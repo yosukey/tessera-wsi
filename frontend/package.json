@@ -19,7 +19,7 @@
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^10.1.0",
-    "react-router": "^7.18.4",
+    "react-router": "^8.5.1",
     "rehype-sanitize": "^6.0.0",
     "remark-gfm": "^4.0.0",
     "szi-tile-source": "github:sundogbio/szi-tile-source#823f538389e15eea7f8385c6bd029743a4b2f224"
