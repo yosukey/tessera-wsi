@@ -1,0 +1,65 @@
+/* Segmented control for the 3-level publish visibility scale
+   (draft → link-only → public). The selected segment is filled with the
+   semantic colour for its level; unselected segments stay muted so the
+   current state reads at a glance. Left→right the fill goes neutral → amber
+   → green, mirroring "more public" as you move right. */
+.root {
+  display: inline-flex;
+  align-items: stretch;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: var(--color-surface);
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.seg {
+  appearance: none;
+  border: none;
+  border-right: 1px solid var(--color-border);
+  background: transparent;
+  color: var(--color-text-subtle);
+  font-weight: var(--font-weight-medium);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--ease-out),
+              color var(--duration-fast) var(--ease-out);
+}
+
+.seg:last-child {
+  border-right: none;
+}
+
+.seg:hover:not(.selected):not(:disabled) {
+  background: var(--color-surface-muted);
+  color: var(--color-text);
+}
+
+.seg:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.sizeSm .seg { padding: 5px 10px; font-size: var(--font-size-sm); min-height: 28px; }
+.sizeMd .seg { padding: 7px 14px; font-size: var(--font-size-md); min-height: 34px; }
+
+/* Selected fills, one per level. */
+.seg.selected {
+  font-weight: var(--font-weight-semibold);
+}
+
+.seg.draft.selected {
+  background: var(--color-surface-sunken);
+  color: var(--color-text);
+}
+
+.seg.unlisted.selected {
+  background: var(--color-warning-bg);
+  color: var(--color-warning-fg);
+}
+
+.seg.public.selected {
+  background: var(--color-success-bg);
+  color: var(--color-success-fg);
+}

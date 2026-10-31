@@ -1,0 +1,121 @@
+# Monthly (or on demand): move the hash-pinned Python lock files to the newest
+# releases requirements*.txt allows, run the backend suite against them, and
+# open a pull request with the result. Dependabot can't maintain these files
+# (it does not regenerate uv-compiled universal locks), and install.sh only
+# installs the lock, so without this nothing would ever pick up upstream
+# security and bug-fix releases.
+#
+# Two jobs, because the versions `make lock-upgrade` picks are by definition
+# not reviewed yet, and the test run imports them:
+#   - refresh: upgrades the locks and runs the backend suite with a read-only
+#     token and no credentials left in .git/config, so a compromised upstream
+#     release can't push anything. It hands the two lock files on as an
+#     artifact, uploaded before the suite runs.
+#   - publish: runs only if refresh succeeded, and never installs or imports a
+#     dependency: it copies the two files in, commits exactly those, pushes a
+#     branch, opens the pull request, and starts CI and the dependency audit
+#     on it. A pull request opened with GITHUB_TOKEN does not trigger the
+#     pull_request workflows; workflow_dispatch is allowed, and their results
+#     show up as the pull request's checks.
+#
+# Needs "Allow GitHub Actions to create and approve pull requests" enabled in
+# the repository's Actions settings.
+#
+# Protect the release tags as well (Settings -> Rules -> Rulesets: a tag
+# ruleset on "v*" restricting creation, update and deletion to repository admins).
+# install.sh and update.sh deploy the highest vX.Y.Z tag on origin and run
+# that release's install.sh as root, so anything that can push a tag — a
+# leaked token, or a workflow with contents: write — can otherwise choose
+# what every host installs on its next update.
+name: Refresh Python lock files
+
+on:
+  schedule:
+    - cron: '17 3 1 * *'
+  workflow_dispatch:
+
+# Each job asks for exactly what it needs.
+permissions: {}
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      # The uv release the committed locks were generated with (Makefile).
+      - run: python -m pip install "uv==$(make -s uv-version)"
+      - run: make lock-upgrade
+      - name: Detect changes
+        id: diff
+        run: |
+          if git diff --quiet -- services/app/requirements.lock services/app/requirements-dev.lock; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      # Uploaded before the suite runs, so what the publish job commits is
+      # what uv wrote, not something the code under test could have edited.
+      - name: Hand the lock files to the publish job
+        if: steps.diff.outputs.changed == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python-locks
+          path: |
+            services/app/requirements.lock
+            services/app/requirements-dev.lock
+          if-no-files-found: error
+          retention-days: 1
+      - name: Backend tests against the refreshed lock
+        if: steps.diff.outputs.changed == 'true'
+        working-directory: services/app
+        run: |
+          python -m pip install --require-hashes -r requirements-dev.lock
+          python -m pytest -q -p no:cacheprovider
+
+  publish:
+    needs: refresh
+    if: needs.refresh.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # workflow_dispatch of ci.yml / audit.yml at the end.
+      actions: write
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: python-locks
+          path: ${{ runner.temp }}/python-locks
+      - name: Open pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          for f in requirements.lock requirements-dev.lock; do
+            install -m 0644 "$RUNNER_TEMP/python-locks/$f" "services/app/$f"
+          done
+          # Run id too: a second run on the same day must not collide.
+          branch="deps/python-lock-$(date -u +%Y%m%d)-${RUN_ID}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add -- services/app/requirements.lock services/app/requirements-dev.lock
+          git commit -m "Refresh the Python lock files"
+          git push -u origin "$branch"
+          gh pr create --fill --base "$DEFAULT_BRANCH" \
+            --body "Automated \`make lock-upgrade\`. The backend suite passed against these pins in the workflow run; CI and the dependency audit were started on this branch and report as this pull request's checks."
+          gh workflow run ci.yml --ref "$branch"
+          gh workflow run audit.yml --ref "$branch"

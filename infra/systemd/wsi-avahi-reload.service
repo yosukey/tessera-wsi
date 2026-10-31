@@ -1,0 +1,11 @@
+[Unit]
+Description=Reload avahi-daemon after WSI mDNS service file change
+After=avahi-daemon.service
+
+[Service]
+Type=oneshot
+# try-reload-or-restart (not plain reload): `reload` exits non-zero — leaving
+# this oneshot in a failed state on every path trigger — when avahi-daemon is
+# inactive. try-reload-or-restart reloads it if running (restarting it if it
+# cannot reload) and is a no-op success when it is not running.
+ExecStart=/usr/bin/systemctl try-reload-or-restart avahi-daemon.service

@@ -1,0 +1,235 @@
+# Runs every check a contributor runs locally, on each pull request (and on
+# demand): the backend test suite, the frontend typecheck / unit tests / build,
+# shell syntax + shellcheck for the infra scripts, and the infra shell tests
+# (with a real nginx, so the nginx-config tests run instead of skipping as
+# they do on a machine without nginx, and with root for the parts that need
+# it — here a test that SKIPs anything fails the run).
+#
+# Actions are pinned by full commit SHA, the release in a trailing comment;
+# Dependabot (github-actions, .github/dependabot.yml) updates both together.
+name: CI
+
+# Not on pushes to main: a pull request's run already tests the merge of its
+# head into main (refs/pull/N/merge), so the push its merge makes would repeat
+# the same tree minutes later. Release tags trigger nothing either. Run it by
+# hand (Run workflow, on main) to re-check main itself, e.g. after merging
+# several pull requests whose runs each predate the others' merges.
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to a pull request supersedes the run for the previous one. A
+# manual dispatch is never cancelled, and gets a group of its own: in a shared
+# group a run that is still pending is dropped when a newer one queues, so
+# back-to-back dispatches would not each get a result.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Which of the jobs below this pull request can affect, so a change that
+  # touches none of a job's inputs does not spend runner minutes on it (a
+  # docs-only change runs none of them). A skipped job reports success, so a
+  # required check is still satisfied. The diff is the merge commit against
+  # its base — the whole pull request, not just the latest push — so a job is
+  # never skipped on the strength of an earlier run that failed or was
+  # cancelled. A manual run tests everything.
+  #
+  # backend and infra run unless EVERY changed file is one they are known not
+  # to read (a new or unlisted path runs them): their tests also read files
+  # outside their own tree — the backend suite cross-checks
+  # frontend/src/lib/admin/validation.ts, slideCredit.sourceUrlCases.json,
+  # frontend/package.json and most of infra/; the infra tests read the
+  # routers, the lock files, Makefile and the workflows. frontend and lock run
+  # when a file they are built from changes. Changing this workflow runs all.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+      infra: ${{ steps.filter.outputs.infra }}
+      lock: ${{ steps.filter.outputs.lock }}
+    steps:
+      # A pull_request run checks out the merge commit; depth 2 brings its
+      # first parent, the base branch tip it was merged onto.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+      - id: filter
+        shell: bash
+        run: |
+          set -euo pipefail
+          jobs=(backend frontend infra lock)
+          if [[ "$GITHUB_EVENT_NAME" != pull_request ]]; then
+            for j in "${jobs[@]}"; do echo "$j=true" >> "$GITHUB_OUTPUT"; done
+            exit 0
+          fi
+          mapfile -t changed < <(git diff --name-only HEAD^1 HEAD)
+          printf 'changed: %s\n' "${changed[@]}"
+          # needs JOB FILE: whether FILE is an input of JOB.
+          needs() {
+            case "$1:$2" in
+              *:.github/workflows/ci.yml) return 0 ;;
+              backend:frontend/package.json \
+              | backend:frontend/src/lib/admin/validation.ts \
+              | backend:frontend/src/lib/slideCredit.sourceUrlCases.json) return 0 ;;
+              backend:docs/* | backend:*.md | backend:LICENSE | backend:.shellcheckrc \
+              | backend:.github/* | backend:frontend/* \
+              | backend:infra/tests/* | backend:infra/nginx/*) return 1 ;;
+              infra:docs/* | infra:*.md | infra:LICENSE | infra:frontend/* \
+              | infra:services/app/tests/* | infra:.github/dependabot.yml \
+              | infra:.github/workflows/lock-refresh.yml) return 1 ;;
+              frontend:frontend/*) return 0 ;;
+              lock:services/app/requirements* | lock:Makefile) return 0 ;;
+              backend:* | infra:*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          for j in "${jobs[@]}"; do
+            run=false
+            for f in "${changed[@]}"; do
+              if needs "$j" "$f"; then run=true; break; fi
+            done
+            echo "$j: $run"
+            echo "$j=$run" >> "$GITHUB_OUTPUT"
+          done
+
+  backend:
+    name: backend (Python ${{ matrix.python }})
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12: Ubuntu 24.04's python3, still accepted by install.sh.
+        # 3.14: Ubuntu 26.04's python3, the documented target.
+        python: ['3.12', '3.14']
+    defaults:
+      run:
+        working-directory: services/app
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: services/app/requirements*.lock
+      - name: Install dependencies (hash-pinned lock)
+        run: python -m pip install --require-hashes -r requirements-dev.lock
+      - name: pytest
+        run: python -m pytest -q -p no:cacheprovider
+
+  # The lock files must be what `make lock` produces from the range files, so
+  # an edited requirements*.txt can't ship with a stale lock (install.sh only
+  # ever installs the lock).
+  lock:
+    needs: changes
+    if: needs.changes.outputs.lock == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      # The uv release the committed locks were generated with (Makefile).
+      - run: python -m pip install "uv==$(make -s uv-version)"
+      - run: make lock
+      - name: Lock files up to date
+        run: git diff --exit-code -- services/app/requirements.lock services/app/requirements-dev.lock
+
+  frontend:
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          # install.sh's NODE_MAJOR default.
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - name: Production build
+        run: npx vite build
+
+  infra:
+    needs: changes
+    if: needs.changes.outputs.infra == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install nginx
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nginx
+      # ShellCheck is pinned to an exact release (checksum-verified) rather
+      # than whatever the runner image's apt carries, so a runner-image bump
+      # cannot change the lint result. Bump SHELLCHECK_VERSION and its sha256
+      # together.
+      - name: Install shellcheck
+        env:
+          SHELLCHECK_VERSION: v0.11.0
+          SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+        run: |
+          set -euo pipefail
+          tarball="shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -fsSLo "$RUNNER_TEMP/$tarball" \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/${tarball}"
+          echo "${SHELLCHECK_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP"
+          sudo install -m 0755 "$RUNNER_TEMP/shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+      # bash -n for the bash scripts; the one /bin/sh script (wsi-cache-stat.sh,
+      # run by systemd as /bin/sh = dash) is parsed by dash itself.
+      - name: Shell syntax
+        shell: bash
+        run: |
+          for f in infra/*.sh infra/lib/*.sh infra/systemd/*.sh; do
+            if [[ "$(head -n1 "$f")" == '#!/bin/sh' ]]; then dash -n "$f"; else bash -n "$f"; fi
+          done
+      # Default severity (style and up); settings and the one exclusion are
+      # in .shellcheckrc. shellcheck checks the /bin/sh script as POSIX sh.
+      - name: Shell lint
+        run: shellcheck --version && shellcheck infra/*.sh infra/lib/*.sh infra/systemd/*.sh
+      # Every infra test has what it needs on this runner, so here a SKIP
+      # means a check silently stopped running: any line starting "SKIP - "
+      # fails the job (locally a SKIP still exits 0). The tests with parts
+      # that need root run under sudo, so those parts run too.
+      - name: Infra tests (a SKIP fails the job)
+        shell: bash
+        run: |
+          root_tests=(test_install_symlink_guard.sh test_update_rollback.sh
+                      test_install_root_sources.sh test_set_workers_env.sh
+                      test_nginx_cache_tool.sh test_sync_from.sh
+                      test_root_guard.sh test_install_nginx_restore.sh)
+          set +e
+          failed=()
+          for n in "${root_tests[@]}"; do
+            [[ -f "infra/tests/$n" ]] || failed+=("$n: listed as a root test but missing")
+          done
+          for t in infra/tests/*.sh; do
+            n="${t##*/}"
+            run=(bash "$t")
+            [[ " ${root_tests[*]} " == *" $n "* ]] && run=(sudo bash "$t")
+            echo "::group::${run[*]}"
+            "${run[@]}" 2>&1 | tee "$RUNNER_TEMP/$n.log"
+            rc=${PIPESTATUS[0]}
+            echo "::endgroup::"
+            [[ $rc -eq 0 ]] || failed+=("$n: exit $rc")
+            skips="$(grep -E '^(SKIP|skip) - ' "$RUNNER_TEMP/$n.log")"
+            [[ -z "$skips" ]] || failed+=("$n: skipped in CI: ${skips//$'\n'/; }")
+          done
+          for f in "${failed[@]}"; do echo "::error::$f"; done
+          [[ ${#failed[@]} -eq 0 ]]

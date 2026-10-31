@@ -1,0 +1,14 @@
+[Unit]
+Description=Watch /run/wsi/restart.trigger to restart wsi-app (restore / reset apply)
+
+[Path]
+# The app runs under NoNewPrivileges=true and cannot use setuid sudo, so it
+# asks for a restart by dropping this trigger file (config.restart_trigger_path).
+# wsi-restart.service removes the file before restarting, so the PathExists
+# condition clears itself and the unit does not re-fire — no restart loop.
+# Same pattern as wsi-avahi-reload.path.
+PathExists=/run/wsi/restart.trigger
+Unit=wsi-restart.service
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,40 @@
+/*
+ * Styles for markup rendered by SafeMarkdown. Scoped to the component (rather
+ * than the page-level .jp-prose, which only wraps the tour viewer) so the tour
+ * viewer and the admin sanitized-preview render tables and horizontal rules
+ * identically.
+ */
+
+.prose table {
+  /* GitHub-style horizontal scroll: a narrow table shrinks to its content,
+     while a wide table gains its own scrollbar instead of stretching the
+     surrounding panel or forcing the whole page to scroll sideways. */
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  margin-block: var(--space-3);
+  font-size: 0.95em;
+}
+
+.prose th,
+.prose td {
+  border: 1px solid var(--color-border);
+  padding: var(--space-1) var(--space-2);
+  /* GFM column alignment (:---:) is emitted as an `align` attribute, which
+     the sanitize schema does not allow, so every cell renders left-aligned
+     by design. */
+  text-align: left;
+}
+
+.prose th {
+  background: var(--color-surface-muted);
+  font-weight: 600;
+}
+
+.prose hr {
+  border: none;
+  border-top: 1px solid var(--color-border);
+  margin-block: var(--space-4);
+}

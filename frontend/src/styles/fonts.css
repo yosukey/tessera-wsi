@@ -1,0 +1,38 @@
+/*
+ * Self-hosted web fonts.
+ *
+ * Inter (Latin) and Noto Sans JP (Japanese subset) are bundled with
+ * the app so the visual identity matches across machines that don't
+ * have Hiragino / Yu Gothic / Segoe UI installed, and so the app never
+ * depends on a third-party CDN at runtime (no Google Fonts).
+ *
+ * Inter ships every used weight (regular through extrabold) — the
+ * Latin subset is small (~24 KB / weight). Noto Sans JP only ships
+ * 400 and 700 because each weight is large; 500 / 600 / 800 fall
+ * back to faux-bold synthesis on top of 400 / 700, which is an
+ * acceptable trade-off given the bundle-size cost.
+ *
+ * Noto Sans JP uses the default (unicode-range split) stylesheets
+ * rather than the monolithic `japanese-*` subset. The single-file
+ * `japanese-*` subset forces the whole ~1 MB/weight font to download
+ * the instant any Japanese glyph renders (~2 MB total for 400 + 700);
+ * the split stylesheets declare ~120 unicode-range chunks so the
+ * browser fetches only the chunks whose glyphs actually appear on the
+ * page. Latin glyphs still come from Inter (listed first in the stack
+ * in tokens.css), so Noto's Latin/Greek/Cyrillic chunks never load.
+ *
+ * font-display: swap is set by @fontsource so the first paint uses
+ * the system fallback chain in tokens.css and the web font swaps
+ * in once it loads.
+ */
+
+/* Inter — Latin */
+@import "@fontsource/inter/400.css";
+@import "@fontsource/inter/500.css";
+@import "@fontsource/inter/600.css";
+@import "@fontsource/inter/700.css";
+@import "@fontsource/inter/800.css";
+
+/* Noto Sans JP — unicode-range split (only the needed chunks download) */
+@import "@fontsource/noto-sans-jp/400.css";
+@import "@fontsource/noto-sans-jp/700.css";

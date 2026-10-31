@@ -1,0 +1,60 @@
+[Unit]
+Description=Restart wsi-app to apply a staged restore / reset
+# The trigger file is writable by the unprivileged wsi user, so a buggy or
+# compromised app can ask for restarts in a tight loop. Under systemd's default
+# start limit (5 starts / 10 s) this unit would latch into `failed` and stay
+# there until someone runs `systemctl reset-failed` by hand — at which point a
+# later, legitimate restore-apply silently never happens, which is a far worse
+# outcome than the burst itself. Widen the window so ordinary bursts never
+# trip it, while still capping a genuine runaway.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=oneshot
+# Remove the trigger FIRST so the watching path unit's PathExists condition
+# goes false immediately; otherwise it could re-fire this unit after the
+# (blocking) restart returns. start-wsi-app.sh also clears it on boot as a
+# belt-and-suspenders. Then restart wsi-app: its start script consumes
+# /run/wsi/restore.request and applies the swap before uvicorn comes back up.
+#
+# A blocking restart (no --no-block) is intentional and safe here: this unit
+# is independent of wsi-app, so it is NOT caught by the SIGTERM cascade that
+# an in-process restart would have to dodge. Blocking also guarantees the
+# trigger is already gone by the time this oneshot exits, closing the loop.
+#
+# A restore/reset apply (/run/wsi/restore.request present) swaps the DB file
+# itself, so wsi-sync — a separate process holding its own pooled SQLite
+# handles — must not keep running across it: its connections would stay on
+# the parked pre-restore file, so live-sync auth, IP filtering and staff
+# checks would keep answering from the old DB and its audit rows would land
+# in the parked copy. For that case only: stop wsi-sync, restart wsi-app,
+# wait for start-wsi-app.sh to finish the swap (it removes the request file
+# when done, success or rollback), then start wsi-sync again if it was
+# running (the wait gives up early if wsi-app fails to start, and after 15
+# minutes at most). A trigger without a staged request (dropped by hand) just
+# restarts wsi-app and leaves wsi-sync, and its in-memory live-sync rooms, alone.
+# ($$ is systemd's escape for a literal $ in the shell snippet.)
+#
+# -r: /run/wsi is writable by the unprivileged wsi user, who can make the
+# trigger a (non-empty) directory instead of a file. `rm -f` cannot remove one,
+# so the unit would fail on every firing, the still-existing path would fire it
+# again, and the start limit above would latch it into `failed` — the same
+# outcome the limit is widened to avoid. rm does not follow symlinks or cross
+# mount points here (--one-file-system), and the name is fixed.
+ExecStartPre=/usr/bin/rm -rf --one-file-system -- /run/wsi/restart.trigger
+ExecStart=/bin/sh -c '\
+    if [ ! -e /run/wsi/restore.request ]; then \
+        exec /usr/bin/systemctl restart wsi-app.service; \
+    fi; \
+    sync_was_active=0; \
+    /usr/bin/systemctl is-active --quiet wsi-sync.service && sync_was_active=1; \
+    /usr/bin/systemctl stop wsi-sync.service; \
+    /usr/bin/systemctl restart wsi-app.service; rc=$$?; \
+    i=0; \
+    while [ -e /run/wsi/restore.request ] && [ "$$i" -lt 900 ]; do \
+        /usr/bin/systemctl is-failed --quiet wsi-app.service && break; \
+        sleep 1; i=$$((i + 1)); \
+    done; \
+    if [ "$$sync_was_active" = 1 ]; then /usr/bin/systemctl start wsi-sync.service; fi; \
+    exit $$rc'

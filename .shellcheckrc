@@ -1,0 +1,21 @@
+# ShellCheck settings for this repository. CI (.github/workflows/ci.yml,
+# "Shell lint") runs `shellcheck infra/*.sh infra/lib/*.sh infra/systemd/*.sh`
+# at shellcheck's default severity (style and up) with these settings; run the
+# same command locally before pushing.
+
+# The scripts source their helpers relative to their own location
+# (`. "$REPO_DIR/infra/lib/wsi-common.sh"`, `. "${SELF_DIR}/wsi-calc.sh"`), and
+# the `# shellcheck source=...` hints next to them are written that way too.
+# Resolve them from the checked script's directory and follow them, so
+# functions and variables defined in a helper are known where it is used.
+source-path=SCRIPTDIR
+external-sources=true
+
+# SC2317 ("command appears to be unreachable") misfires on code that is only
+# ever reached indirectly: trap handlers, and functions defined inside other
+# functions (wsi_define_run_git's run_git in lib/wsi-common.sh). It is an
+# info-level reachability guess, not a correctness check. ShellCheck 0.11+
+# reports the "function is never invoked" half of it as SC2329, so both
+# codes are needed for the same false positive (older releases ignore the
+# unknown code).
+disable=SC2317,SC2329

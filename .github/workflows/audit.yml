@@ -1,0 +1,72 @@
+# Weekly (or on demand): check the dependency trees the service actually ships
+# against the published vulnerability advisories, so a fix that can't wait for
+# the monthly lock refresh (lock-refresh.yml) or the next Dependabot round is
+# noticed when it is published, not at the next scheduled update.
+#
+#   - Python: pip-audit installs requirements.lock (hash-checked) into a
+#     throwaway venv, once for each Python version CI tests, and looks every
+#     resolved package up in the PyPI / OSV advisory data. The lock can carry
+#     per-Python pins (environment markers), hence the matrix.
+#   - npm: `npm audit` on the production dependencies of package-lock.json
+#     (dev tooling never reaches the built SPA).
+#
+# A failing scheduled run is e-mailed by GitHub to whoever last changed the
+# schedule. To act on a finding: raise the floor in requirements.txt (with the
+# advisory as the reason) and `make lock`, or `npm install <pkg>@<fixed>` in
+# frontend/; see docs/developer-guide.md -> "Dependency locking".
+#
+# Also runs on pull requests that change a lock file. It is not part of ci.yml
+# on purpose: a newly published advisory would otherwise turn every unrelated
+# pull request red.
+name: Dependency audit
+
+on:
+  schedule:
+    - cron: '41 4 * * 1'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - services/app/requirements.lock
+      - frontend/package-lock.json
+      - .github/workflows/audit.yml
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: python (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Same versions as ci.yml's backend job.
+        python: ['3.12', '3.14']
+    defaults:
+      run:
+        working-directory: services/app
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install pip-audit==2.10.1
+      - name: pip-audit (runtime lock)
+        run: python -m pip_audit -r requirements.lock --require-hashes --progress-spinner off
+
+  npm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          # install.sh's NODE_MAJOR default.
+          node-version: 24
+      # Reads package-lock.json only; nothing is installed.
+      - name: npm audit (production dependencies)
+        run: npm audit --omit=dev

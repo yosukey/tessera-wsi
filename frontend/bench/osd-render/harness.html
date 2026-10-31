@@ -1,0 +1,184 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; }
+  #v { position: absolute; inset: 0; }
+</style>
+<script src="/osd.js"></script>
+</head>
+<body>
+<div id="v"></div>
+<script>
+const P = new URLSearchParams(location.search)
+const IR = P.get('ir') === '1'
+const CACHE = Number(P.get('cache') || 200)
+const DRAWER = P.get('drawer') || 'canvas'
+const SAMPLE = P.get('sample') !== '0'
+const MTPF = Number(P.get('mtpf') || 1)
+
+const viewer = OpenSeadragon({
+  element: document.getElementById('v'),
+  prefixUrl: '/osd-images/',
+  tileSources: '/slide.dzi',
+  showNavigator: true,
+  showRotationControl: true,
+  maxZoomPixelRatio: 1.0,
+  immediateRender: IR,
+  maxImageCacheCount: CACHE,
+  gestureSettingsMouse: { clickToZoom: false },
+  drawer: DRAWER,
+  maxTilesPerFrame: MTPF,
+})
+
+let animating = false
+viewer.addHandler('animation-start', () => { animating = true })
+viewer.addHandler('animation-finish', () => { animating = false })
+const counters = { loaded: 0, unloaded: 0, loadedByLevel: {} }
+viewer.addHandler('tile-loaded', (e) => {
+  if (e.tiledImage !== viewer.world.getItemAt(0)) return
+  counters.loaded++
+  const l = e.tile.level
+  counters.loadedByLevel[l] = (counters.loadedByLevel[l] || 0) + 1
+})
+viewer.addHandler('tile-unloaded', (e) => {
+  if (e.tiledImage !== viewer.world.getItemAt(0)) return
+  counters.unloaded++
+})
+
+const SW = 192
+let SH = 108
+const small = document.createElement('canvas')
+const sctx = small.getContext('2d', { willReadFrequently: true })
+
+function targetLevel(ti) {
+  const src = ti.source
+  for (let l = src.maxLevel; l >= src.minLevel; l--) {
+    const r = viewer.viewport.deltaPixelsFromPointsNoRotate(src.getPixelRatio(l), true).x * ti._scaleSpring.current.value
+    if (r >= ti.minPixelRatio) return l
+  }
+  return src.minLevel
+}
+
+// Classify what is on screen right now: inside the image's on-screen
+// rectangle, each sample is blank (nothing drawn), sharp (drawn from the level
+// OSD wants for this zoom, or finer) or low-res (a coarser level stretched).
+function sample() {
+  const c = viewer.drawer.canvas
+  const cw = viewer.container.clientWidth, ch = viewer.container.clientHeight
+  SH = Math.max(1, Math.round(SW * ch / cw))
+  if (small.width !== SW || small.height !== SH) { small.width = SW; small.height = SH }
+  sctx.imageSmoothingEnabled = false
+  sctx.clearRect(0, 0, SW, SH)
+  sctx.drawImage(c, 0, 0, SW, SH)
+  const d = sctx.getImageData(0, 0, SW, SH).data
+  const ti = viewer.world.getItemAt(0)
+  const r = viewer.viewport.viewportToViewerElementRectangle(ti.getBounds(true))
+  const target = targetLevel(ti)
+  let n = 0, blank = 0, sharp = 0, low = 0
+  for (let y = 0; y < SH; y++) {
+    const cy = (y + 0.5) * ch / SH
+    if (cy < r.y || cy > r.y + r.height) continue
+    for (let x = 0; x < SW; x++) {
+      const cx = (x + 0.5) * cw / SW
+      if (cx < r.x || cx > r.x + r.width) continue
+      n++
+      const i = (y * SW + x) * 4
+      if (d[i + 3] < 128) { blank++; continue }
+      const lvl = Math.round((d[i] - 10) / 12)
+      if (lvl >= target) sharp++
+      else low++
+    }
+  }
+  return { n, blank: n ? blank / n : 0, sharp: n ? sharp / n : 0, low: n ? low / n : 0, target }
+}
+
+function busy() {
+  const ti = viewer.world.getItemAt(0)
+  const il = viewer.imageLoader
+  return animating || !ti.getFullyLoaded() || il.jobsInProgress > 0 || il.jobQueue.length > 0
+}
+
+async function serverMark() { return (await (await fetch('/__mark', { cache: 'no-store' })).json()).n }
+async function serverLog(since) { return (await fetch('/__log?since=' + since, { cache: 'no-store' })).json() }
+
+function frame() { return new Promise((r) => requestAnimationFrame(r)) }
+
+async function waitSettled(timeoutMs = 30000) {
+  const t0 = performance.now()
+  let calm = 0
+  while (performance.now() - t0 < timeoutMs) {
+    await frame()
+    calm = busy() ? 0 : calm + 1
+    if (calm >= 5) return true
+  }
+  return false
+}
+
+function vpPoint(fx, fy) {
+  const b = viewer.viewport.getBounds()
+  return new OpenSeadragon.Point(b.x + fx * b.width, b.y + fy * b.height)
+}
+
+function run(cmd) {
+  const vp = viewer.viewport
+  if (cmd.op === 'zoomBy') vp.zoomBy(cmd.f, cmd.at ? vpPoint(cmd.at[0], cmd.at[1]) : undefined)
+  else if (cmd.op === 'panBy') { const b = vp.getBounds(); vp.panBy(new OpenSeadragon.Point(cmd.dx * b.width, cmd.dy * b.height)) }
+  else if (cmd.op === 'home') vp.goHome()
+  else if (cmd.op === 'zoomTo') vp.zoomTo(cmd.z)
+  else throw new Error('bad op ' + cmd.op)
+}
+
+// One user action: issue it, sample every frame until the view is settled
+// (animation over, every wanted tile loaded), and report what the user saw.
+async function step(cmd) {
+  const mark = await serverMark()
+  const c0 = { loaded: counters.loaded, unloaded: counters.unloaded }
+  const t0 = performance.now()
+  run(cmd)
+  let last = t0, animEnd = null, blankArea = 0, lowArea = 0, maxBlank = 0, frames = 0
+  let sharp95 = null
+  // Settled = animation over and nothing loading, for 5 frames in a row; the
+  // step's time ends at the first of those frames, not the fifth.
+  let calm = 0, calmAt = null, ok = false
+  while (performance.now() - t0 < 30000) {
+    await frame()
+    const now = performance.now()
+    const s = SAMPLE ? sample() : { blank: 0, low: 0, sharp: 1 }
+    const dt = now - last
+    last = now
+    frames++
+    blankArea += s.blank * dt
+    lowArea += s.low * dt
+    if (s.blank > maxBlank) maxBlank = s.blank
+    if (!animating && animEnd == null) animEnd = now - t0
+    if (animEnd != null && sharp95 == null && s.sharp >= 0.95) sharp95 = now - t0
+    if (busy()) { calm = 0 } else { if (calm === 0) calmAt = now; calm++ }
+    if (calm >= 5) { ok = true; break }
+  }
+  const settle = (ok ? calmAt : performance.now()) - t0
+  const reqs = await serverLog(mark)
+  const by = {}
+  for (const q of reqs) by[q.s] = (by[q.s] || 0) + 1
+  const finalS = sample()
+  return {
+    op: cmd.op, ok, settle_ms: Math.round(settle), anim_ms: animEnd == null ? null : Math.round(animEnd),
+    sharp95_ms: sharp95 == null ? null : Math.round(sharp95),
+    blank_area_ms: Math.round(blankArea), low_area_ms: Math.round(lowArea), max_blank: +maxBlank.toFixed(3),
+    frames, req200: by[200] || 0, req304: by[304] || 0,
+    tile_loaded: counters.loaded - c0.loaded, tile_unloaded: counters.unloaded - c0.unloaded,
+    final_sharp: +finalS.sharp.toFixed(3), target: finalS.target,
+    cache_records: viewer.tileCache.numCachesLoaded(),
+  }
+}
+
+window.H = {
+  ready: new Promise((res) => viewer.addOnceHandler('open', async () => { await waitSettled(); res(true) })),
+  step, waitSettled, sample, viewer,
+  info: () => ({ dpr: window.devicePixelRatio, w: viewer.container.clientWidth, h: viewer.container.clientHeight,
+                 drawer: viewer.drawer.getType(), ir: IR, cache: CACHE, sample: SAMPLE, mtpf: MTPF }),
+}
+</script>
+</body>
+</html>

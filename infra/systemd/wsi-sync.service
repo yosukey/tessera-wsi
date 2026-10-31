@@ -1,0 +1,90 @@
+[Unit]
+Description=Tessera - Sync coordinator (single worker, port 8001)
+Documentation=https://github.com/yosukey/tessera-wsi
+# wsi-app.service runs the schema migrations / bootstrap_admin so the sync
+# coordinator should come up after it.
+After=network-online.target wsi-app.service
+Wants=network-online.target
+# NOTE: deliberately NOT PartOf=wsi-app.service. PartOf propagates restart:
+# every wsi-app restart (a worker- or cache-size change, an operator's
+# systemctl restart) would cascade into the single-worker sync process and wipe
+# every in-memory live-sync room, disconnecting an entire in-progress class.
+# Settings changes restart neither unit: the sync worker converges on committed
+# auth/IP-filter settings on its own via the periodic snapshot refresh in the
+# app lifespan (_settings_refresh_loop, WSI_SETTINGS_REFRESH_SECONDS). update.sh
+# stops/starts wsi-sync explicitly, and WantedBy below keeps it in the normal
+# boot set, so having no PartOf does not orphan its lifecycle.
+
+[Service]
+# The live-sync feature relies on per-worker in-memory rooms (RoomManager).
+# Running a second uvicorn process with --workers 1 keeps fan-out coherent
+# without dragging in Redis, while letting the main wsi-app stay
+# multi-worker for DZI throughput. nginx splits traffic by location.
+Type=simple
+User=wsi
+Group=wsi
+WorkingDirectory=/opt/wsi/services/app
+EnvironmentFile=/etc/wsi/wsi.env
+# Tells the app it is the sync coordinator: it never applies a restore, so the
+# boot check for a writable restore IPC dir (/run/wsi, not in ReadWritePaths
+# below) is skipped instead of warning on every start.
+Environment=WSI_PROCESS_ROLE=sync
+# --no-proxy-headers: see start-wsi-app.sh. The app reads request.client.host
+# as the immediate TCP peer (loopback) for its CF Access / IP-filter trust
+# checks and resolves the real client IP itself; uvicorn's default proxy-header
+# rewriting would break that, so it is disabled here too.
+ExecStart=/opt/wsi/venv/bin/uvicorn wsi_app.main:app \
+    --host 127.0.0.1 \
+    --port 8001 \
+    --workers 1 \
+    --ws-max-size 65536 \
+    --no-proxy-headers
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+# --- Sandboxing / hardening (mirrors wsi-app.service) ---
+# Intentionally narrower than wsi-app: only wsi-app advertises mDNS, so the
+# sync coordinator has no business writing to /etc/avahi/services. Keep the
+# ReadWritePaths list minimal per least-privilege.
+NoNewPrivileges=true
+# Match wsi-app: 0640/0750 on anything this worker creates under /var/lib/wsi
+# so the SQLite DB and friends never land world-readable. This worker writes
+# no avahi file, so no 0644 exception is needed here.
+UMask=0027
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/wsi
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+# NOT ProcSubset=pid — see the note in wsi-app.service (psutil reads /proc).
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Mirrors wsi-app.service: no device access is needed, no capabilities are
+# held (User=wsi), and nothing here schedules realtime.
+PrivateDevices=true
+RestrictRealtime=true
+CapabilityBoundingSet=
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# Refuse filtered syscalls with EPERM instead of killing the process
+# (the default action is SIGSYS). numpy's bundled OpenBLAS calls mbind()
+# (@resources) while it initialises at import time and carries on if that
+# fails; with the default action the whole worker core-dumps on startup
+# (status=31/SYS) as soon as the OME-TIFF reader imports numpy.
+SystemCallErrorNumber=EPERM
+
+# --- Resources ---
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

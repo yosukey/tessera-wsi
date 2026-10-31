@@ -1,0 +1,22 @@
+[Unit]
+Description=WSI nginx tile cache statistics snapshot
+After=network.target
+
+[Service]
+Type=oneshot
+User=www-data
+Group=www-data
+ExecStart=/usr/local/bin/wsi-cache-stat
+# Create /run/wsi-cache-stat owned by www-data and keep it after the
+# service exits so the wsi app can read nginx_cache_stat.json between
+# timer activations.
+#
+# This must NOT share /run/wsi with the wsi-app IPC dir: that one is
+# tmpfiles.d-managed as wsi:wsi (so the wsi-app worker can write
+# /run/wsi/restore.request from inside the Backup & Restore flow), while
+# RuntimeDirectory= here would enforce www-data ownership on the leaf
+# directory on every service start. Two services with different User=
+# cannot coexist on the same RuntimeDirectory=.
+RuntimeDirectory=wsi-cache-stat
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes

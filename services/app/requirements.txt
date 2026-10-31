@@ -1,0 +1,67 @@
+# The accepted version RANGES of the backend's runtime dependencies. Nothing
+# installs from this file directly: install.sh, `make venv` and CI install
+# requirements.lock, generated from it by `make lock` (every package pinned to
+# one version with its hashes, installed with --require-hashes), so two hosts
+# provisioned from the same commit get the same, verified tree. After editing
+# a range here, run `make lock` and commit both files; `make lock-upgrade` (or
+# the monthly lock-refresh workflow) moves the pins within these ranges. See
+# docs/developer-guide.md -> "Dependency locking".
+#
+# Every entry carries an upper bound at the next major, so a lock refresh
+# picks up security and bug-fix releases in the tested line but never an
+# untested major. When upgrading across a major version, move both bounds
+# together.
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27,<1.0
+sqlalchemy>=2.0,<3.0
+# >=0.0.18: earlier releases are vulnerable to CVE-2024-53981 (multipart DoS).
+# Capped at <1.0 like everything else here. The project is still pre-1.0, so
+# its 0.0.x line carries no compatibility guarantee — it has already renamed
+# its import root (`multipart` -> `python_multipart`), and while the old name
+# is still provided as a deprecated alias today, dropping it is a patch-level
+# release away and would take wsi-app down at import on the next update.sh
+# run. Revisit the cap deliberately when 1.0 is tested.
+python-multipart>=0.0.18,<1.0
+passlib>=1.7.4,<2.0
+# >=2.14: verify_google_id_token passes issuer= as a list, which PyJWT only
+# accepts from 2.9.0 onward (earlier versions fail every Google login). 2.14.0
+# is also the first release with the two hardening changes this code relies on:
+# strict base64url decoding (a token with junk bytes after the signature is
+# refused, so the dashboard's re-authentication throttle, which hashes the raw
+# token string, cannot be fed endless spellings of one token) and a cooldown
+# between JWKS refreshes for an unknown ``kid`` (so a made-up kid cannot make
+# every request fetch the Cloudflare Access keys again).
+# The [crypto] extra brings `cryptography`, which mfa.py also uses directly
+# (AES-GCM / HKDF for the two-factor secrets).
+pyjwt[crypto]>=2.14,<3.0
+ldap3>=2.9,<3.0
+httpx>=0.27,<1.0
+# >=1.4: the openslide-bin wheel auto-detection that requirements-dev.txt
+# relies on (so `import openslide` finds the shared library) was added in 1.4.
+openslide-python>=1.4,<2.0
+# OME-TIFF reader (wsi_app/ome_tiff.py): tifffile parses the TIFF structure
+# and the OME-XML plane mapping, imagecodecs supplies the tile codecs tifffile
+# delegates to (JPEG, JPEG 2000, LZW, zstd, ...), and numpy is the array type
+# both hand back. tifffile and imagecodecs are calendar-versioned, so there is
+# no semantic "next major": the upper bound is the next calendar year instead,
+# to be moved once a newer release has been tested. The lower bounds are the
+# oldest combination the OME-TIFF tests pass on (imagecodecs 2024.1.1 has no
+# binary wheel for every supported Python, so its floor is 2024.6.1); they
+# also pass on tifffile 2026.9.20 + imagecodecs 2026.8.16, across tifffile
+# 2026.5's breaking change to TiffFile.series (see ome_tiff._file_series).
+tifffile>=2024.1.30,<2027
+imagecodecs>=2024.6.1,<2027
+numpy>=1.26,<3.0
+# >=13.0: Pillow processes untrusted uploads, and every release below 13.0.0
+# carries published advisories — among them out-of-bounds reads in the TIFF
+# tile decoder, a JPEG decoder write past its scanline buffer, and unbounded
+# memory growth in the GIF, APNG and BMP decoders (the 11.x and 12.x lines are
+# not patched). Untrusted image bytes are also opened with an explicit
+# ``formats=`` list (szi_utils / openslide_utils / admin_tours) so only the
+# decoders the code needs are reachable at all.
+pillow>=13.0,<14.0
+psutil>=5.9,<8.0
+# Optional: when present, the dashboard's Backup feature uses zstd-compressed
+# tar archives (smaller + faster than gzip). The code falls back to .tar.gz
+# when this dependency is missing, so it's safe to remove on minimal installs.
+zstandard>=0.22,<1.0

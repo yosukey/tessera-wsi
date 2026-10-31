@@ -1,0 +1,18 @@
+# The Python lock files (services/app/requirements*.lock) are refreshed by
+# .github/workflows/lock-refresh.yml instead: Dependabot does not regenerate
+# uv-compiled universal locks.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+    groups:
+      # One PR per week for routine updates; majors stay separate so each
+      # gets its own review.
+      minor-and-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

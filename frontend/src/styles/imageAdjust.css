@@ -1,0 +1,15 @@
+/*
+ * Session-only image adjustment for the OpenSeadragon viewer.
+ *
+ * The owning page sets `className="osd-with-adjust"` on the OSD container
+ * and writes the desired CSS filter into the `--osd-filter` custom property
+ * (see lib/imageAdjust.ts). The rule below scopes that filter to OSD's
+ * internal canvas wrapper only — overlays added via viewer.addOverlay
+ * (pins, shapes, labels) live in a sibling layer and stay unaffected.
+ * No `will-change`: with the identity adjustment the filter is `none` (see
+ * cssFilterString), and the canvas should not be promoted to a layer of its
+ * own for nothing.
+ */
+.osd-with-adjust .openseadragon-canvas canvas {
+  filter: var(--osd-filter, none);
+}

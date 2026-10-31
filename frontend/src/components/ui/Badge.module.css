@@ -1,0 +1,21 @@
+.root {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  line-height: 1.5;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+
+.pill { border-radius: var(--radius-pill); padding: 2px 10px; }
+
+.toneNeutral { background: var(--color-surface-muted); color: var(--color-text-muted); }
+.toneBrand   { background: var(--color-brand-50); color: var(--color-brand-700); }
+.toneSuccess { background: var(--color-success-bg); color: var(--color-success-fg); }
+.toneWarning { background: var(--color-warning-bg); color: var(--color-warning-fg); }
+.toneDanger  { background: var(--color-danger-bg); color: var(--color-danger-fg); }
+.toneInfo    { background: var(--color-info-bg); color: var(--color-info-fg); }

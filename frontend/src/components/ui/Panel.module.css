@@ -1,0 +1,21 @@
+.root {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  color: var(--color-text);
+}
+.toneMuted {
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+.toneFlat {
+  box-shadow: none;
+  background: var(--color-surface-muted);
+  border-color: var(--color-border);
+}
+
+.padSm { padding: var(--space-3); }
+.padMd { padding: var(--space-4); }
+.padLg { padding: var(--space-6); }

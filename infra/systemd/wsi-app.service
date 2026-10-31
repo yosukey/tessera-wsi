@@ -1,0 +1,84 @@
+[Unit]
+Description=Tessera - FastAPI backend (uvicorn)
+Documentation=https://github.com/yosukey/tessera-wsi
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wsi
+Group=wsi
+WorkingDirectory=/opt/wsi/services/app
+EnvironmentFile=/etc/wsi/wsi.env
+ExecStart=/opt/wsi/infra/systemd/start-wsi-app.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+# --- Sandboxing / hardening ---
+NoNewPrivileges=true
+# Default 0022 makes the SQLite DB (admin password hashes, JWT session state,
+# analytics identities) world-readable at /var/lib/wsi/wsi.db, since DATA_DIR
+# is 0755. 0027 creates new files 0640 / dirs 0750 so only the wsi user/group
+# can read them. Runtime file consumers are all the wsi user (nginx proxies
+# /thumbs/ and /assets/ THROUGH the app rather than reading disk), except the
+# avahi mDNS file, which network.py explicitly re-chmods to 0644.
+UMask=0027
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# ProtectSystem=strict mounts the whole hierarchy (including /run) read-only,
+# so every writable path must be listed explicitly. /run/wsi is the restore
+# IPC dir: the app writes /run/wsi/restore.request from the Backup & Restore
+# apply path and start-wsi-app.sh writes /run/wsi/restore.result on the next
+# boot. It is created out-of-band by /etc/tmpfiles.d/wsi.conf (not via
+# RuntimeDirectory=, which would wipe the request mid-restart), so without it
+# here the entire restore-apply flow fails with EROFS.
+#
+# A listed path that does not exist makes systemd fail the namespace setup
+# (status=226/NAMESPACE) and the service never starts — unless the entry
+# carries a "-" prefix, which skips it when absent. /var/lib/wsi (install.sh)
+# and /run/wsi (tmpfiles.d) always exist; /etc/avahi/services is only there
+# while avahi-daemon is installed, and without it the app merely cannot toggle
+# its mDNS advertisement, so it is optional.
+ReadWritePaths=/var/lib/wsi -/etc/avahi/services /run/wsi
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+# NOT ProcSubset=pid: the admin System page reads /proc and /sys through psutil
+# (cpu_freq, sensors_temperatures, virtual_memory, disk/net counters, boot_time)
+# and hiding the non-pid entries would empty half that dashboard.
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# The app opens files and sockets, never devices; a private /dev leaves it the
+# basic nodes (null/zero/(u)random/tty) and closes off the rest as a
+# post-compromise information-gathering surface. Safe for openslide/pillow,
+# which are pure file consumers.
+PrivateDevices=true
+RestrictRealtime=true
+# Runs as User=wsi, so it holds no capabilities to begin with; pinning the
+# bounding set to empty makes that explicit and survives a future unit edit
+# that adds AmbientCapabilities by mistake.
+CapabilityBoundingSet=
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# Refuse filtered syscalls with EPERM instead of killing the process
+# (the default action is SIGSYS). numpy's bundled OpenBLAS calls mbind()
+# (@resources) while it initialises at import time and carries on if that
+# fails; with the default action the whole worker core-dumps on startup
+# (status=31/SYS) as soon as the OME-TIFF reader imports numpy.
+SystemCallErrorNumber=EPERM
+# openslide / pillow may load JIT-ish native code; leave MemoryDenyWriteExecute off.
+
+# --- Resources (tune as needed) ---
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

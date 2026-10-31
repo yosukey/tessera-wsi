@@ -1,0 +1,42 @@
+# Development-only dependencies for the WSI app.
+#
+# Ranges only, like requirements.txt: install the generated, hash-pinned
+# requirements-dev.lock (`make venv-dev`, or
+# `pip install --require-hashes -r requirements-dev.lock`), which also pins the
+# runtime deps to exactly requirements.lock's versions. Run `make lock` after
+# editing this file.
+#
+# Keep production-only deps in requirements.txt; anything that isn't shipped
+# to the running service (test runners, type checkers, linters, etc.) goes
+# here so production images can opt out via the prod-only file.
+
+-r requirements.txt
+
+# Same policy as requirements.txt: every entry carries an upper bound at the
+# next major — or, for the calendar-versioned tifffile, the next year — so a
+# lock refresh picks up bug-fix and feature releases of the tested line but
+# never an untested major.
+# `make outdated` lists the releases past a bound; move the bounds together
+# once a new major has been tested, then `make lock`.
+#
+# Test runner. httpx is already in requirements.txt (runtime use for OAuth /
+# LDAP HTTP calls) so FastAPI's TestClient picks it up automatically.
+pytest>=8.0,<9.0
+pytest-asyncio>=0.23,<1.0
+# tifffile and numpy are runtime dependencies too (the OME-TIFF reader, see
+# requirements.txt). The tests also use them as writers: test_openslide_utils.py
+# synthesises multi-IFD TIFFs with custom per-IFD ImageDescription tags — the
+# form Aperio-convention macro/label pages take, which Pillow's save() can't
+# produce (it only stamps the tiffinfo dict onto IFD 0) — and
+# test_ome_tiff.py writes pyramidal OME-TIFF fixtures. Listed here as well so
+# the test suite's use doesn't hinge on the runtime list keeping them.
+tifffile>=2024.1.30,<2027
+numpy>=1.26,<3.0
+# test_openslide_utils.py does `import openslide` at module scope, which loads
+# the OpenSlide shared library via ctypes. On a Python-only machine (CI, a
+# fresh venv) that native library isn't present and collection fails before a
+# single test runs. openslide-bin ships the prebuilt shared library as a wheel
+# and openslide-python (>=1.4, see requirements.txt) auto-detects it, so the
+# suite is reproducible without installing system packages. Its version tracks
+# the bundled OpenSlide release, so the bound is OpenSlide's next major.
+openslide-bin>=4.0.0,<5

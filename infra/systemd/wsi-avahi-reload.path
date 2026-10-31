@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch /etc/avahi/services for WSI mDNS service file changes
+
+[Path]
+PathChanged=/etc/avahi/services
+Unit=wsi-avahi-reload.service
+
+[Install]
+WantedBy=multi-user.target

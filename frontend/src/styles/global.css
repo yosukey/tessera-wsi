@@ -1,0 +1,140 @@
+@import './tokens.css';
+@import './fonts.css';
+@import './reset.css';
+
+body {
+  font-family: var(--font-body);
+  font-size: var(--font-size-md);
+  line-height: var(--line-height-normal);
+  color: var(--color-text);
+  background: var(--color-bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: "palt";
+  font-variant-numeric: tabular-nums;
+  text-rendering: optimizeLegibility;
+}
+
+/* Full-viewport shell whose child <main> scrolls internally. Using an inner
+   scroll container (rather than letting the document body scroll) keeps a
+   bottom-anchored footer glued to the viewport on iOS Safari, where a
+   `position: fixed` footer detaches during the rubber-band overscroll. The
+   dvh value tracks the shrinking/growing viewport as mobile browser chrome
+   appears; the vh line is the fallback for browsers without dvh support. */
+.app-viewport {
+  height: 100vh;
+  height: 100dvh;
+}
+
+/* Set on <html> by useNoOverscroll (viewer, tour and admin pages): no
+   rubber-band / stretch at a scroll edge. The document's own is off
+   everywhere. Where touch input is available (any-pointer: coarse — on an
+   iPad also with a trackpad attached, which makes the primary pointer fine),
+   touch scrolling bounces scroll containers one by one (iOS), so it is also
+   off:
+   - sideways, for every element: tables and code blocks that scroll
+     horizontally. Only the x axis — `none` on both axes would make such a box
+     swallow a vertical swipe that started on it (Chromium doesn't hand a
+     swipe on from a container whose overscroll-behavior isn't `auto` in that
+     axis, even one it can't scroll), so the page under it would not scroll;
+   - on both axes, for the panels marked .overscroll-panel: the step text,
+     the side panels, the admin panes and modals. A drag that reaches such a
+     panel's end then stops there rather than carrying on — the price of no
+     bounce, which overscroll-behavior can't remove any other way.
+   A device with no touch input is left alone: its wheel scrolling chains on
+   to the page, which these would stop. (On a touch laptop the marked panels
+   do stop the wheel at their end.) */
+html.no-overscroll {
+  overscroll-behavior: none;
+}
+@media (any-pointer: coarse) {
+  html.no-overscroll * {
+    overscroll-behavior-x: none;
+  }
+  html.no-overscroll .overscroll-panel {
+    overscroll-behavior: none;
+  }
+}
+
+/* Set on <html> by useNoPageZoom (admin pages): no double-tap zoom and no
+   pinch-zoom where touch-action is honoured. Pans still go through, and an
+   OpenSeadragon canvas keeps its own pinch (its touch-action: none and
+   pointer-event handling are unaffected). */
+html.no-page-zoom {
+  touch-action: pan-x pan-y;
+}
+
+/* Set by the viewer pages (slide and tour) on their root, which itself has
+   touch-action: pan-x pan-y: the same on everything inside it. Down the tree
+   is normally enough, but WebKit (iOS / iPadOS Safari) starts again from
+   `auto` at every element with overflow auto / scroll — the step text, the
+   side panels, a wide code block — so a pinch there would zoom the page. JS
+   can't reliably stop it: once one finger has started scrolling such a panel,
+   the touchmove events of the pinch that follows are no longer cancelable.
+   The OpenSeadragon container and everything in it are left out — it sets
+   its own touch-action. :where() keeps this at zero specificity, so any rule
+   that sets touch-action on an element still wins. The @supports keeps the
+   minifier from merging this into the html.no-page-zoom rule above: a browser
+   without :where() drops a whole selector list it can't parse, and would
+   lose that rule with this one. */
+@supports selector(:where(*)) {
+  :where(.no-pinch-zoom *:not(.openseadragon-container, .openseadragon-container *)) {
+    touch-action: pan-x pan-y;
+  }
+}
+
+h1, h2, h3, h4, h5, h6 {
+  margin: 0;
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: var(--letter-spacing-tight);
+  color: var(--color-text);
+}
+
+a {
+  color: var(--color-brand-700);
+}
+a:hover {
+  color: var(--color-brand-600);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-focus);
+  border-radius: var(--radius-sm);
+}
+
+::selection {
+  background: var(--color-brand-100);
+  color: var(--color-brand-900);
+}
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+  border-radius: var(--radius-pill);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--color-text-faint); background-clip: padding-box; }
+
+/* Line height tuned for Japanese body text */
+.jp-prose { line-height: var(--line-height-loose); }
+.jp-prose p { margin-block: var(--space-3); }
+.jp-prose code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  padding: 1px 6px;
+  background: var(--color-surface-muted);
+  border-radius: var(--radius-sm);
+}
+.jp-prose pre {
+  background: var(--color-surface-muted);
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  overflow-x: auto;
+}
+.jp-prose pre code { background: none; padding: 0; }
+.jp-prose ul, .jp-prose ol { padding-left: 1.4em; }
