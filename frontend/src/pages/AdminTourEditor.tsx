@@ -129,9 +129,10 @@ export default function AdminTourEditor() {
   // startEdit, and replaced by the submitted state when a save lands while
   // newer edits are still open (see saveEdit). Used to detect unsaved changes
   // and confirm before discarding them. JSON-stringified once (instead of a
-  // structural compare every render) and fed into the `isDirty` memo below,
-  // which drives confirmDiscardIfDirty (Cancel, the dashboard link, switching
-  // to edit another step) plus the beforeunload guard.
+  // structural compare every render) and fed into the `stepDirty` memo below,
+  // which drives confirmDiscardStepIfDirty (Cancel, switching to edit another
+  // step) and, through isDirty, confirmDiscardIfDirty (the dashboard link),
+  // Back / Forward and the beforeunload guard.
   const [editBaseline, setEditBaseline] = useState<string | null>(null)
   // Id of the step whose save request is in flight, or null. Disables that
   // editor's Save button and every other step's Edit button until the

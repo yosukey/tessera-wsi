@@ -17,6 +17,7 @@ const api = vi.hoisted(() => ({
   adminUpdateTour: vi.fn(),
   adminDeleteStep: vi.fn(),
   adminDeleteTour: vi.fn(),
+  adminListMetadataOptions: vi.fn(),
   isManagerOrAboveFromToken: vi.fn(),
 }))
 // The viewer's pending pin, settable per test.
@@ -324,6 +325,7 @@ describe('AdminTourEditor unsaved-changes prompts', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Edit title' }))
     fireEvent.change(screen.getByDisplayValue('Tour'), { target: { value: 'Renamed' } })
     fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    expect(screen.getByRole('textbox', { name: 'Label' })).toBeTruthy()
     // The title row and the step editor each have a Cancel; the step's is last.
     const cancels = screen.getAllByRole('button', { name: 'Cancel' })
     fireEvent.click(cancels[cancels.length - 1])
@@ -331,6 +333,46 @@ describe('AdminTourEditor unsaved-changes prompts', () => {
     expect(screen.queryByRole('textbox', { name: 'Label' })).toBeNull()
     // The title edit is still open.
     expect(screen.getByDisplayValue('Renamed')).toBeTruthy()
+    confirmSpy.mockRestore()
+  })
+
+  it('names the metadata when only the metadata dialog holds unsaved picks', async () => {
+    api.adminGetTour.mockResolvedValue(detail(5, [step(1, 1)]))
+    api.adminListMetadataOptions.mockResolvedValue({ options: { level: ['basic', 'advanced'] } })
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    mount()
+    await screen.findByText('1. Step 1')
+    const open = screen.getByRole('button', { name: 'Metadata' }) as HTMLButtonElement
+    await waitFor(() => expect(open.disabled).toBe(false))
+    fireEvent.click(open)
+    const advanced = await screen.findByLabelText('advanced', { exact: false })
+    fireEvent.click(advanced)
+    // Leaving the editor (here its dashboard link) names the metadata too.
+    fireEvent.click(screen.getByRole('link', { name: '← Dashboard' }))
+    expect(confirmSpy).toHaveBeenLastCalledWith('You have unsaved changes to the tour metadata. Discard them?')
+    // And so does the dialog's own Cancel.
+    const cancels = screen.getAllByRole('button', { name: 'Cancel' })
+    fireEvent.click(cancels[cancels.length - 1])
+    expect(confirmSpy).toHaveBeenLastCalledWith('You have unsaved changes to the tour metadata. Discard them?')
+    expect(screen.getByRole('dialog')).toBeTruthy()
+    confirmSpy.mockRestore()
+  })
+
+  it('says just "changes" when the step and the title are both unsaved', async () => {
+    api.adminGetTour.mockResolvedValue(detail(5, [step(1, 1)]))
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    mount()
+    await screen.findByText('1. Step 1')
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Label' }), { target: { value: 'Changed' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Edit title' }))
+    fireEvent.change(screen.getByDisplayValue('Tour'), { target: { value: 'Renamed' } })
+    fireEvent.click(screen.getByRole('link', { name: '← Dashboard' }))
+    expect(confirmSpy).toHaveBeenCalledWith('You have unsaved changes. Discard them?')
+    // Cancelling the step editor still asks about the step alone.
+    const cancels = screen.getAllByRole('button', { name: 'Cancel' })
+    fireEvent.click(cancels[cancels.length - 1])
+    expect(confirmSpy).toHaveBeenLastCalledWith('You have unsaved changes in this step. Discard them?')
     confirmSpy.mockRestore()
   })
 })
