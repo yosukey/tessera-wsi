@@ -302,3 +302,35 @@ describe('AdminTourEditor writes that carry the tour revision', () => {
     vi.mocked(window.confirm).mockRestore()
   })
 })
+
+describe('AdminTourEditor unsaved-changes prompts', () => {
+  it('names the title, not the step, when only the title is unsaved', async () => {
+    api.adminGetTour.mockResolvedValue(detail(5, [step(1, 1)]))
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    mount()
+    await screen.findByText('1. Step 1')
+    fireEvent.click(screen.getByRole('button', { name: 'Edit title' }))
+    fireEvent.change(screen.getByDisplayValue('Tour'), { target: { value: 'Renamed' } })
+    fireEvent.click(screen.getByRole('link', { name: '← Dashboard' }))
+    expect(confirmSpy).toHaveBeenCalledWith('You have unsaved changes to the tour title. Discard them?')
+    confirmSpy.mockRestore()
+  })
+
+  it("doesn't ask about the step when cancelling an unchanged step editor beside an unsaved title", async () => {
+    api.adminGetTour.mockResolvedValue(detail(5, [step(1, 1)]))
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    mount()
+    await screen.findByText('1. Step 1')
+    fireEvent.click(screen.getByRole('button', { name: 'Edit title' }))
+    fireEvent.change(screen.getByDisplayValue('Tour'), { target: { value: 'Renamed' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    // The title row and the step editor each have a Cancel; the step's is last.
+    const cancels = screen.getAllByRole('button', { name: 'Cancel' })
+    fireEvent.click(cancels[cancels.length - 1])
+    expect(confirmSpy).not.toHaveBeenCalled()
+    expect(screen.queryByRole('textbox', { name: 'Label' })).toBeNull()
+    // The title edit is still open.
+    expect(screen.getByDisplayValue('Renamed')).toBeTruthy()
+    confirmSpy.mockRestore()
+  })
+})

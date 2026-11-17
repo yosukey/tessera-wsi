@@ -92,7 +92,8 @@ describe('TourMetadataModal', () => {
     await waitFor(() => expect(checkbox('advanced')).toBeTruthy())
     fireEvent.click(checkbox('advanced'))
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
-    expect(confirmSpy).toHaveBeenCalled()
+    // Names the metadata, not the step editor's "changes in this step".
+    expect(confirmSpy).toHaveBeenCalledWith('You have unsaved changes to the tour metadata. Discard them?')
     expect(props.onClose).not.toHaveBeenCalled()
     confirmSpy.mockRestore()
   })

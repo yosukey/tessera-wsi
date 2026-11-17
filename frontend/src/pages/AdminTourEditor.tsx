@@ -66,6 +66,7 @@ import {
   type Step,
   type StepSaveResult,
   applyStepOrder,
+  discardConfirmKey,
   makePinId,
   makeShapeId,
   mergeStep,
@@ -168,19 +169,17 @@ export default function AdminTourEditor() {
   const selected = useMemo(() => sortedSteps.find((s) => s.id === selectedStepId) || null, [sortedSteps, selectedStepId])
   const editingStep = useMemo(() => sortedSteps.find((s) => s.id === editingStepId) || null, [sortedSteps, editingStepId])
 
-  // Unsaved-changes guard. Dirty when an open step editor diverges from the
-  // saved baseline, the inline title editor diverges from the saved title, or
-  // the metadata dialog holds unsaved picks.
-  const isDirty = useMemo(() => {
-    if (
-      editState
-      && editBaseline !== null
-      && JSON.stringify(editState) !== editBaseline
-    ) return true
-    if (editingTitle !== null && editingTitle !== (tour?.title ?? '')) return true
-    if (metadataDirty) return true
-    return false
-  }, [editState, editBaseline, editingTitle, tour, metadataDirty])
+  // Unsaved-changes guard, per source: an open step editor that diverges from
+  // its saved baseline, the inline title editor diverging from the saved
+  // title, and the metadata dialog holding unsaved picks. Kept apart so each
+  // prompt names what would actually be lost.
+  const stepDirty = useMemo(
+    () => !!editState && editBaseline !== null && JSON.stringify(editState) !== editBaseline,
+    [editState, editBaseline],
+  )
+  const titleDirty = editingTitle !== null && editingTitle !== (tour?.title ?? '')
+  const isDirty = stepDirty || titleDirty || metadataDirty
+  const discardMessage = t(discardConfirmKey(stepDirty, titleDirty, metadataDirty))
 
   // Mirror into a ref so the (mount-once) beforeunload listener always sees
   // the live value without re-subscribing on every keystroke.
@@ -202,18 +201,23 @@ export default function AdminTourEditor() {
   // Browser Back / Forward (BrowserRouter has no useBlocker) asks first too.
   // In-app exits go through leaveEditor so they don't stack on its history
   // sentinel.
-  const leaveEditor = useUnsavedNavigationGuard(isDirty, t('adminTour.discardChangesConfirm'))
+  const leaveEditor = useUnsavedNavigationGuard(isDirty, discardMessage)
   // Slide above sidebar on a narrow screen instead of a 560px sidebar that
   // leaves the slide no room.
   const stacked = useMediaQuery(TOUR_EDITOR_STACK_QUERY)
   const appHeight = useViewportHeight()
   const layout = tourEditorLayout(stacked, appHeight)
 
-  // Shared confirm for in-app actions that would discard unsaved edits
-  // (clicking the dashboard link, switching to edit another step). Returns
-  // true when it's safe to proceed.
+  // Confirm for leaving the editor (the dashboard link), which discards every
+  // unsaved edit. Returns true when it's safe to proceed.
   function confirmDiscardIfDirty(): boolean {
-    return !isDirty || confirm(t('adminTour.discardChangesConfirm'))
+    return !isDirty || confirm(discardMessage)
+  }
+  // Confirm for actions that discard only the open step editor's edits
+  // (Cancel, switching to edit another step): an unsaved title is kept by
+  // them, so it is no reason to ask.
+  function confirmDiscardStepIfDirty(): boolean {
+    return !stepDirty || confirm(t('adminTour.discardChangesConfirm'))
   }
 
   const viewer = useTourViewer({
@@ -546,7 +550,7 @@ export default function AdminTourEditor() {
     // Switching into another step's editor would silently replace the current
     // editState; warn first if the open editor has unsaved changes. Re-opening
     // the same step is a no-op refresh, so skip the prompt for it.
-    if (editingStepId !== step.id && !confirmDiscardIfDirty()) return
+    if (editingStepId !== step.id && !confirmDiscardStepIfDirty()) return
     setSelectedStepId(step.id)
     openEditor(step)
     setMsg('')
@@ -1193,10 +1197,10 @@ export default function AdminTourEditor() {
                   fovEstimated={!!slide && !slidePixelSize(slide)}
                   onSave={() => saveEdit(s.id)}
                   onCancel={() => {
-                    // Warn before discarding unsaved changes (isDirty compares
+                    // Warn before discarding unsaved changes (stepDirty compares
                     // against the snapshot taken at startEdit so brand-new
                     // pins / shapes / text edits don't get tossed silently).
-                    if (!confirmDiscardIfDirty()) return
+                    if (!confirmDiscardStepIfDirty()) return
                     resetEditorState()
                   }}
                 />

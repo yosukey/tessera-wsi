@@ -136,3 +136,16 @@ export function resolveStepSave(
       : { key: sameEditor ? 'adminTour.stepUpdatedEditsKept' : 'adminTour.stepUpdated' },
   }
 }
+
+// The i18n key of the "discard unsaved changes?" prompt for leaving the tour
+// editor, naming what is unsaved: the open step, the tour title or the tour
+// metadata, or just "changes" when more than one of them is.
+export function discardConfirmKey(step: boolean, title: boolean, metadata: boolean): string {
+  const count = Number(step) + Number(title) + Number(metadata)
+  if (count === 1) {
+    if (step) return 'adminTour.discardChangesConfirm'
+    if (title) return 'adminTour.discardTitleChangesConfirm'
+    return 'adminTour.discardMetadataChangesConfirm'
+  }
+  return 'adminTour.discardAllChangesConfirm'
+}
