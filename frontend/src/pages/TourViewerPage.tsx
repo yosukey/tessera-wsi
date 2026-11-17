@@ -46,10 +46,7 @@ import { useNoOverscroll } from '../hooks/useNoOverscroll'
 import { useViewerOverlays } from '../hooks/useViewerOverlays'
 import { useDebugParam } from '../hooks/useDebugParam'
 import { useMouseCoords } from '../hooks/useMouseCoords'
-import { PORTRAIT_TABLET_QUERY } from '../lib/tourEditorLayout'
-
-// When the step panel stacks under the slide (see `stacked` below).
-const TOUR_VIEWER_STACK_QUERY = `(max-width: 720px), ${PORTRAIT_TABLET_QUERY}`
+import { TOUR_VIEWER_STACK_QUERY } from '../lib/tourEditorLayout'
 
 // The tour data as last fetched, tagged with the route tokens it was fetched
 // for. Tour and steps live in one state object so they can never belong to two

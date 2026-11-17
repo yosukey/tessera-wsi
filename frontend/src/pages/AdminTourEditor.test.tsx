@@ -358,6 +358,23 @@ describe('AdminTourEditor unsaved-changes prompts', () => {
     confirmSpy.mockRestore()
   })
 
+  it('names the metadata when browser Back is pressed over unsaved picks', async () => {
+    api.adminGetTour.mockResolvedValue(detail(5, [step(1, 1)]))
+    api.adminListMetadataOptions.mockResolvedValue({ options: { level: ['basic', 'advanced'] } })
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    mount()
+    await screen.findByText('1. Step 1')
+    const open = screen.getByRole('button', { name: 'Metadata' }) as HTMLButtonElement
+    await waitFor(() => expect(open.disabled).toBe(false))
+    fireEvent.click(open)
+    fireEvent.click(await screen.findByLabelText('advanced', { exact: false }))
+    // The guard (useUnsavedNavigationGuard) works on window.history directly.
+    await act(async () => { window.history.back() })
+    await waitFor(() => expect(confirmSpy).toHaveBeenCalledWith('You have unsaved changes to the tour metadata. Discard them?'))
+    expect(screen.getByRole('dialog')).toBeTruthy()
+    confirmSpy.mockRestore()
+  })
+
   it('says just "changes" when the step and the title are both unsaved', async () => {
     api.adminGetTour.mockResolvedValue(detail(5, [step(1, 1)]))
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)

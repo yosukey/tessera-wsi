@@ -1,5 +1,6 @@
 import type { PinItem, Shape, TourStep, TransitionMode } from './api'
 import { makeUid } from './uid'
+import type { MessageKey } from './i18n/en'
 
 export type Step = TourStep
 
@@ -140,7 +141,7 @@ export function resolveStepSave(
 // The i18n key of the "discard unsaved changes?" prompt for leaving the tour
 // editor, naming what is unsaved: the open step, the tour title or the tour
 // metadata, or just "changes" when more than one of them is.
-export function discardConfirmKey(step: boolean, title: boolean, metadata: boolean): string {
+export function discardConfirmKey(step: boolean, title: boolean, metadata: boolean): MessageKey {
   const count = Number(step) + Number(title) + Number(metadata)
   if (count === 1) {
     if (step) return 'adminTour.discardChangesConfirm'

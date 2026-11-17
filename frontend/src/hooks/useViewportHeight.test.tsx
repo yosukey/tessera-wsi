@@ -33,9 +33,42 @@ describe('useViewportHeight', () => {
     const { result } = renderHook(() => useViewportHeight())
     act(() => { window.dispatchEvent(new Event('orientationchange')) })
     expect(result.current).toBe('1180px')
+    // Still the old size after the next frame (and the first re-check)...
+    act(() => { vi.advanceTimersByTime(150) })
+    expect(result.current).toBe('1180px')
+    // ...and settled only later: a later re-check picks it up.
     setInnerHeight(820)
     act(() => { vi.advanceTimersByTime(1000) })
     expect(result.current).toBe('820px')
+  })
+
+  describe('with screen.orientation', () => {
+    const had = Object.getOwnPropertyDescriptor(window.screen, 'orientation')
+    let orientation: EventTarget
+    beforeEach(() => {
+      orientation = new EventTarget()
+      Object.defineProperty(window.screen, 'orientation', { configurable: true, value: orientation })
+    })
+    afterEach(() => {
+      if (had) Object.defineProperty(window.screen, 'orientation', had)
+      else delete (window.screen as unknown as Record<string, unknown>).orientation
+    })
+
+    it('measures again after its change event too', () => {
+      const { result } = renderHook(() => useViewportHeight())
+      act(() => { orientation.dispatchEvent(new Event('change')) })
+      setInnerHeight(820)
+      act(() => { vi.advanceTimersByTime(1000) })
+      expect(result.current).toBe('820px')
+    })
+
+    it('stops listening to it once unmounted', () => {
+      const { unmount } = renderHook(() => useViewportHeight())
+      unmount()
+      const before = vi.getTimerCount()
+      orientation.dispatchEvent(new Event('change'))
+      expect(vi.getTimerCount()).toBe(before)
+    })
   })
 
   it('stops measuring once unmounted', () => {
