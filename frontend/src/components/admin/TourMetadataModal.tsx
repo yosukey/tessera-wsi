@@ -87,7 +87,7 @@ export default function TourMetadataModal({ tour, slideAttributes, onSaved, onCo
   function close() {
     // Not while a save is in flight: it would land after the dialog closed.
     if (saving) return
-    if (dirty && !confirm(t('adminTour.discardChangesConfirm'))) return
+    if (dirty && !confirm(t('adminTour.discardMetadataChangesConfirm'))) return
     onClose()
   }
   const closeRef = useRef(close)

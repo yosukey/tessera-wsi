@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { TourStep } from './api'
-import { applyStepOrder, mergeStep, resolveStepSave, type StepSaveResult } from './tourEditHelpers'
+import { applyStepOrder, discardConfirmKey, mergeStep, resolveStepSave, type StepSaveResult } from './tourEditHelpers'
 
 function step(id: number, revision: number | undefined, label = `s${id}`): TourStep {
   return {
@@ -117,5 +117,18 @@ describe('applyStepOrder: the step list after a reorder or delete, without a rel
     expect(out.map((s) => [s.id, s.order])).toEqual([[1, 1], [3, 2]])
     // Unchanged steps keep their identity.
     expect(out[0]).toBe(steps[0])
+  })
+})
+
+describe('discardConfirmKey: what the "discard unsaved changes?" prompt names', () => {
+  it('names the one thing that is unsaved', () => {
+    expect(discardConfirmKey(true, false, false)).toBe('adminTour.discardChangesConfirm')
+    expect(discardConfirmKey(false, true, false)).toBe('adminTour.discardTitleChangesConfirm')
+    expect(discardConfirmKey(false, false, true)).toBe('adminTour.discardMetadataChangesConfirm')
+  })
+
+  it('falls back to plain "changes" when more than one thing is unsaved', () => {
+    expect(discardConfirmKey(true, false, true)).toBe('adminTour.discardAllChangesConfirm')
+    expect(discardConfirmKey(true, true, true)).toBe('adminTour.discardAllChangesConfirm')
   })
 })
