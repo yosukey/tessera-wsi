@@ -21,7 +21,10 @@ const IPADS: Array<[string, number, number]> = [
   ['iPad Pro 11"', 834, 1194],
   ['iPad Pro 12.9"', 1024, 1366],
   ['iPad Pro 13"', 1032, 1376],
-  ['iPad Pro 12.9" (Display Zoom: More Space)', 1192, 1590],
+  // Display Zoom: More Space. No published figure; 1192 x 1590 is the
+  // 12.9" as commonly quoted, and the 13" scaled by the same factor.
+  ['iPad Pro 12.9" (More Space)', 1192, 1590],
+  ['iPad Pro 13" (More Space, estimated)', 1202, 1603],
 ]
 
 describe.each([
