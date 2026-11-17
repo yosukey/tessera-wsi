@@ -46,6 +46,10 @@ import { useNoOverscroll } from '../hooks/useNoOverscroll'
 import { useViewerOverlays } from '../hooks/useViewerOverlays'
 import { useDebugParam } from '../hooks/useDebugParam'
 import { useMouseCoords } from '../hooks/useMouseCoords'
+import { PORTRAIT_TABLET_QUERY } from '../lib/tourEditorLayout'
+
+// When the step panel stacks under the slide (see `stacked` below).
+const TOUR_VIEWER_STACK_QUERY = `(max-width: 720px), ${PORTRAIT_TABLET_QUERY}`
 
 // The tour data as last fetched, tagged with the route tokens it was fetched
 // for. Tour and steps live in one state object so they can never belong to two
@@ -77,9 +81,11 @@ export default function TourViewerPage() {
   const appHeight = useViewportHeight()
   // Phone portrait (and other narrow windows): the step panel alone is wider
   // than the screen, which would squeeze the slide pane (flex: 1, basis 0) to zero
-  // width. Below this breakpoint the panel stacks under the slide instead;
-  // above it, the panel sits beside the slide (width: see the <aside> below).
-  const stacked = useMediaQuery('(max-width: 720px)')
+  // width. Below this breakpoint the panel stacks under the slide instead, as
+  // it does on a portrait tablet (where side by side would leave the slide a
+  // tall strip), so rotating an iPad switches between the two; otherwise the
+  // panel sits beside the slide (width: see the <aside> below).
+  const stacked = useMediaQuery(TOUR_VIEWER_STACK_QUERY)
   const [slide, setSlide] = useState<Slide | null>(null)
   // Initial state must populate every field on ViewerSettings so the OSD
   // init effect's numeric dependencies (notably max_zoom_pixel_ratio)

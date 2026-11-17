@@ -1,5 +1,16 @@
 import { describe, expect, it } from 'vitest'
-import { tourEditorLayout } from './tourEditorLayout'
+import { PORTRAIT_TABLET_QUERY, TOUR_EDITOR_STACK_QUERY, tourEditorLayout } from './tourEditorLayout'
+
+describe('TOUR_EDITOR_STACK_QUERY', () => {
+  // So rotating an iPad (744–1032px wide upright) switches the layout.
+  it('stacks on a narrow window and on a portrait tablet', () => {
+    expect(TOUR_EDITOR_STACK_QUERY).toBe(`(max-width: 800px), ${PORTRAIT_TABLET_QUERY}`)
+    expect(PORTRAIT_TABLET_QUERY).toContain('(orientation: portrait)')
+    const maxWidth = Number(/max-width: (\d+)px/.exec(PORTRAIT_TABLET_QUERY)?.[1])
+    // Every upright iPad, up to the 13" Pro.
+    expect(maxWidth).toBeGreaterThanOrEqual(1032)
+  })
+})
 
 describe('tourEditorLayout', () => {
   it('keeps the fixed 560px sidebar beside the slide on a wide screen', () => {
