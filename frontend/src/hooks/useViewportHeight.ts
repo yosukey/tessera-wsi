@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
 
-// After a rotation, when to measure again (ms): iPadOS Safari can fire
-// `orientationchange` and even the first `resize` while the viewport still
-// has its pre-rotation size, and sends nothing once it has settled.
+// After a viewport change, when to measure again (ms): iPadOS browsers can
+// fire `orientationchange` and even the first `resize` while the viewport
+// still has its pre-rotation size, and send nothing once it has settled.
 const ROTATION_SETTLE_DELAYS_MS = [100, 300, 700]
 
 /**
@@ -21,10 +21,15 @@ const ROTATION_SETTLE_DELAYS_MS = [100, 300, 700]
  * `100dvh` stays as the pre-measurement default so the very first paint is
  * still full-height on browsers without `visualViewport`.
  *
- * A rotation is measured again a few times while it settles (see
+ * Every change is measured again a few times while it settles (see
  * ROTATION_SETTLE_DELAYS_MS): kept at the stale size, the layout would stay
  * as tall as the portrait screen in landscape (its bottom off screen) or as
- * short as the landscape one in portrait (a blank band below it).
+ * short as the landscape one in portrait (a blank band below it). Which
+ * events a rotation sends depends on the browser — an app built on WKWebView
+ * (Chrome, Edge, Firefox on iPad) need not send `orientationchange` at all —
+ * so a ResizeObserver on <html>, which reset.css sizes to the layout viewport,
+ * catches it too: it reports the new size from the layout itself, whatever
+ * events do or don't arrive.
  */
 export function useViewportHeight(): string {
   const [height, setHeight] = useState<string>('100dvh')
@@ -43,16 +48,19 @@ export function useViewportHeight(): string {
       timers = ROTATION_SETTLE_DELAYS_MS.map((ms) => window.setTimeout(measure, ms))
     }
     const orientation = typeof screen !== 'undefined' ? screen.orientation : undefined
+    const layoutViewport = typeof ResizeObserver === 'function' ? new ResizeObserver(settle) : null
     measure()
-    window.addEventListener('resize', measure)
+    window.addEventListener('resize', settle)
     window.addEventListener('orientationchange', settle)
     orientation?.addEventListener?.('change', settle)
-    window.visualViewport?.addEventListener('resize', measure)
+    window.visualViewport?.addEventListener('resize', settle)
+    layoutViewport?.observe(document.documentElement)
     return () => {
-      window.removeEventListener('resize', measure)
+      window.removeEventListener('resize', settle)
       window.removeEventListener('orientationchange', settle)
       orientation?.removeEventListener?.('change', settle)
-      window.visualViewport?.removeEventListener('resize', measure)
+      window.visualViewport?.removeEventListener('resize', settle)
+      layoutViewport?.disconnect()
       timers.forEach((id) => window.clearTimeout(id))
       if (frame !== null) window.cancelAnimationFrame(frame)
     }

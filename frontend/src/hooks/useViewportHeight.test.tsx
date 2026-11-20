@@ -42,6 +42,53 @@ describe('useViewportHeight', () => {
     expect(result.current).toBe('820px')
   })
 
+  // A WKWebView browser (Chrome on iPad) may send only a `resize`, and send it
+  // before the viewport has its new size.
+  it('measures again after a resize that came with the old size', () => {
+    const { result } = renderHook(() => useViewportHeight())
+    act(() => { window.dispatchEvent(new Event('resize')) })
+    act(() => { vi.advanceTimersByTime(150) })
+    expect(result.current).toBe('1180px')
+    setInnerHeight(820)
+    act(() => { vi.advanceTimersByTime(1000) })
+    expect(result.current).toBe('820px')
+  })
+
+  describe('with ResizeObserver', () => {
+    const had = (globalThis as { ResizeObserver?: unknown }).ResizeObserver
+    let observers: Array<{ cb: () => void; targets: Element[]; disconnected: boolean }>
+    beforeEach(() => {
+      observers = []
+      class FakeResizeObserver {
+        entry: { cb: () => void; targets: Element[]; disconnected: boolean }
+        constructor(cb: () => void) { this.entry = { cb, targets: [], disconnected: false }; observers.push(this.entry) }
+        observe(el: Element) { this.entry.targets.push(el) }
+        disconnect() { this.entry.disconnected = true }
+        unobserve() {}
+      }
+      ;(globalThis as { ResizeObserver?: unknown }).ResizeObserver = FakeResizeObserver
+    })
+    afterEach(() => {
+      ;(globalThis as { ResizeObserver?: unknown }).ResizeObserver = had
+    })
+
+    // No event at all: only the layout viewport (<html>) changed size.
+    it('measures when <html> changes size without any event', () => {
+      const { result } = renderHook(() => useViewportHeight())
+      expect(observers).toHaveLength(1)
+      expect(observers[0].targets).toEqual([document.documentElement])
+      setInnerHeight(820)
+      act(() => { observers[0].cb() })
+      expect(result.current).toBe('820px')
+    })
+
+    it('disconnects on unmount', () => {
+      const { unmount } = renderHook(() => useViewportHeight())
+      unmount()
+      expect(observers[0].disconnected).toBe(true)
+    })
+  })
+
   describe('with screen.orientation', () => {
     const had = Object.getOwnPropertyDescriptor(window.screen, 'orientation')
     let orientation: EventTarget

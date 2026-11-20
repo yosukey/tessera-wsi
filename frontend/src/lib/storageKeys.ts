@@ -10,6 +10,9 @@ export const STORAGE_KEYS = {
   // Time of the ErrorBoundary's last automatic reload after a missing lazy
   // chunk (sessionStorage), which caps those reloads to one per cooldown.
   chunkReload: 'wsi.chunkReload',
+  // Set (sessionStorage) by ?vpdebug=1, cleared by ?vpdebug=0: shows the
+  // viewport diagnostics panel (components/ViewportDiagnostics) in this tab.
+  viewportDiagnostics: 'wsi.vpdebug',
   // Job id of an in-progress admin backup, persisted (sessionStorage) so a
   // sidebar tab switch that unmounts AdminBackupSection can re-attach to the
   // running job on remount instead of losing its progress + double-start guard.
