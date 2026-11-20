@@ -561,7 +561,7 @@ export default function TourViewerPage() {
         // than a fixed 420px would leave it (over a third of an 11" iPad).
         ...(stacked
           ? { flex: '0 0 45%', borderTop: '1px solid var(--color-border)', overflow: 'auto' }
-          : { flex: '0 0 clamp(320px, 30vw, 420px)', borderLeft: '1px solid var(--color-border)' }),
+          : { flex: '0 0 clamp(320px, calc(var(--vp-width, 100vw) * 0.3), 420px)', borderLeft: '1px solid var(--color-border)' }),
         // As a flex item the panel otherwise defaults to min-width: auto, so
         // the step text's min-content width would override the basis: a wide table,
         // a code block or a long unbreakable word would stretch the panel (and

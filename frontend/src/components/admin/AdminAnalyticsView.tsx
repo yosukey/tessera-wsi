@@ -1081,7 +1081,7 @@ export default function AdminAnalyticsView() {
         <div
           className="overscroll-panel"
           aria-busy={recentPending || undefined}
-          style={{ maxHeight: 'calc(100vh - 240px)', overflow: 'auto', border: '1px solid var(--color-border)', borderRadius: 4, opacity: recentPending ? 0.55 : 1 }}
+          style={{ maxHeight: 'calc(var(--vp-height, 100vh) - 240px)', overflow: 'auto', border: '1px solid var(--color-border)', borderRadius: 4, opacity: recentPending ? 0.55 : 1 }}
         >
           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead style={{ position: 'sticky', top: 0, background: 'var(--color-surface)' }}>

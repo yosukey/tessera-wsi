@@ -26,6 +26,24 @@ body {
   height: 100dvh;
 }
 
+/* Set on <html> (with --vp-width / --vp-height, the measured visible
+   viewport) while the browser's layout viewport is out of step with the
+   screen — Chrome on iPad keeps the size the page was loaded at after a
+   rotation, so `100%` here, vw / vh and media queries all read the old
+   orientation's size (see lib/viewportBox). The app is sized to the screen
+   instead, and the stale extra width can't be scrolled into. Nothing changes
+   while the two agree. */
+html.vp-stale {
+  overflow-x: hidden;
+}
+html.vp-stale #root {
+  width: var(--vp-width);
+  height: var(--vp-height);
+}
+html.vp-stale .app-viewport {
+  height: var(--vp-height);
+}
+
 /* Set on <html> by useNoOverscroll (viewer, tour and admin pages): no
    rubber-band / stretch at a scroll edge. The document's own is off
    everywhere. Where touch input is available (any-pointer: coarse — on an

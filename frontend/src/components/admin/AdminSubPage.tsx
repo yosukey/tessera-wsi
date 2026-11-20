@@ -54,7 +54,7 @@ export default function AdminSubPage({
 
   return (
     <div style={{
-      minHeight: '100vh',
+      minHeight: 'var(--vp-height, 100vh)',
       background: 'var(--color-bg)',
       // Top spacing is owned by the sticky header below (via its paddingTop) so
       // it stays opaque and visible when pinned; the root keeps only the side
