@@ -8,5 +8,8 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
   // what each browser honours).
   useNoOverscroll()
   useNoPageZoom()
-  return <div className="admin-theme" style={{ minHeight: '100vh' }}>{children}</div>
+  // At least the screen's height: 100% of #root (the layout viewport), not
+  // 100vh, which on iPadOS Safari can be taller than what is on screen and
+  // would leave every admin page scrolling past its own bottom.
+  return <div className="admin-theme" style={{ minHeight: '100%' }}>{children}</div>
 }

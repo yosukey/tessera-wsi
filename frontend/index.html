@@ -2,7 +2,17 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!--
+      shrink-to-fit=no: iPadOS Safari (desktop-class browsing, the iPad
+      default) otherwise widens the layout up to the content's width and zooms
+      the page out whenever the content is laid out over 20px wider than the
+      screen. A rotation does that on its own: the first layout at the new
+      size still has the old orientation's DOM, before any JS has re-rendered
+      it. The widened layout then stays until the next rotation or reload (in
+      this SPA, for good), and with page zoom blocked the user can't undo it.
+      See WebKit's WebPage::shrinkToFitContent / ViewportConfiguration.
+    -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, shrink-to-fit=no" />
     <link rel="icon" href="/favicon.ico" />
     <title>Tessera</title>
     <!--
