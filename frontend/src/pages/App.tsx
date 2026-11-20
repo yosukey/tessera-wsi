@@ -4,6 +4,7 @@ import { getToken, getViewerSettings } from '../lib/api'
 import { useAnalyticsBeacon } from '../hooks/useAnalyticsBeacon'
 import { BASE_KEYS as INDEX_FILTER_KEYS } from '../components/index/types'
 import AnalyticsNoticeToast from '../components/AnalyticsNoticeToast'
+import ViewportDiagnostics from '../components/ViewportDiagnostics'
 
 // Route-level code splitting. Each page (and the admin group in particular,
 // which drags in the dashboard / analytics / backup / tour-editor surfaces)
@@ -251,6 +252,8 @@ export default function App() {
         </Routes>
       </Suspense>
       <AnalyticsNoticeToast />
+      {/* Off unless ?vpdebug=1 was opened in this tab. */}
+      <ViewportDiagnostics />
     </>
   )
 }
