@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { NO_PAGE_ZOOM_CLASS, useNoPageZoom } from './useNoPageZoom'
 
-const ORIGINAL = 'width=device-width, initial-scale=1.0, viewport-fit=cover'
+const ORIGINAL = 'width=device-width, initial-scale=1.0, viewport-fit=cover, shrink-to-fit=no'
 
 // jsdom has no Touch constructor, so a touchmove carries a fake `touches` list
 // of the given length (the hook registers no touchmove listener; the test

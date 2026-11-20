@@ -32,7 +32,8 @@ import {
   staffGetViewerOverlayDefaults,
 } from '../lib/api'
 import { useI18n } from '../lib/i18n'
-import { useMediaQuery } from '../hooks/useMediaQuery'
+import styles from './AdminDashboard.module.css'
+import { useViewportHeight } from '../hooks/useViewportHeight'
 import { useInFlight } from '../hooks/useInFlight'
 import { useStableCallback } from '../lib/useStableCallback'
 import { logger } from '../lib/logger'
@@ -128,12 +129,12 @@ function groupToursBySlide(tours: TourSummary[]): Record<number, TourSummary[]> 
 export default function AdminDashboard() {
   const { t } = useI18n()
   const nav = useNavigate()
-  // The desktop layout's 460px sidebar + 600px min main pane need ~1060px
-  // side by side, which overflows iPad widths (768/834 portrait, 1024
-  // landscape). Below that, keep the side-by-side layout but drop the fixed
-  // widths for a fluid 4:6 (sidebar:list) split so it fits the screen instead
-  // of overflowing horizontally.
-  const narrow = useMediaQuery('(max-width: 1080px)')
+  // The panes' widths: fixed sidebar + floored list on a wide screen, a fluid
+  // 4:6 split at 1080px and below (AdminDashboard.module.css, where a media
+  // query switches them in the same layout as an iPad rotation).
+  // The height is the visible viewport's, measured, as on the viewer and tour
+  // pages: on iPadOS Safari 100vh can be taller than what is on screen.
+  const appHeight = useViewportHeight()
 
   // Sticky stacking for the slide-list controls: the header (title + toolbar)
   // pins at the top of the scrollable main pane, the filter panel pins directly
@@ -1164,9 +1165,8 @@ export default function AdminDashboard() {
   const lockedOpacity = uploadRunning ? 0.4 : undefined
 
   return (
-    <div style={{ display: 'flex', height: '100vh', background: 'var(--color-bg)' }}>
-      <aside style={{
-        flex: narrow ? '4 1 0' : '0 0 460px',
+    <div style={{ display: 'flex', height: appHeight, background: 'var(--color-bg)' }}>
+      <aside className={styles.sidebar} style={{
         minWidth: 0,
         borderRight: '1px solid var(--color-border)',
         boxSizing: 'border-box',
@@ -1337,14 +1337,11 @@ export default function AdminDashboard() {
         </div>
       </aside>
 
-      {/* On desktop `minWidth: 600` keeps the slide rows readable next to the
-          fixed 460px sidebar (without it `flex: 1` would collapse them). When
-          narrow the panes share the width as a fluid 4:6 split, so the floor
-          is dropped to 0 to avoid forcing horizontal overflow. */}
+      {/* Flex basis and the 600px floor: see AdminDashboard.module.css. */}
       <main
-        className="overscroll-panel"
+        className={`overscroll-panel ${styles.main}`}
         inert={lockInert}
-        style={{ flex: narrow ? '6 1 0' : '1 1 0', minWidth: narrow ? 0 : 600, padding: '0 12px 12px', overflow: 'auto', opacity: lockedOpacity }}
+        style={{ padding: '0 12px 12px', overflow: 'auto', opacity: lockedOpacity }}
       >
         {edit && isManagerOrAboveFromToken() && (
           <SlideEditModal

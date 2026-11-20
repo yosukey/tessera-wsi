@@ -1,0 +1,29 @@
+/* The dashboard's two panes. Side by side, the fixed 460px sidebar and the
+   600px floor that keeps the slide rows readable need ~1060px; at 1080px and
+   below (iPads, narrow windows) the panes share the width as a fluid 4:6
+   split instead, the floor dropped so nothing forces horizontal overflow.
+
+   A media query rather than JS state on purpose: right after an iPad
+   rotation Safari lays the page out at the new width before any JS has run,
+   and a layout that is then wider than the screen makes it widen the page
+   and zoom it out (see the viewport meta in index.html). CSS switches in that
+   same layout, so it never overflows. */
+.sidebar {
+  flex: 0 0 460px;
+}
+
+.main {
+  flex: 1 1 0;
+  min-width: 600px;
+}
+
+@media (max-width: 1080px) {
+  .sidebar {
+    flex: 4 1 0;
+  }
+
+  .main {
+    flex: 6 1 0;
+    min-width: 0;
+  }
+}
