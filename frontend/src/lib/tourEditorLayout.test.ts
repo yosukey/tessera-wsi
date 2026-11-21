@@ -1,17 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { TOUR_EDITOR_STACK_QUERY, TOUR_VIEWER_STACK_QUERY, tourEditorLayout } from './tourEditorLayout'
+import { matchesViewportQuery } from './viewportBox'
 
-// Evaluates the media-query lists these constants use — comma-separated
-// alternatives of `and`-joined `(max-width: Npx)` / `(orientation: …)` —
-// for a viewport of the given CSS size, as a browser would. Throws on any
-// other feature, so a query this can't read fails the test.
+// As a browser would evaluate them for a viewport of that size (the same
+// evaluator the app uses while the layout viewport is stale).
 function matches(query: string, width: number, height: number): boolean {
-  return query.split(',').some((alt) => alt.trim().split(/\s+and\s+/).every((cond) => {
-    const m = /^\((max-width|orientation):\s*(\d+px|portrait|landscape)\)$/.exec(cond.trim())
-    if (!m) throw new Error(`unsupported media condition: ${cond}`)
-    if (m[1] === 'max-width') return width <= parseInt(m[2], 10)
-    return (height >= width ? 'portrait' : 'landscape') === m[2]
-  }))
+  const m = matchesViewportQuery(query, width, height)
+  if (m === null) throw new Error(`cannot evaluate ${query}`)
+  return m
 }
 
 // Upright CSS-px sizes; landscape is the same with the sides swapped.

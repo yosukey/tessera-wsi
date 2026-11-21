@@ -34,6 +34,7 @@ import {
 import { useI18n } from '../lib/i18n'
 import styles from './AdminDashboard.module.css'
 import { useViewportHeight } from '../hooks/useViewportHeight'
+import { useMediaQuery } from '../hooks/useMediaQuery'
 import { useInFlight } from '../hooks/useInFlight'
 import { useStableCallback } from '../lib/useStableCallback'
 import { logger } from '../lib/logger'
@@ -130,8 +131,9 @@ export default function AdminDashboard() {
   const { t } = useI18n()
   const nav = useNavigate()
   // The panes' widths: fixed sidebar + floored list on a wide screen, a fluid
-  // 4:6 split at 1080px and below (AdminDashboard.module.css, where a media
-  // query switches them in the same layout as an iPad rotation).
+  // 4:6 split at 1080px and below (AdminDashboard.module.css: a media query,
+  // plus this flag for when the browser's layout viewport is stale).
+  const fluid = useMediaQuery('(max-width: 1080px)')
   // The height is the visible viewport's, measured, as on the viewer and tour
   // pages: on iPadOS Safari 100vh can be taller than what is on screen.
   const appHeight = useViewportHeight()
@@ -1165,7 +1167,7 @@ export default function AdminDashboard() {
   const lockedOpacity = uploadRunning ? 0.4 : undefined
 
   return (
-    <div style={{ display: 'flex', height: appHeight, background: 'var(--color-bg)' }}>
+    <div className={fluid ? styles.fluid : undefined} style={{ display: 'flex', height: appHeight, background: 'var(--color-bg)' }}>
       <aside className={styles.sidebar} style={{
         minWidth: 0,
         borderRight: '1px solid var(--color-border)',

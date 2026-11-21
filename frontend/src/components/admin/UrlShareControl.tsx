@@ -319,7 +319,7 @@ function PopoverShare({ routes, downloadName, hint }: { routes: ShareRoute[]; do
             gap: 8,
             // Never taller than the viewport: with QR panels expanded the
             // content scrolls inside the popover instead of spilling off-screen.
-            maxHeight: 'calc(100vh - 16px)',
+            maxHeight: 'calc(var(--vp-height, 100vh) - 16px)',
             overflowY: 'auto',
           }}
         >

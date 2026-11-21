@@ -3,11 +3,15 @@
    below (iPads, narrow windows) the panes share the width as a fluid 4:6
    split instead, the floor dropped so nothing forces horizontal overflow.
 
-   A media query rather than JS state on purpose: right after an iPad
-   rotation Safari lays the page out at the new width before any JS has run,
-   and a layout that is then wider than the screen makes it widen the page
-   and zoom it out (see the viewport meta in index.html). CSS switches in that
-   same layout, so it never overflows. */
+   The switch is made twice over, each covering a case the other gets wrong:
+   - a media query, so that right after an iPad rotation, when Safari lays
+     the page out at the new width before any JS has run, it is already
+     right (a layout wider than the screen then makes Safari widen the page
+     and zoom it out; see the viewport meta in index.html);
+   - `.fluid`, set from JS (useMediaQuery), for while the browser's layout
+     viewport is stale (`html.vp-stale`, Chrome on iPad after a rotation; see
+     lib/viewportBox): the media query then answers for the old size, so it
+     is ignored and the measured width decides. */
 .sidebar {
   flex: 0 0 460px;
 }
@@ -17,12 +21,21 @@
   min-width: 600px;
 }
 
+.fluid .sidebar {
+  flex: 4 1 0;
+}
+
+.fluid .main {
+  flex: 6 1 0;
+  min-width: 0;
+}
+
 @media (max-width: 1080px) {
-  .sidebar {
+  :global(html:not(.vp-stale)) .sidebar {
     flex: 4 1 0;
   }
 
-  .main {
+  :global(html:not(.vp-stale)) .main {
     flex: 6 1 0;
     min-width: 0;
   }

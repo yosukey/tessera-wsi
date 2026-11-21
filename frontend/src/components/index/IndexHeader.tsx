@@ -366,7 +366,7 @@ export default function IndexHeader({
         // Cap the open panel and let it scroll internally: the header doesn't
         // scroll with the page (only <main> does), so a tall filter list must
         // stay reachable on short viewports without pushing the layout off-screen.
-        <div id="index-filter-panel" style={{ padding: '12px 24px 14px', display: 'flex', flexDirection: 'column', gap: 8, maxHeight: '40vh', overflowY: 'auto' }}>
+        <div id="index-filter-panel" style={{ padding: '12px 24px 14px', display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 'calc(var(--vp-height, 100vh) * 0.4)', overflowY: 'auto' }}>
           {groupKeys.map(key => {
             const selected = selectedValues(searchParams, key)
             const rawItems = facets.groups[key] || []

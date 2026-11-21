@@ -274,7 +274,7 @@ export default function AdminPerformancePage() {
   }
 
   return (
-    <div style={{ minHeight: '100vh', background: 'var(--color-bg)', padding: '0 var(--space-4) var(--space-5)' }}>
+    <div style={{ minHeight: 'var(--vp-height, 100vh)', background: 'var(--color-bg)', padding: '0 var(--space-4) var(--space-5)' }}>
       <div style={{ maxWidth: 1400, margin: '0 auto' }}>
         <div style={{
           position: 'sticky',

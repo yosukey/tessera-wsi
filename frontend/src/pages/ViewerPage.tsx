@@ -732,7 +732,7 @@ function PresenterAbsentBanner({ message }: { message: string }) {
       position: 'absolute', top: 48, left: '50%', transform: 'translateX(-50%)',
       zIndex: 30, background: 'rgba(180, 83, 9, 0.92)', color: '#fff',
       padding: '6px 14px', borderRadius: 999, fontSize: 12, fontWeight: 600,
-      letterSpacing: '0.02em', maxWidth: '90vw', textAlign: 'center',
+      letterSpacing: '0.02em', maxWidth: 'calc(var(--vp-width, 100vw) * 0.9)', textAlign: 'center',
     }}>
       {message}
     </div>

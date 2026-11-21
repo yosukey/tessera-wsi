@@ -143,7 +143,7 @@ export default function AdminLogin() {
 
   return (
     <div style={{
-      minHeight: '100vh',
+      minHeight: 'var(--vp-height, 100vh)',
       background: 'var(--color-bg)',
       display: 'flex',
       alignItems: 'center',

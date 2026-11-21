@@ -4,6 +4,7 @@ import { APP_INFO } from '../lib/appInfo'
 import { safeSessionGetItem, safeSessionRemoveItem, safeSessionSetItem } from '../lib/safeStorage'
 import { STORAGE_KEYS } from '../lib/storageKeys'
 import { TOUR_EDITOR_STACK_QUERY, TOUR_VIEWER_STACK_QUERY } from '../lib/tourEditorLayout'
+import { matchesViewportQuery, measureViewportBox, VIEWPORT_STALE_CLASS } from '../lib/viewportBox'
 
 // `?vpdebug=1` turns the panel on for this tab (it survives in-app navigation
 // and reloads), `?vpdebug=0` turns it off. Nothing is shown otherwise.
@@ -43,7 +44,13 @@ export function viewportSnapshot(): string[] {
       : 'visual (no visualViewport)',
     `doc.scroll ${de.scrollWidth}x${de.scrollHeight}  overflowX ${de.scrollWidth - window.innerWidth}  overflowY ${de.scrollHeight - window.innerHeight}  at ${r(window.scrollX)},${r(window.scrollY)}`,
     `page root ${page ? `${r(page.width)}x${r(page.height)} at ${r(page.left)},${r(page.top)}` : '-'}`,
-    `media ${QUERIES.map(([name, q]) => `${name}=${window.matchMedia(q).matches ? 1 : 0}`).join(' ')}`,
+    `media(css) ${QUERIES.map(([name, q]) => `${name}=${window.matchMedia(q).matches ? 1 : 0}`).join(' ')}`,
+    (() => {
+      const box = measureViewportBox()
+      const fix = de.classList.contains(VIEWPORT_STALE_CLASS)
+      return `stale layout viewport ${box.stale ? 'YES' : 'no'}  fix ${fix ? `ON ${de.style.getPropertyValue('--vp-width')}x${de.style.getPropertyValue('--vp-height')}` : 'off'}`
+        + `\nmedia(measured) ${QUERIES.map(([name, q]) => `${name}=${matchesViewportQuery(q, box.width, box.height) ? 1 : 0}`).join(' ')}`
+    })(),
   ]
 }
 

@@ -143,7 +143,7 @@ const listStyle: React.CSSProperties = {
   // With many concurrent presenters this list could otherwise grow tall enough
   // to push the header off-screen (the banner sits in the sticky top stack).
   // Cap it and let the rows scroll within the banner instead.
-  maxHeight: '40vh',
+  maxHeight: 'calc(var(--vp-height, 100vh) * 0.4)',
   overflowY: 'auto',
   overscrollBehavior: 'contain',
 }
