@@ -119,11 +119,11 @@ def _client_only(fn: Callable[[dict], Any]) -> Callable[[dict], Any]:
 
 
 def _defang_parts(text: str) -> str:
-    """``text`` with every ';'-separated part defanged on its own (see
-    csv_export.csv_safe, which does the per-part split for every exported
-    cell that csv.writer leaves unquoted — a quoted cell stays one cell even
-    in a ';'-separated locale): a spreadsheet that splits cells on ';' would otherwise see a later
-    part starting with "=" as a formula. Applied to the joined text, not per
+    """``text`` with every part after a ';' or a line break defanged on its
+    own (it is csv_export.csv_safe, which the CSV writer also applies to every
+    exported cell, quoted or not): a spreadsheet in a ';'-separator locale
+    starts a new cell at each ';' and a new row at each line break, so a later
+    part starting with "=" would otherwise be a formula. Applied to the joined text, not per
     value, so a value that itself holds ';' (a slide title "A;=B") cannot
     carry a formula past it."""
     return csv_safe(text)
@@ -337,7 +337,8 @@ def _cell(v: Any) -> Any:
     timestamp, a tile format, a headline number — can arrive as a string
     such as "x;=1". (csv_response's own csv_safe pass would defang it too;
     doing it here keeps csv_row's output safe on its own.) A benign value
-    comes out unchanged (no part of it starts with a formula character)."""
+    comes out unchanged (no part of it starts with a formula character, even
+    after leading whitespace)."""
     if isinstance(v, bool):
         return "true" if v else "false"
     if isinstance(v, (dict, list)):

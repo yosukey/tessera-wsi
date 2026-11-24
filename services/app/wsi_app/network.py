@@ -3,7 +3,6 @@ from __future__ import annotations
 import functools
 import hashlib
 import ipaddress
-import itertools
 import json
 import logging
 import os
@@ -263,23 +262,23 @@ _IPV4_MAPPED_NET = ipaddress.ip_network("::ffff:0:0/96")
 
 @functools.lru_cache(maxsize=16)
 def _warn_oversized_rules(digest: str, count: int) -> None:
-    """Log, once per distinct stored rule list, that rules past the cap are ignored.
+    """Log, once per distinct stored rule list, that it exceeds the save cap.
 
     The save path refuses a list longer than :data:`MAX_IP_RULES`, but a row
-    written some other way (a backup restored from an older release, a hand
-    edit) can still hold one, and :func:`rules_allow_ip` silently stops
-    reading at the cap — a ``deny`` entry past it would simply never apply.
-    That has to be visible to the operator, so :func:`refresh` reports it
-    here. The settings refresh loop reloads the same row every few seconds in
+    written some other way (a list saved by an older release, a backup
+    restored from one, a hand edit) can still hold one. Every rule is still
+    enforced, but the operator should know that the list costs more per
+    request than intended and cannot be saved again until it is trimmed, so
+    :func:`refresh` reports it here. The settings refresh loop reloads the same row every few seconds in
     every process; caching on the digest of the stored JSON keeps that to a
     single line per process per distinct list (a changed list has a new
     digest and is reported again).
     """
     logger.warning(
-        "IP filter: the stored rule list has %d entries; only the first %d are "
-        "evaluated and the remaining %d are IGNORED. Aggregate the rules into "
-        "CIDR ranges and save the IP filter again.",
-        count, MAX_IP_RULES, count - MAX_IP_RULES,
+        "IP filter: the stored rule list has %d entries, more than the %d a "
+        "save accepts. All of them are still enforced, but the list cannot be "
+        "saved again until it is trimmed: aggregate the rules into CIDR ranges.",
+        count, MAX_IP_RULES,
     )
 
 
@@ -343,7 +342,7 @@ def rules_allow_ip(client_ip: str, enabled: bool, default: str, rules) -> bool:
     if addr is None:
         return default == "allow"
 
-    for rule in itertools.islice(rules, MAX_IP_RULES):
+    for rule in rules:
         if not isinstance(rule, dict):
             continue
         ip_str = rule.get("ip", "")

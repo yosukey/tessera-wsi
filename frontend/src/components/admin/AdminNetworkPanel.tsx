@@ -558,8 +558,9 @@ export default function AdminNetworkPanel({ onDirtyChange }: {
             setNetMsgIsError(true)
             return
           }
-          // The server refuses a longer list with a 422 (and only ever reads
-          // the first MAX_IP_RULES of a stored one); say so up front.
+          // The server refuses to save a longer list (422); say so up front.
+          // (A longer stored list is still enforced in full; deleting rows
+          // stays possible so it can be trimmed.)
           if (netSettings.ip_rules.length > MAX_IP_RULES) {
             setNetMsg(t('adminDash.ipRuleLimit', { n: MAX_IP_RULES }))
             setNetMsgIsError(true)

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 import threading
 from typing import Iterable, Iterator, Optional
 
@@ -187,6 +188,12 @@ def resolve_export_limit(requested: Optional[int], retention_max_rows: int) -> i
     return cap
 
 
+# What a ';'-separator spreadsheet import starts a new cell (';') or a new
+# row (CR, LF, CRLF — CRLF first, so it counts as one break) at, whatever the
+# CSV quoting. Captured, so a split keeps the separators for the re-join.
+_CSV_PART_SEP = re.compile(r"(;|\r\n|\r|\n)")
+
+
 def _formula_like(part: str) -> bool:
     return part.startswith(_CSV_FORMULA_LEAD) or part.lstrip(_CSV_LEADING_SPACE).startswith(
         _CSV_FORMULA_LEAD
@@ -221,6 +228,12 @@ def csv_safe(v):
     ``Mozilla/5.0 (compatible; Googlebot/2.1; +http://…)`` exports as
     ``…Googlebot/2.1;' +http://…)``.
 
+    Line breaks split the same way. Such an import does not honour the CSV
+    double quotes, so a CR or LF inside a (quoted) field ends the spreadsheet
+    row, and the text after it starts a new row's first cell: an error-log
+    message "x\\n=HYPERLINK(…)" would become a live formula. So the parts
+    after every ';', CR, LF and CRLF are checked alike.
+
     A value with no such part comes out unchanged. Idempotent (a defanged
     part starts with the quote), so applying it twice — perf_export defangs its cells,
     then the CSV writer runs every cell through here — changes nothing more.
@@ -229,12 +242,15 @@ def csv_safe(v):
     if not isinstance(v, str):
         return v
     head = "'" + v if _formula_like(v) else v
-    if ";" not in v:
+    pieces = _CSV_PART_SEP.split(head)
+    if len(pieces) == 1:
         return head
-    first, sep, rest = head.partition(";")
-    return first + sep + ";".join(
-        "'" + part if _formula_like(part) else part for part in rest.split(";")
-    )
+    # pieces alternates part, separator, part, …; the first part is the start
+    # of the value, already handled above.
+    for i in range(2, len(pieces), 2):
+        if _formula_like(pieces[i]):
+            pieces[i] = "'" + pieces[i]
+    return "".join(pieces)
 
 
 def _iter_csv(header: list[str], rows: Iterable[list]):

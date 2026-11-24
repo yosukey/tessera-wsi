@@ -10,7 +10,9 @@
 // - Every ';'-separated part is checked the same way, whatever the CSV
 //   quoting: a spreadsheet in a ';'-separator locale splits the text on ';',
 //   and there the commas between columns are not separators, so a quoted
-//   field's ';' still starts a new cell.
+//   field's ';' still starts a new cell. The same goes for the parts after a
+//   CR, LF or CRLF: such an import ends the row at a line break even inside
+//   a quoted field, so the next part opens a new row's first cell.
 // - Idempotent (a defanged part starts with the quote); a value with no such
 //   part comes out unchanged.
 
@@ -26,12 +28,20 @@ function formulaLike(part: string): boolean {
   return startsWithFormulaLead(part) || startsWithFormulaLead(part.replace(LEADING_SPACE, ''))
 }
 
+// Cell (';') and row (CR, LF, CRLF — CRLF first) boundaries of a
+// ';'-separator import; captured so split() keeps them for the re-join.
+const PART_SEP = /(;|\r\n|\r|\n)/
+
 export function csvSafe(v: string): string {
   const head = formulaLike(v) ? `'${v}` : v
-  const at = head.indexOf(';')
-  if (at < 0) return head
-  const rest = head.slice(at + 1).split(';').map((part) => (formulaLike(part) ? `'${part}` : part))
-  return `${head.slice(0, at)};${rest.join(';')}`
+  const pieces = head.split(PART_SEP)
+  if (pieces.length === 1) return head
+  // pieces alternates part, separator, part, …; the first part is the start
+  // of the value, already handled above.
+  for (let i = 2; i < pieces.length; i += 2) {
+    if (formulaLike(pieces[i])) pieces[i] = `'${pieces[i]}`
+  }
+  return pieces.join('')
 }
 
 // One CSV field: defanged, then quoted as Python's csv.writer (QUOTE_MINIMAL,

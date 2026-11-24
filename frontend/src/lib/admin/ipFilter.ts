@@ -17,8 +17,8 @@
 //   an IPv4 client seen through a dual-stack socket as ::ffff:a.b.c.d is
 //   judged (loopback exemption included) as a.b.c.d;
 // - network.rules_allow_ip — loopback is always allowed; a disabled filter
-//   allows; an unparseable client IP gets the default policy; only the first
-//   MAX_IP_RULES rules are read (the server refuses to save more); they are
+//   allows; an unparseable client IP gets the default policy; every rule is
+//   read (the server only refuses to SAVE more than MAX_IP_RULES); they are
 //   tried in order and the first match decides (CIDR membership, or address
 //   equality for a bare address); a rule that does not parse is skipped;
 //   nothing matching falls through to the default policy;
@@ -58,8 +58,9 @@ type CompiledRule =
   | { kind: 'host'; ip: ParsedIp }
   | { kind: 'net'; version: IpVersion; value: bigint; prefix: number }
 
-// network.MAX_IP_RULES: the server refuses to save a longer list and stops
-// reading a stored one at this many entries.
+// network.MAX_IP_RULES: the server refuses to save a longer list (a stored one
+// that is longer — from an older release or a restore — is still enforced in
+// full).
 export const MAX_IP_RULES = 1000
 
 export interface IpFilterRule {
@@ -270,8 +271,10 @@ function compileIpRule(raw: string): CompiledRule | null {
       return { kind: 'host', ip: canonicalIp({ version: net.version, value: net.value, scope: net.scope }) }
     }
     // A prefix of 96 or more keeps the network inside ::ffff:0:0/96 exactly
-    // when its network address is (net.subnet_of(_IPV4_MAPPED_NET)).
-    const v4 = net.prefix >= 96 ? ipv4Mapped(net.version, net.value) : null
+    // when its network address is (net.subnet_of(_IPV4_MAPPED_NET)). Python's
+    // subnet_of is False for a network that keeps a zone (%eth0), so such a
+    // rule stays IPv6 there, and here.
+    const v4 = net.prefix >= 96 && net.scope === null ? ipv4Mapped(net.version, net.value) : null
     if (v4 !== null) return { kind: 'net', version: 4, value: v4, prefix: net.prefix - 96 }
     return { kind: 'net', version: net.version, value: net.value, prefix: net.prefix }
   }
@@ -306,14 +309,14 @@ export function isLoopbackIp(clientIp: string): boolean {
 
 // The first rule that matches `clientIp` (the one that decides for it, unless
 // it is loopback), or undefined when none does or the IP does not parse.
-// Like the server, only the first MAX_IP_RULES rules are considered.
+// Like the server, every rule is considered, however long the list.
 export function firstMatchingIpRule<R extends IpFilterRule>(
   clientIp: string,
   rules: readonly R[],
 ): R | undefined {
   const ip = parseClientIp(clientIp)
   if (!ip) return undefined
-  return rules.slice(0, MAX_IP_RULES).find((r) => {
+  return rules.find((r) => {
     const compiled = compileIpRule(r.ip)
     return !!compiled && ruleMatches(compiled, ip)
   })

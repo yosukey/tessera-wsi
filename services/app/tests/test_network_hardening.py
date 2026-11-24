@@ -67,11 +67,13 @@ def test_malformed_rules_are_skipped_not_raised():
     assert _network.rules_allow_ip("198.51.100.5", True, "allow", rules)
 
 
-def test_rules_past_the_cap_are_not_evaluated():
+def test_rules_past_the_save_cap_are_still_enforced():
+    """A list longer than the save cap (saved by an older release, restored,
+    hand-edited) is evaluated in full: a deny past the cap still applies."""
     filler = [{"ip": f"10.{i // 256}.{i % 256}.1", "action": "allow"}
               for i in range(_network.MAX_IP_RULES)]
     late_deny = {"ip": "203.0.113.5", "action": "deny"}
-    assert _network.rules_allow_ip("203.0.113.5", True, "allow", filler + [late_deny])
+    assert not _network.rules_allow_ip("203.0.113.5", True, "allow", filler + [late_deny])
     assert not _network.rules_allow_ip("203.0.113.5", True, "allow", filler[:-1] + [late_deny])
 
 
@@ -95,7 +97,8 @@ def _settings_row(rules):
 
 
 def test_an_oversized_stored_rule_list_is_logged_once(monkeypatch, caplog):
-    """A row past the cap (restored / hand-edited) is reported, once per list."""
+    """A row past the save cap (older release / restored / hand-edited) is
+    reported, once per list."""
     monkeypatch.setattr(_network, "_snapshot", _network._Snapshot())
     _network._warn_oversized_rules.cache_clear()
     oversized = [{"ip": f"10.{i // 256}.{i % 256}.1", "action": "allow"}
@@ -103,11 +106,10 @@ def test_an_oversized_stored_rule_list_is_logged_once(monkeypatch, caplog):
     with caplog.at_level("WARNING", logger="wsi_app.network"):
         _network.refresh(_FakeDB(_settings_row(oversized)))
         _network.refresh(_FakeDB(_settings_row(oversized)))
-    hits = [r for r in caplog.records if "IGNORED" in r.getMessage()]
+    hits = [r for r in caplog.records if "cannot be saved again" in r.getMessage()]
     assert len(hits) == 1
     assert str(_network.MAX_IP_RULES + 3) in hits[0].getMessage()
-    # Evaluation is unchanged: the snapshot keeps the list, the evaluator
-    # stops at the cap.
+    # The snapshot keeps the whole list; every rule is enforced.
     assert len(_network._snapshot.rules) == _network.MAX_IP_RULES + 3
 
     # A different oversized list is reported again; a list within the cap never.
@@ -115,7 +117,7 @@ def test_an_oversized_stored_rule_list_is_logged_once(monkeypatch, caplog):
     with caplog.at_level("WARNING", logger="wsi_app.network"):
         _network.refresh(_FakeDB(_settings_row(oversized[:-1])))
         _network.refresh(_FakeDB(_settings_row(oversized[:_network.MAX_IP_RULES])))
-    assert len([r for r in caplog.records if "IGNORED" in r.getMessage()]) == 1
+    assert len([r for r in caplog.records if "cannot be saved again" in r.getMessage()]) == 1
 
 
 # --------------------------------------------------------------------------

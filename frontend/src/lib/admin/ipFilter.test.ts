@@ -121,13 +121,20 @@ describe('rulesAllowIp — cases the server treats specially', () => {
     ])
   })
 
-  it('reads only the first MAX_IP_RULES rules, as the server does', () => {
+  it('enforces rules past MAX_IP_RULES in a stored list, as the server does', () => {
     const filler = Array.from({ length: MAX_IP_RULES }, (_, i) =>
       allow(`2001:db8::${(i + 1).toString(16)}`),
     )
     check([
-      ['10.0.0.1', [...filler, deny('10.0.0.1')], 'allow', true],
+      ['10.0.0.1', [...filler, deny('10.0.0.1')], 'allow', false],
       ['10.0.0.1', [...filler.slice(1), deny('10.0.0.1')], 'allow', false],
+    ])
+  })
+
+  it('keeps a zoned IPv4-mapped network as IPv6, as the server does', () => {
+    check([
+      ['10.0.0.1', [deny('::ffff:0.0.0.0%eth0/96')], 'allow', true],
+      ['10.0.0.1', [deny('::ffff:0.0.0.0/96')], 'allow', false],
     ])
   })
 
