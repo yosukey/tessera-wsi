@@ -82,6 +82,18 @@ export class DiscoverySocket {
   }
 
   close() {
+    this.terminate()
+    try { this.ws?.close() } catch { /* swallow */ }
+    this.ws = null
+  }
+
+  // Stop for good and release everything held outside the socket: the
+  // visibilitychange / online listeners, the stale-list timer, the ping
+  // interval and any pending reconnect. Shared by close() and the terminal
+  // close codes in onclose, so a socket the server refused for good does not
+  // keep its document/window listeners registered until (or unless) the
+  // consumer also calls close(). Idempotent; leaves `this.ws` to the caller.
+  private terminate() {
     this.closed = true
     if (this.visListener) {
       document.removeEventListener('visibilitychange', this.visListener)
@@ -94,8 +106,6 @@ export class DiscoverySocket {
     this.cancelStale()
     this.stopPing()
     if (this.reconnectTimer != null) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null }
-    try { this.ws?.close() } catch { /* swallow */ }
-    this.ws = null
   }
 
   private onVisibilityChange() {
@@ -210,9 +220,9 @@ export class DiscoverySocket {
       //        switch the banner off for good on every real viewer. The
       //        backoff below grows to 30 s since no snapshot arrives to reset it.
       if (ev.code === 4401 || ev.code === 4403) {
-        this.closed = true
-        // Nothing will replace the list any more: clear it now.
-        this.cancelStale()
+        // terminate() also cancels the stale timer armed just above: nothing
+        // will replace the list any more, so it is cleared now instead.
+        this.terminate()
         this.opts.onEvent({ type: 'snapshot', sessions: [] })
         return
       }

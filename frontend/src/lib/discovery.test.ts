@@ -115,6 +115,23 @@ describe('DiscoverySocket keeps no stale list', () => {
     d.close()
   })
 
+  it.each([4401, 4403])('a final %i removes the document/window listeners and timers', (code) => {
+    // The instance stops on its own; it must not wait for close() to let go
+    // of its visibilitychange / online listeners.
+    const winRemove = vi.spyOn(window, 'removeEventListener')
+    const docRemove = vi.spyOn(document, 'removeEventListener')
+    new DiscoverySocket({ onEvent: () => {} })
+    const ws = last()
+    ws.readyState = 1
+    ws.onopen?.()
+    ws.onclose?.({ code })
+    expect(winRemove).toHaveBeenCalledWith('online', expect.any(Function))
+    expect(docRemove).toHaveBeenCalledWith('visibilitychange', expect.any(Function))
+    expect(vi.getTimerCount()).toBe(0)
+    winRemove.mockRestore()
+    docRemove.mockRestore()
+  })
+
   it('a channel down for a while clears the list; a quick reconnect does not', () => {
     vi.spyOn(Math, 'random').mockReturnValue(1)
     const events: Array<{ type: string; sessions?: unknown[] }> = []

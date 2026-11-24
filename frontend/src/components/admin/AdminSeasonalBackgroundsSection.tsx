@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useRef, useState, type MutableRefObject } from 'react'
 import {
   SeasonalBackground,
   adminDeleteSeasonalBackgroundImage,
@@ -13,6 +13,7 @@ import { failureMessage } from '../../lib/admin/apiError'
 import { UPLOAD_LIMITS, isValidHexColor } from '../../lib/admin/validation'
 import { cssImageUrl, useAdminBlobUrl } from '../../hooks/useAdminBlobUrl'
 import { useInFlightKey } from '../../hooks/useInFlight'
+import { useUnsavedNavigationGuard } from '../../hooks/useUnsavedNavigationGuard'
 import { LockFieldset } from '../ui'
 import { SectionMessage, itemRow, subHeading, useSectionMessage } from './settingsSectionUi'
 
@@ -99,7 +100,20 @@ function parseDate(raw: string, min: number, max: number, fallback: number): num
   return Math.max(min, Math.min(max, n))
 }
 
-export default function AdminSeasonalBackgroundsSection() {
+type Props = {
+  // Reports whether any slot has unsaved edits, so the dashboard can confirm
+  // before a sidebar tab switch (or a header link / Logout) unmounts the
+  // Settings tab and drops them. Unlike the rest of the Settings tab, this
+  // section's edit state is local and does not survive an unmount.
+  onDirtyChange?: (dirty: boolean) => void
+  // Holds the navigation guard's in-app exit while this section is mounted
+  // (null otherwise), as for AdminNetworkAuthSection: the dashboard leaves
+  // the tab through it so the history entry the guard pushed for unsaved
+  // edits is stepped off first. It does not ask: the dashboard confirms.
+  leaveRef?: MutableRefObject<((go: () => void) => void) | null>
+}
+
+export default function AdminSeasonalBackgroundsSection({ onDirtyChange, leaveRef }: Props = {}) {
   const { t } = useI18n()
   const [items, setItems] = useState<Record<number, SeasonalBackground>>({})
   // Per-slot raw text for the four date inputs. The canonical numeric
@@ -169,6 +183,34 @@ export default function AdminSeasonalBackgroundsSection() {
       sb.title_color !== saved.title_color
     )
   }
+
+  // Any slot with unsaved edits. Recomputed every render (five rows, cheap)
+  // so it follows mid-edit date text the same way the per-row chip does.
+  const anyDirty = SLOTS.some((slot) => rowDirty(slot))
+
+  // Surface the flag to the dashboard (sidebar tab switch, header links,
+  // Logout: in-SPA unmounts that beforeunload cannot catch), and clear it on
+  // unmount so a remount doesn't inherit a stale "dirty".
+  useEffect(() => {
+    onDirtyChange?.(anyDirty)
+  }, [anyDirty, onDirtyChange])
+  useEffect(() => () => onDirtyChange?.(false), [onDirtyChange])
+  // beforeunload covers full-page exits (reload / tab close) while dirty;
+  // the navigation guard below covers browser Back / Forward.
+  useEffect(() => {
+    if (!anyDirty) return
+    const onBeforeUnload = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = '' }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => window.removeEventListener('beforeunload', onBeforeUnload)
+  }, [anyDirty])
+  const leave = useUnsavedNavigationGuard(anyDirty, t('adminDash.unsavedChangesConfirm'))
+  useEffect(() => {
+    if (!leaveRef) return
+    leaveRef.current = leave
+    return () => {
+      if (leaveRef.current === leave) leaveRef.current = null
+    }
+  }, [leaveRef, leave])
 
   // The rows stay locked until the slots have loaded, so a failed load is
   // offered again (Retry) rather than leaving them locked.

@@ -9,6 +9,7 @@ import {
   bearerHeaders,
   downloadAttachment,
   errorGuard,
+  filenameFromContentDisposition,
   httpStatusOf,
   isNetworkError,
   isRateLimitError,
@@ -281,5 +282,32 @@ describe('downloadAttachment', () => {
     await expect(downloadAttachment('/x', { fallbackName: 'f', failMessage: 'x', signal: ctrl.signal }))
       .rejects.toThrow(/aborted/)
     vi.unstubAllGlobals()
+  })
+})
+
+describe('filenameFromContentDisposition', () => {
+  it('reads a quoted or bare filename', () => {
+    expect(filenameFromContentDisposition('attachment; filename="x.csv"')).toBe('x.csv')
+    expect(filenameFromContentDisposition('attachment; filename=x.csv')).toBe('x.csv')
+    expect(filenameFromContentDisposition('attachment; filename="a \\"b\\".csv"')).toBe('a "b".csv')
+  })
+
+  // RFC 6266 4.3: filename* wins over filename whichever comes first.
+  it('prefers filename* over filename, in either order', () => {
+    const ext = "filename*=UTF-8''%E6%A8%99%E6%9C%AC.csv"
+    expect(filenameFromContentDisposition(`attachment; filename="slides.csv"; ${ext}`)).toBe('標本.csv')
+    expect(filenameFromContentDisposition(`attachment; ${ext}; filename="slides.csv"`)).toBe('標本.csv')
+    expect(filenameFromContentDisposition(`attachment; filename*=utf-8'ja'%E6%A8%99.csv`)).toBe('標.csv')
+  })
+
+  it('falls back to filename when filename* cannot be decoded', () => {
+    expect(filenameFromContentDisposition(`attachment; filename*=UTF-8''100%.csv; filename="x.csv"`)).toBe('x.csv')
+    expect(filenameFromContentDisposition(`attachment; filename*=ISO-8859-1''%E9.csv; filename="e.csv"`)).toBe('e.csv')
+  })
+
+  it('does not percent-decode the plain parameter, and is empty without a name', () => {
+    expect(filenameFromContentDisposition('attachment; filename="100%.csv"')).toBe('100%.csv')
+    expect(filenameFromContentDisposition('attachment')).toBe('')
+    expect(filenameFromContentDisposition('')).toBe('')
   })
 })

@@ -6,7 +6,9 @@ import {
   findOverCapShape,
   freehandStroke,
   normalizeShape,
+  resolveShapeColor,
 } from './tourShapes'
+import { PIN_COLORS } from './tourPins'
 
 type P = { x: number; y: number }
 
@@ -86,5 +88,15 @@ describe('freehand point cap', () => {
     const ok = normalizeShape({ id: 'a', kind: 'rect', x: 0, y: 0, w: 1, h: 1 })
     expect(findOverCapShape([ok, shape])).toBe(-1)
     expect(findOverCapShape([ok, { ...shape, points: big }])).toBe(1)
+  })
+})
+
+describe('resolveShapeColor', () => {
+  it.each(['#abc', '#abcd', '#aabbcc', '#aabbcc80'])('passes the valid CSS hex %s through', (c) => {
+    expect(resolveShapeColor(c)).toBe(c)
+  })
+
+  it.each(['#abcde', '#aabbccd'])('falls back to the palette for the invalid %s', (c) => {
+    expect(resolveShapeColor(c)).toBe(PIN_COLORS.red)
   })
 })

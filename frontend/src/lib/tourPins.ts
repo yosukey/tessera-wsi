@@ -37,7 +37,10 @@ export const DEFAULT_PIN_SHAPE: PinShape = 'pin'
 // returned — otherwise a stored value like `red"><script>...` would inject
 // arbitrary markup. The named-palette branch returns a constant from the
 // PIN_COLORS map and is therefore safe by construction.
-const SAFE_HEX_COLOR = /^#[0-9a-fA-F]{3,8}$/
+// Exactly 3, 4, 6 or 8 digits: `{3,8}` also let 5- and 7-digit values
+// through, which are not valid CSS colors (the browser drops the fill and the
+// pin/shape renders with no color instead of the palette fallback).
+const SAFE_HEX_COLOR = /^#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/
 
 // Resolve a stored pin color (preset name OR hex string) into a CSS color.
 // Mirrors resolveShapeColor so the pin palette can accept free-form hex

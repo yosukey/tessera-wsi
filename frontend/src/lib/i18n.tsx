@@ -2,6 +2,7 @@ import React, { createContext, useContext, useEffect, useMemo, useState } from '
 import enBundle from './i18n/en'
 import { STORAGE_KEYS } from './storageKeys'
 import { safeGetItem, safeSetItem } from './safeStorage'
+import { logger } from './logger'
 
 export type Locale = 'en' | 'ja'
 
@@ -69,6 +70,13 @@ export function I18nProvider({ children }: { children: React.ReactNode }) {
     let cancelled = false
     loadLocale(locale).then((m) => {
       if (!cancelled) setMsgs(m)
+    }).catch((err) => {
+      // The lazy chunk could not be fetched: offline, or a redeploy replaced
+      // the hashed file this page still references. Without a handler this
+      // is an unhandled rejection. The page keeps the messages it has (the
+      // English bundle every key falls back to), and switching the language
+      // again re-runs this effect and so retries the import.
+      logger.warn(`failed to load the "${locale}" messages; showing English`, err)
     })
     return () => { cancelled = true }
   }, [locale])

@@ -628,6 +628,36 @@ export function downloadCsv(url: string, opts: DownloadOptions): Promise<void> {
   return downloadAttachment(url, opts)
 }
 
+// The file name a Content-Disposition header carries, or '' when it has none
+// usable. Per RFC 6266 section 4.3 the extended `filename*=charset'lang'value`
+// parameter (percent-encoded, for non-ASCII names) takes precedence over the
+// plain `filename=` one, whichever comes first in the header: a server sends
+// both so that older clients get an ASCII approximation, and picking the
+// first match instead would save the file under that approximation. The plain
+// parameter is a token or a quoted string and is not percent-decoded.
+export function filenameFromContentDisposition(cd: string): string {
+  const ext = cd.match(/(?:^|;)\s*filename\*\s*=\s*([^';]*)'[^';]*'([^;\s]+)/i)
+  if (ext) {
+    const charset = ext[1].trim().toLowerCase()
+    // decodeURIComponent reads UTF-8 percent-escapes only, so another
+    // charset (RFC 6266 also allows ISO-8859-1) falls back to `filename=`.
+    // A mangled value (a literal `%`) throws URIError and falls back too.
+    if (charset === 'utf-8') {
+      try {
+        const name = decodeURIComponent(ext[2])
+        if (name) return name
+      } catch { /* fall through to filename= */ }
+    }
+  }
+  const plain = cd.match(/(?:^|;)\s*filename\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^;\s]+))/i)
+  if (plain) {
+    // A quoted string's backslash escapes (\" and \\) stand for the character.
+    const name = plain[1] !== undefined ? plain[1].replace(/\\(.)/g, '$1') : plain[2]
+    if (name) return name
+  }
+  return ''
+}
+
 // Fetch a server-built file (CSV, JSON, …) and hand it to the browser as a
 // download. fetch + blob rather than a plain <a download>, so the admin Bearer
 // token can be attached. The file name comes from the server's
@@ -637,14 +667,7 @@ export function downloadCsv(url: string, opts: DownloadOptions): Promise<void> {
 export async function downloadAttachment(url: string, opts: DownloadOptions): Promise<void> {
   const r = await fetch(url, { headers: opts.headers, cache: 'no-store', signal: opts.signal })
   if (!r.ok) await throwApi(r, opts.failMessage)
-  const cd = r.headers.get('content-disposition') || ''
-  const m = cd.match(/filename\*?=(?:UTF-8''|")?([^";]+)/i)
-  let filename = opts.fallbackName
-  if (m) {
-    // A mangled header can leave a literal `%` that makes decodeURIComponent
-    // throw URIError; keep the fallback name then.
-    try { filename = decodeURIComponent(m[1].replace(/"$/, '')) } catch {}
-  }
+  const filename = filenameFromContentDisposition(r.headers.get('content-disposition') || '') || opts.fallbackName
   const blob = await readBody(r, opts.onProgress)
   const objectUrl = URL.createObjectURL(blob)
   const a = document.createElement('a')

@@ -308,7 +308,7 @@ abstract class _BaseSync {
     // 'unauthorized' once and stop. Callers can re-instantiate the
     // SyncPresenter / SyncFollower with a fresh token to retry.
     if (code === 4401) {
-      this.closed = true
+      this.terminate()
       this.notify('unauthorized')
       return
     }
@@ -316,7 +316,7 @@ abstract class _BaseSync {
     // or a later re-check), or an upgrade from another site's page. Just as
     // permanent as 4401, but no sign-in fixes it, so it gets its own state.
     if (code === 4403) {
-      this.closed = true
+      this.terminate()
       this.notify('forbidden')
       return
     }
@@ -325,7 +325,7 @@ abstract class _BaseSync {
     // same token would just keep producing 4409, so stop the loop. A room
     // that disappeared before the attach is 4404 ('gone') instead.
     if (code === 4409) {
-      this.closed = true
+      this.terminate()
       this.notify('notOwner')
       return
     }
@@ -340,7 +340,7 @@ abstract class _BaseSync {
     // release this session without ending the server-side room the other
     // socket is now driving.
     if (code === 4000) {
-      this.closed = true
+      this.terminate()
       this.notify('replaced')
       return
     }
@@ -351,7 +351,7 @@ abstract class _BaseSync {
     // as 'rejected': the user has to act (enter a name, or start again)
     // before another connection can succeed, but no login has expired.
     if (code === 4400) {
-      this.closed = true
+      this.terminate()
       this.notify('rejected')
       return
     }
@@ -361,7 +361,7 @@ abstract class _BaseSync {
     // reconnect loop would hammer the server with a permanently dead
     // session id every backoff tick.
     if (code === 4404) {
-      this.closed = true
+      this.terminate()
       this.notify('gone')
       return
     }
@@ -468,7 +468,14 @@ abstract class _BaseSync {
   /** Override to push sticky state to the server right after the hello. */
   protected onPostHello(): void { /* default: no-op */ }
 
-  close() {
+  // Stop for good: mark the instance closed and release everything it holds
+  // outside the socket itself - the window/document wake listeners, the ping
+  // interval and any pending reconnect. Shared by the consumer's close() and
+  // every terminal path (a final close code in handleClose, an ``end``
+  // frame), so an instance that stopped on its own does not keep listeners
+  // and timers alive until (or unless) its consumer also calls close().
+  // Idempotent. Leaves `this.ws` alone: the callers decide whether to close it.
+  protected terminate() {
     this.closed = true
     if (this.wakeListener) {
       window.removeEventListener('online', this.wakeListener)
@@ -477,6 +484,10 @@ abstract class _BaseSync {
     }
     this.stopPing()
     if (this.reconnectTimer != null) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null }
+  }
+
+  close() {
+    this.terminate()
     try { this.ws?.close() } catch { /* swallow */ }
     this.ws = null
   }
@@ -591,7 +602,9 @@ export class SyncPresenter extends _BaseSync {
       // hook tears local state down on the first close, not the second.
       const reason = (msg as { reason?: unknown }).reason
       this.onEnded?.(typeof reason === 'string' ? reason : undefined)
-      this.closed = true
+      // terminate() also stops the ping timer and the wake listeners, which
+      // would otherwise outlive the session until the consumer's close().
+      this.terminate()
       this.notify('gone')
       try { this.ws?.close() } catch { /* swallow */ }
     }

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import React from 'react'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { MemoryRouter, Route, Routes, useLocation } from 'react-router'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-router'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 const api = vi.hoisted(() => ({ getAuthState: vi.fn(), appLogin: vi.fn() }))
@@ -90,5 +90,59 @@ describe('Login when /api/auth/state fails', () => {
     expect(await screen.findByLabelText('Username')).toBeTruthy()
     expect(screen.queryByRole('alert')).toBeNull()
     expect(api.getAuthState).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('Login stale probes and markup', () => {
+  // Renders Login plus a control that changes ?next= in place, which re-runs
+  // the auth-state effect without remounting the page.
+  function renderWithNextSwitch(url: string) {
+    function Switch() {
+      const navigate = useNavigate()
+      return <button type="button" onClick={() => navigate('/login?next=%2Fb')}>switch</button>
+    }
+    return render(
+      <I18nProvider>
+        <MemoryRouter initialEntries={[url]}>
+          <Switch />
+          <Routes>
+            <Route path="/login" element={<Login />} />
+            <Route path="*" element={<Where />} />
+          </Routes>
+        </MemoryRouter>
+      </I18nProvider>,
+    )
+  }
+
+  it('hides the previously fetched form when a re-probe fails', async () => {
+    api.getAuthState.mockResolvedValueOnce(ldap)
+    renderWithNextSwitch('/login?next=%2Fa')
+    expect(await screen.findByLabelText('Username')).toBeTruthy()
+    api.getAuthState.mockRejectedValueOnce(new Error('boom'))
+    fireEvent.click(screen.getByRole('button', { name: 'switch' }))
+    expect(await screen.findByRole('alert')).toBeTruthy()
+    expect(screen.queryByLabelText('Username')).toBeNull()
+  })
+
+  it('ignores a superseded probe that settles late', async () => {
+    let resolveFirst: (v: unknown) => void = () => {}
+    api.getAuthState.mockReturnValueOnce(new Promise((r) => { resolveFirst = r }))
+    api.getAuthState.mockResolvedValueOnce(ldap)
+    renderWithNextSwitch('/login?next=%2Fa')
+    fireEvent.click(screen.getByRole('button', { name: 'switch' }))
+    expect(await screen.findByLabelText('Username')).toBeTruthy()
+    // The first probe now claims the visitor is signed in; acting on it would
+    // navigate to the stale ?next=/a target.
+    await act(async () => { resolveFirst({ mode: 'ldap', authenticated: true }) })
+    expect(screen.queryByTestId('where')).toBeNull()
+    expect(screen.getByLabelText('Username')).toBeTruthy()
+  })
+
+  it('renders the Google sign-in as one link with no nested button', async () => {
+    api.getAuthState.mockResolvedValue({ mode: 'google_oauth', authenticated: false })
+    renderAt('/login')
+    const a = (await screen.findByRole('link', { name: 'Sign in with Google' })) as HTMLAnchorElement
+    expect(a.getAttribute('href')).toBe('/api/auth/oauth/start')
+    expect(a.querySelector('button')).toBeNull()
   })
 })

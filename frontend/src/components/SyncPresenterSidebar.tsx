@@ -153,8 +153,11 @@ export default function SyncPresenterSidebar({
     triggerDownload(url, `wsi-sync-${session.session_id}.csv`)
     // Defer revoke so any browser that initiates the download asynchronously
     // after click() returns still has a valid blob URL. Synchronous revoke
-    // races the download in some browsers and silently produces empty files.
-    setTimeout(() => URL.revokeObjectURL(url), 0)
+    // races the download in some browsers and silently produces empty files,
+    // and a 0 ms timer is not enough either: Safari / iPadOS can start reading
+    // the blob after the next macrotask. One second matches the other blob
+    // downloads in the app (e.g. the MFA recovery codes, downloadAttachment).
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
   }, [sortedFollowers, session.session_id, pseudonymous])
 
   // -------------------------------------------------- collapsed strip ----

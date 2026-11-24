@@ -458,4 +458,36 @@ describe('online wake jitter, replayed views and listener cleanup', () => {
     f.close()
     expect(remove).toHaveBeenCalledWith('online', expect.any(Function))
   })
+
+  // A terminal close code or an ``end`` frame stops the instance on its own;
+  // it must release the same listeners and timers close() does, without
+  // waiting for the consumer to call close() as well.
+  it.each([4000, 4400, 4401, 4403, 4404, 4409])('a final %i removes the wake listeners and stops the ping', (code) => {
+    const winRemove = vi.spyOn(window, 'removeEventListener')
+    const docRemove = vi.spyOn(document, 'removeEventListener')
+    const p = new SyncPresenter({ sessionId: 's', token: 't', onAudience: () => {} })
+    const ws = FakeWS.instances[0]
+    ws.readyState = 1
+    ws.onopen?.()
+    expect(vi.getTimerCount()).toBeGreaterThan(0) // the ping interval
+    ws.onclose?.({ code })
+    expect(winRemove).toHaveBeenCalledWith('online', expect.any(Function))
+    expect(docRemove).toHaveBeenCalledWith('visibilitychange', expect.any(Function))
+    expect(vi.getTimerCount()).toBe(0)
+    p.close() // still safe (idempotent) after stopping on its own
+  })
+
+  it("an 'end' frame removes the wake listeners and stops the ping at once", () => {
+    const winRemove = vi.spyOn(window, 'removeEventListener')
+    const p = new SyncPresenter({ sessionId: 's', token: 't', onAudience: () => {} })
+    const ws = FakeWS.instances[0]
+    ws.readyState = 1
+    ws.onopen?.()
+    // The socket's onclose never fires here (FakeWS.close is a no-op), so
+    // only the end-frame path itself can have stopped the ping interval.
+    ws.onmessage?.({ data: JSON.stringify({ type: 'end', reason: 'ended' }) })
+    expect(winRemove).toHaveBeenCalledWith('online', expect.any(Function))
+    expect(vi.getTimerCount()).toBe(0)
+    p.close()
+  })
 })

@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router'
 import type { Facets, IndexTypeFilter, SeasonalBackground, SlideListItem as SlideResult, TourIndexItem, TourSummary } from '../lib/api'
-import { INDEX_TOURS_PER_SLIDE_DEFAULT, MAX_INDEX_ITEMS_DEFAULT, clampIndexToursPerSlide, clampMaxIndexItems, getFacets, getViewerSettings, isAbortError, listAllPublishedTours, listSlides, listTourIndex } from '../lib/api'
+import { INDEX_TOURS_PER_SLIDE_DEFAULT, MAX_INDEX_ITEMS_DEFAULT, clampIndexToursPerSlide, clampMaxIndexItems, getFacets, getViewerSettings, httpStatusOf, isAbortError, listAllPublishedTours, listSlides, listTourIndex } from '../lib/api'
 import { logger } from '../lib/logger'
 import { pickActiveHeaderState } from '../lib/seasonalBackground'
 import { useAuthGate } from '../lib/useAuthGate'
@@ -36,7 +36,11 @@ function EmptyState({ message }: { message: string }) {
 }
 
 export default function IndexPage() {
-  useAuthGate()
+  // The gate probes once on mount; the returned (stable) callback re-runs the
+  // probe when one of this page's own requests is answered 401. An index left
+  // open past the session's lifetime then sends the visitor to sign in on the
+  // next search instead of showing a generic "failed to load" message.
+  const recheckAuth = useAuthGate()
   const [searchParams, setSearchParams] = useSearchParams()
   const { t } = useI18n()
   const [facets, setFacets] = useState<Facets>({ groups: {} })
@@ -322,9 +326,14 @@ export default function IndexPage() {
     const ctrl = new AbortController()
     getFacets({ signal: ctrl.signal })
       .then(setFacets)
-      .catch((err) => { if (!isAbortError(err)) { logger.error(err); setCatalogLoadError(true) } })
+      .catch((err) => {
+        if (isAbortError(err)) return
+        logger.error(err)
+        if (httpStatusOf(err) === 401) recheckAuth()
+        setCatalogLoadError(true)
+      })
     return () => ctrl.abort()
-  }, [])
+  }, [recheckAuth])
   // The "All" view's inline tour lists, fetched the first time that view is
   // shown (after settings, which can make another view the default) and kept.
   useEffect(() => {
@@ -336,9 +345,14 @@ export default function IndexPage() {
         setAllTours(ts)
         setAllToursLoaded(true)
       })
-      .catch((err) => { if (!isAbortError(err)) { logger.error(err); setCatalogLoadError(true) } })
+      .catch((err) => {
+        if (isAbortError(err)) return
+        logger.error(err)
+        if (httpStatusOf(err) === 401) recheckAuth()
+        setCatalogLoadError(true)
+      })
     return () => ctrl.abort()
-  }, [settingsLoaded, type, allToursLoaded])
+  }, [settingsLoaded, type, allToursLoaded, recheckAuth])
   useEffect(() => {
     // Abortable like its sibling fetches above.
     const ctrl = new AbortController()
@@ -377,7 +391,17 @@ export default function IndexPage() {
       setSeasonalBackgrounds(vs.seasonal_backgrounds || [])
       setHeaderDefaultImageUrl(vs.header_default_image_url || '')
       setHeaderDefaultTitleColor(vs.header_default_title_color || '')
-    }).catch(() => {}).finally(() => setSettingsLoaded(true))
+    }).catch(() => {}).finally(() => {
+      // Not after an abort: the effect's cleanup aborted this request because
+      // the page is unmounting (or StrictMode is re-running the effect, whose
+      // second request is the one that counts). Flipping settingsLoaded here
+      // would release the results fetch with the hardcoded defaults before
+      // the live request's settings land - the redundant request the
+      // settingsLoaded gate exists to prevent. A real failure (not an abort)
+      // still unblocks the page so a settings outage doesn't leave it stuck.
+      if (ctrl.signal.aborted) return
+      setSettingsLoaded(true)
+    })
     // Fetch viewer settings exactly once on mount. The document title (the only
     // locale-dependent piece) is split into its own effect below, so this effect
     // doesn't key on `t`: keying on `t` would re-fetch and re-apply server
@@ -435,6 +459,9 @@ export default function IndexPage() {
     const onError = (err: unknown) => {
       if (isAbortError(err)) return
       logger.error(err)
+      // The session may have expired while the index stayed open: re-run
+      // the auth probe, which redirects only if the server agrees.
+      if (httpStatusOf(err) === 401) recheckAuth()
       setResultsLoadError(true)
       setResultsPending(false)
     }
@@ -456,7 +483,7 @@ export default function IndexPage() {
       }).catch(onError)
     }
     return () => ctrl.abort()
-  }, [searchParams, type, defaultSortField, maxIndexItems, settingsLoaded])
+  }, [searchParams, type, defaultSortField, maxIndexItems, settingsLoaded, recheckAuth])
 
   const toggleFilter = (key: string, value: string) => {
     updateParams((sp) => {
