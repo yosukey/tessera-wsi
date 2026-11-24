@@ -2963,6 +2963,57 @@ def test_query_budget_never_touches_the_connection_after_releasing_it(monkeypatc
     assert log.count("set_progress_handler") == 2  # installed, then cleared
 
 
+def test_query_budget_timeout_while_a_statement_is_re_prepared_is_a_503(monkeypatch):
+    """When another connection has changed the schema since a statement was
+    compiled, SQLite re-prepares it on the next run; an interrupt landing
+    during that re-prepare is reported as "database schema has changed",
+    not "interrupted". It is still the budget running out and must answer
+    503, not escape as a 500."""
+    import sqlite3
+
+    from fastapi import HTTPException
+    from sqlalchemy import text
+
+    from wsi_app.db import engine
+
+    stmt = text("SELECT count(*) FROM page_views WHERE id != :x")
+    db = _SessionLocal()
+    other = sqlite3.connect(engine.url.database)
+    try:
+        # Compiles the statement into this connection's statement cache.
+        db.execute(stmt, {"x": 0}).scalar()
+        # A schema change made through another connection.
+        other.execute("CREATE TABLE _schema_bump (x INTEGER)")
+        other.commit()
+        monkeypatch.setattr(_ar, "_QUERY_TIME_BUDGET_S", -1.0)
+        monkeypatch.setattr(_ar, "_QUERY_BUDGET_CHECK_STEPS", 1)
+        with pytest.raises(HTTPException) as caught:
+            with _ar._query_budget(db):
+                db.execute(stmt, {"x": 0}).scalar()
+        assert caught.value.status_code == 503
+        assert caught.value.detail["code"] == "adminDash.apiErr.analyticsQueryTimeout"
+    finally:
+        db.close()
+        other.execute("DROP TABLE IF EXISTS _schema_bump")
+        other.commit()
+        other.close()
+
+
+def test_query_budget_lets_other_operational_errors_through():
+    """Only a query the budget stopped becomes the 503; any other
+    OperationalError (here a missing table) propagates unchanged."""
+    from sqlalchemy import text
+    from sqlalchemy.exc import OperationalError
+
+    db = _SessionLocal()
+    try:
+        with pytest.raises(OperationalError, match="no such table"):
+            with _ar._query_budget(db):
+                db.execute(text("SELECT * FROM _no_such_table")).all()
+    finally:
+        db.close()
+
+
 def test_beacons_skip_identity_work_when_analytics_is_off(client, admin_headers, slide, monkeypatch):
     calls = []
     monkeypatch.setattr(_analytics, "probe_identity", lambda *a, **k: calls.append("probe") or (None, ""))

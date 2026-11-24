@@ -232,12 +232,28 @@ def _query_budget(db: Session):
     passed, turning the interruption into a 503 the dashboard can explain."""
     raw = db.connection().connection.driver_connection
     deadline = time.monotonic() + _QUERY_TIME_BUDGET_S
-    raw.set_progress_handler(lambda: time.monotonic() > deadline, _QUERY_BUDGET_CHECK_STEPS)
+    # Whether the handler has asked SQLite to stop. The error that follows is
+    # not always "interrupted": when the interrupt lands while SQLite is
+    # re-preparing a cached statement (another connection changed the schema
+    # since it was compiled, e.g. a migration or an index build), it reports
+    # "database schema has changed" instead. So the timeout is recognised by
+    # the handler having fired, not by the error's wording.
+    fired = False
+
+    def past_deadline() -> bool:
+        nonlocal fired
+        if time.monotonic() > deadline:
+            fired = True
+        return fired
+
+    raw.set_progress_handler(past_deadline, _QUERY_BUDGET_CHECK_STEPS)
     timed_out = None
     try:
         yield
     except OperationalError as exc:
-        if "interrupted" not in str(exc.orig):
+        # Any other OperationalError (locked database, disk I/O, a genuine
+        # schema error) is not a timeout and propagates as before.
+        if not fired:
             raise
         timed_out = exc
     finally:
