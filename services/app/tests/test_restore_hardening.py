@@ -546,6 +546,30 @@ def test_request_apply_refuses_a_stage_db_with_side_files(tmp_path, suffix):
         _backup.cleanup_stage(stage_id)
 
 
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+def test_inprocess_apply_refuses_a_stage_db_with_side_files(suffix):
+    """The dev in-process apply holds a stage to the same rule as the boot's:
+    nothing is parked, nothing journaled, the live tree is untouched."""
+    from wsi_app.db import engine
+
+    stage_id = "stage-" + "e" * 12
+    stage_dir = _stage_dir(stage_id)
+    os.makedirs(stage_dir, exist_ok=True)
+    try:
+        _backup._mark_stage_complete(stage_dir, stage_id)
+        with open(os.path.join(stage_dir, "wsi.db"), "wb") as f:
+            f.write(b"x")
+        with open(os.path.join(stage_dir, "wsi.db" + suffix), "wb") as f:
+            f.write(b"x")
+        live_db = _backup._live_db_path()
+        with pytest.raises(RuntimeError, match="beside it"):
+            _backup.inprocess_apply(stage_id, "metadata", engine)
+        assert os.path.exists(live_db)
+        assert not os.path.lexists(_backup.restore_journal_path())
+    finally:
+        _backup.cleanup_stage(stage_id)
+
+
 def _held_from_file(tmp_path, data: bytes):
     from wsi_app.routers import admin_backup as _ab
 

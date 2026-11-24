@@ -581,3 +581,75 @@ def test_create_session_supersedes_caller_previous_session(
     assert second_sid in sr.manager._rooms
     owned = [r for r in sr.manager._rooms.values() if r.owner_user_id == admin_user.id]
     assert len(owned) == 1
+
+
+def test_rest_db_reads_use_a_session_of_their_own_thread(client, admin_headers, slide, monkeypatch):
+    """The async endpoints' DB reads run in a worker thread, in a session that
+    thread opens and closes itself — never the request's ``get_db`` session,
+    which a client disconnect would close from another thread while the
+    worker is still querying it."""
+    import threading
+
+    import wsi_app.routers.sync as sync_mod
+
+    real = sync_mod.SessionLocal
+    events = []
+
+    class _Tracked:
+        def __init__(self):
+            self._db = real()
+            events.append(("open", threading.get_ident()))
+
+        def __getattr__(self, name):
+            return getattr(self._db, name)
+
+        def close(self):
+            events.append(("close", threading.get_ident()))
+            self._db.close()
+
+    monkeypatch.setattr(sync_mod, "SessionLocal", _Tracked)
+    sid = _create_session(client, admin_headers, slide.id)
+    assert client.get(f"/api/sync/sessions/{sid}").status_code == 200
+    assert client.get("/api/admin/sync/sessions", headers=admin_headers).status_code == 200
+    assert client.get("/api/admin/sync/sessions/all", headers=admin_headers).status_code == 200
+    # create, peek, owned list, full list: one session each, opened and
+    # closed on the same thread.
+    assert len(events) == 8, events
+    for opened, closed in zip(events[::2], events[1::2]):
+        assert opened[0] == "open" and closed[0] == "close"
+        assert opened[1] == closed[1]
+
+
+def test_sync_timer_env_values_fall_back_when_not_positive(monkeypatch):
+    """A zero / negative / NaN / infinite timer would spin or kill the
+    keepalive and reauth loops: the default is used instead. A value that is
+    not a number at all still fails, naming the variable."""
+    from wsi_app.routers.sync import _env_positive_float
+
+    for bad in ("0", "-5", "nan", "inf", "-inf"):
+        monkeypatch.setenv("WSI_SYNC_TEST_SEC", bad)
+        assert _env_positive_float("WSI_SYNC_TEST_SEC", 15) == 15.0
+    monkeypatch.setenv("WSI_SYNC_TEST_SEC", "2.5")
+    assert _env_positive_float("WSI_SYNC_TEST_SEC", 15) == 2.5
+    monkeypatch.setenv("WSI_SYNC_TEST_SEC", "fast")
+    with pytest.raises(ValueError, match="WSI_SYNC_TEST_SEC"):
+        _env_positive_float("WSI_SYNC_TEST_SEC", 15)
+
+
+def test_zero_reverse_dns_workers_does_not_break_the_import():
+    """WSI_SYNC_REVERSE_DNS_WORKERS=0 used to raise from ThreadPoolExecutor at
+    import time, crash-looping wsi-app and wsi-sync alike."""
+    import os
+    import subprocess
+    import sys
+
+    env = {**os.environ, "WSI_SYNC_REVERSE_DNS_WORKERS": "0", "WSI_SYNC_PING_INTERVAL_SEC": "0"}
+    r = subprocess.run(
+        [sys.executable, "-c",
+         "import wsi_app.routers.sync as s; "
+         "print(s._RDNS_EXECUTOR._max_workers, s.PING_INTERVAL_SECONDS)"],
+        env=env, capture_output=True, text=True, timeout=60,
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split() == ["1", "15.0"]

@@ -341,6 +341,36 @@ def test_close_error_after_cancel_still_reports_the_cancel(db_session, monkeypat
     assert _partial_archives() == []
 
 
+def test_close_error_after_a_failed_write_keeps_the_write_error(db_session, monkeypatch):
+    """Not only a cancel: a write that fails (ENOSPC is the usual one) leaves
+    a stream that may fail to close too — often with the same ENOSPC from
+    the final flush. The original error is what the job must report, not a
+    generic close failure, and the partial archive is still removed."""
+    import errno
+
+    real_open = _backup._open_archive_writer
+
+    def opener(path):
+        raw, tar, counter, comp = real_open(path)
+        real_close = tar.close
+
+        def bad_add(*a, **k):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        def bad_close():
+            real_close()
+            raise OSError("trailer write failed")
+        tar.add = bad_add
+        tar.close = bad_close
+        return raw, tar, counter, comp
+
+    monkeypatch.setattr(_backup, "_open_archive_writer", opener)
+    with pytest.raises(OSError) as ei:
+        _backup.create_backup(scope=_backup.SCOPE_METADATA)
+    assert ei.value.errno == errno.ENOSPC
+    assert _partial_archives() == []
+
+
 # ---------------------------------------------------------------------------
 # the endpoint and the job lifecycle
 # ---------------------------------------------------------------------------

@@ -572,6 +572,32 @@ def _load_slides_for_export(db: Session, slide_ids: List[int]) -> List[Slide]:
     return ordered
 
 
+def _check_exportable_tours(s: Slide) -> None:
+    """Refuse a slide holding a tour with a malformed public_id.
+
+    _serialize_tour writes each tour's public_id into slides.json as is, and
+    the importer refuses the whole bundle over one malformed tour token
+    (importInvalid "malformed or unsafe tour public_id") — while
+    _exported_tour_pids merely skips that tour's attachments, so without this
+    check the export "succeeded" with a bundle no system would take. Refuse
+    it, naming slide and tour, so the admin can fix (or delete) that one tour.
+
+    Run once in the preflight and again on the re-read under the slide's
+    lock, since a tour can be added (or restored in) while a long export
+    writes earlier slides."""
+    for t in s.tours:
+        if not valid_public_id(t.public_id):
+            raise SlideTransferError(
+                f"slide {s.public_id} has a tour {t.id} with a malformed public_id "
+                f"{t.public_id!r}; cannot export",
+                code="exportInvalidTourPublicId",
+                params={
+                    "slide": (s.title or "")[:200] or str(s.id),
+                    "tour": (t.title or "")[:200] or str(t.id),
+                },
+            )
+
+
 def export_slides(
     slide_ids: List[int],
     note: str = "",
@@ -612,25 +638,7 @@ def export_slides(
                     code="exportInvalidPublicId",
                     params={"slide": (s.title or "")[:200] or str(s.id)},
                 )
-            # The same holds for each of the slide's tours: _serialize_tour
-            # writes its public_id into slides.json as is, and the importer
-            # refuses the whole bundle over one malformed tour token
-            # (importInvalid "malformed or unsafe tour public_id") — while
-            # _exported_tour_pids merely skips that tour's attachments, so
-            # without this check the export "succeeded" with a bundle no
-            # system would take. Refuse it here, naming slide and tour, so
-            # the admin can fix (or delete) that one tour.
-            for t in s.tours:
-                if not valid_public_id(t.public_id):
-                    raise SlideTransferError(
-                        f"slide {s.public_id} has a tour {t.id} with a malformed public_id "
-                        f"{t.public_id!r}; cannot export",
-                        code="exportInvalidTourPublicId",
-                        params={
-                            "slide": (s.title or "")[:200] or str(s.id),
-                            "tour": (t.title or "")[:200] or str(t.id),
-                        },
-                    )
+            _check_exportable_tours(s)
             if not s.wsi_filename or not os.path.isfile(_slide_wsi_path(s)):
                 raise SlideTransferError(
                     f"slide {s.public_id} has no WSI file on disk; cannot export",
@@ -729,6 +737,18 @@ def export_slides(
                     # may since have replaced the file (new wsi_filename, new
                     # size/dimensions) or deleted the slide. Re-read it under
                     # the lock before resolving the path or serialising.
+                    #
+                    # refresh() re-runs the eager loaders the row was loaded
+                    # with (_load_slides_for_export's selectinload chain) with
+                    # populate_existing semantics, so tours, steps, pins,
+                    # shapes and attributes already in the identity map are
+                    # overwritten from the database too, tours added since
+                    # appear and deleted ones drop out: the doc serialised
+                    # below is the current state, the same state whose tour
+                    # attachments are archived right after.
+                    # (test_export_rereads_tours_edited_during_the_export pins
+                    # that.) A tour that appeared meanwhile has not been
+                    # through the preflight yet, so its token is checked here.
                     pid = s.public_id
                     try:
                         db.refresh(s)
@@ -737,6 +757,7 @@ def export_slides(
                             f"slide {pid} was deleted during the export",
                             code="exportUnknownSlide",
                         ) from exc
+                    _check_exportable_tours(s)
                     if not s.wsi_filename:
                         raise SlideTransferError(
                             f"slide {s.public_id} has no WSI file on disk; cannot export",
@@ -804,9 +825,21 @@ def export_slides(
                     os.remove(tmp_path)
                 except FileNotFoundError:
                     pass
+            # After a failed write the archive is discarded anyway, and a
+            # close of a stream cut mid-member (or a flush into the volume
+            # that just ran out of space) can fail too: let the original
+            # exception — a coded SlideTransferError, an ENOSPC — propagate
+            # instead of a generic close error, and only log the close
+            # failures (mirrors create_backup).
             if close_errors:
                 detail = ", ".join(f"{n}={exc!r}" for n, exc in close_errors)
-                raise RuntimeError(f"export archive close failed: {detail}") from close_errors[0][1]
+                if not write_failed:
+                    raise RuntimeError(
+                        f"export archive close failed: {detail}"
+                    ) from close_errors[0][1]
+                _logger.warning(
+                    "export archive close also failed after a write error: %s", detail
+                )
 
         # fsync then atomically publish; reclaim the .tmp on any failure.
         try:
@@ -834,7 +867,11 @@ def export_slides(
             created_at=created_at,
             archive_format=archive_format,
             slide_count=len(slides),
-            tour_count=tour_count,
+            # What slides.json actually holds: the per-slide re-read can see
+            # tours added or deleted since the preflight. (manifest.json was
+            # already streamed with the preflight count; it is informational
+            # only — the import counts the tours in slides.json.)
+            tour_count=sum(len(d.get("tours") or []) for d in slide_docs),
             note=note or "",
             slides=[
                 {
@@ -2148,6 +2185,25 @@ def _import_tour_assets(
             count += 1
             total += size
             continue
+        # Same instance-wide floor an upload is held to
+        # (admin_tours._enforce_tour_asset_free_space), measured per file as
+        # the pass goes so what this pass has copied so far counts: the
+        # per-tour caps bound one tour, but a bundle carries many tours, and
+        # without this a large import could fill the data volume one
+        # attachment at a time. The reserve is the shared disk_space rule or
+        # the operator's TOUR_ASSET_MIN_FREE_BYTES, whichever is larger —
+        # unlike an upload, an import is not exempt when that setting is 0,
+        # as the slide's own WSI copy is not (_check_wsi_copy_space). Raised,
+        # not skipped: it is the volume that is out of room, not the file,
+        # so the slide fails with importNoSpace (its copies rolled back) and
+        # a retry of the stage picks it up once space is freed.
+        reserve = max(_disk_space.reserve_for(size), settings.tour_asset_min_free_bytes)
+        short = _disk_space.check(dst_dir, size, reserve=reserve)
+        if short is not None:
+            raise SlideTransferError(
+                f"{short.message('data volume')} (tour attachment {name})",
+                code="importNoSpace",
+            )
         dst = os.path.join(dst_dir, name)
         # Through a hidden temp + rename: on a retry the tour is live, and a
         # viewer must never be served a half-copied image. The temp follows
@@ -3326,9 +3382,27 @@ def retry_import_assets(
                 if tid is not None and src:
                     got: list = []
                     with tour_asset_lock(tid):
-                        again = _import_tour_assets(
-                            src, tour_asset_dir(new), only=retry_names, copied=got,
-                        )
+                        # tour_ids was read before this lock: a tour deleted
+                        # in between (_do_delete_tour drops the row and its
+                        # asset directory under this same lock) must not get
+                        # that directory back — the copy below would recreate
+                        # it and leave its files served publicly for a tour
+                        # with no row. Re-check inside the lock, as the
+                        # upload endpoint does; a SELECT outside a write
+                        # transaction reads the current state, not a
+                        # snapshot from before the lock. A tour gone by now is
+                        # treated like one already gone when tour_ids was
+                        # read: its retryable skips are dropped below (again
+                        # stays empty), the permanent ones kept.
+                        alive = db.execute(
+                            select(Tour.id).where(
+                                Tour.id == tid, Tour.slide_id == rec["slide_id"],
+                            )
+                        ).first() is not None
+                        if alive:
+                            again = _import_tour_assets(
+                                src, tour_asset_dir(new), only=retry_names, copied=got,
+                            )
                     copied.extend(
                         {"public_id": src_pid, "tour": titles.get(old) or new, "name": n}
                         for n in got

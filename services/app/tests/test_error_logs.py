@@ -964,6 +964,47 @@ def test_logs_export_csv_can_leave_tracebacks_out(client, admin_headers, db_sess
     assert without.splitlines()[0] == with_tb.splitlines()[0]
 
 
+def test_logs_export_without_tracebacks_does_not_read_them(client, admin_headers, db_session):
+    """Leaving the column out of the file also leaves it out of the query:
+    the tracebacks (up to 16 KB a row) are most of the table's bytes."""
+    from sqlalchemy import event
+
+    from wsi_app.db import engine
+
+    _seed_full(db_session, "fcsvnotb.a", traceback="Traceback: frame")
+    statements = []
+
+    def _capture(conn, cursor, statement, *a):
+        if "FROM error_logs" in statement:
+            statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        body = client.get("/api/admin/logs/export.csv",
+                          params={"logger": "fcsvnotb.", "include_traceback": "false"},
+                          headers=admin_headers).text
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture)
+    assert "fcsvnotb.a" in body
+    assert statements
+    assert not any("error_logs.traceback" in st for st in statements), statements
+
+
+def test_logs_total_matches_the_level_counts(client, admin_headers, db_session):
+    """The total is taken from the level counts (one scan, not two); with and
+    without a level filter it is still the count of the rows listed."""
+    for lvl in ("ERROR", "ERROR", "WARNING"):
+        _seed_full(db_session, "ftotal.a", level=lvl)
+    r = client.get("/api/admin/logs", params={"logger": "ftotal.a"}, headers=admin_headers).json()
+    assert r["total"] == 3 and r["level_counts"] == {"ERROR": 2, "WARNING": 1}
+    r = client.get("/api/admin/logs", params={"logger": "ftotal.a", "level": "warning"},
+                   headers=admin_headers).json()
+    assert r["total"] == 1 and len(r["items"]) == 1
+    r = client.get("/api/admin/logs", params={"logger": "ftotal.a", "level": "CRITICAL"},
+                   headers=admin_headers).json()
+    assert r["total"] == 0 and r["items"] == []
+
+
 def test_iter_newest_first_reads_in_keyset_batches(db_session):
     from wsi_app.admin_reports import iter_newest_first
 

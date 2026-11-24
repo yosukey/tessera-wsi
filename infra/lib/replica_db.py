@@ -943,7 +943,15 @@ def cmd_bump_generations(args) -> None:
     conn = _connect_rw(args.live_db)
     try:
         now_ms = max(1, time.time_ns() // 1_000_000)
-        conn.execute("UPDATE slides SET wsi_generation = MAX(wsi_generation + 1, ?)", (now_ms,))
+        # COALESCE: the column is NOT NULL in the app's schema, but this
+        # helper also runs against databases it did not create (an older or
+        # hand-repaired copy), and SQLite's scalar MAX() returns NULL when any
+        # argument is NULL — such a row would keep a generation that is no
+        # generation at all instead of moving to a fresh one.
+        conn.execute(
+            "UPDATE slides SET wsi_generation = MAX(COALESCE(wsi_generation, 0) + 1, ?)",
+            (now_ms,),
+        )
     finally:
         conn.close()
 

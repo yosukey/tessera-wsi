@@ -1134,12 +1134,33 @@ class _OpenFileResponse(FileResponse):
     FileResponse opens its path only at send time, after the handler's checks;
     serving through ``/dev/fd/<fd>`` reads the very inode those checks were
     made against, whatever has since been moved onto the original path. The
-    response owns ``fd`` and closes it once sent.
+    response owns ``fd`` and closes it once sent — or, should it never be
+    sent (the client went away between the handler's return and the send, a
+    middleware answered with another response), when it is garbage
+    collected: every such request would otherwise leak one descriptor, and an
+    anonymous caller can make plenty of them on a public slide.
     """
 
     def __init__(self, fd: int, st: os.stat_result, **kwargs) -> None:
-        self._fd = fd
         super().__init__(f"/dev/fd/{fd}", stat_result=st, **kwargs)
+        # Taken over only once construction succeeded: until then the caller
+        # still owns (and on a failure closes) the descriptor, and a __del__
+        # closing it as well could close a number already reused elsewhere.
+        self._fd = fd
+
+    def _close_fd(self) -> None:
+        # Idempotent: the number is forgotten before it is closed, so neither
+        # a second call nor __del__ after the send can close it again (by
+        # then it may name an unrelated file another request opened).
+        fd, self._fd = getattr(self, "_fd", -1), -1
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def __del__(self) -> None:
+        self._close_fd()
 
     async def __call__(self, scope, receive, send) -> None:
         # Never hand the server the /dev/fd path to open on its own
@@ -1154,7 +1175,7 @@ class _OpenFileResponse(FileResponse):
         try:
             await super().__call__(scope, receive, send)
         finally:
-            os.close(self._fd)
+            self._close_fd()
 
 
 # SZI slides bypass OpenSlide tile generation: the .szi archive holds the
