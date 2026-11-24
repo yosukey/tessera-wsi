@@ -4023,12 +4023,12 @@ generation `?v=` — never the session cookie; every request, HIT or MISS, is
 first authorized by an `auth_request` subrequest to `/api/edge-authz`, which
 checks app access and, for `/dzi/`, that the slide is still published, so a
 HIT cannot bypass either). Clearing the cache empties both zones, so it affects
-tiles, thumbnails and assets alike. Two kinds of request neither read nor fill
-the shared caches:
-one carrying a staff bearer (the dashboard's draft preview) and one carrying
-a Cloudflare Access assertion (Path A in
-[Ingress paths](#ingress-paths-a--b--c)) — so behind CF Access SSO every tile
-is rendered by the app. The `/api/edge-authz` verdicts themselves are
+tiles, thumbnails and assets alike. A request carrying a staff bearer (the
+dashboard's draft preview) neither reads nor fills the shared caches; one
+carrying a Cloudflare Access assertion (Path A in
+[Ingress paths](#ingress-paths-a--b--c)) shares them like any signed-in
+viewer's, since the edge check runs before every HIT. The `/api/edge-authz`
+probe is for nginx only (from outside, nginx answers it with 404); its verdicts themselves are
 kept in a separate, small `wsi_authz_cache` zone (`/var/cache/nginx/wsi_authz`,
 60 s per allowed client and slide, entries dropped after 2 minutes unused,
 denials never stored), so requests carrying made-up session cookies cannot

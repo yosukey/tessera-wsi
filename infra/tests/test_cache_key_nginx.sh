@@ -183,6 +183,7 @@ http {
     limit_req_zone \$binary_remote_addr zone=wsi_sync_ws:1m     rate=600r/m;
     limit_req_zone \$binary_remote_addr zone=wsi_slide_detail:1m rate=600r/m;
     limit_req_zone \$binary_remote_addr zone=wsi_page_reads:1m rate=600r/m;
+    limit_req_zone \$binary_remote_addr zone=wsi_branding:1m rate=600r/m;
     limit_req_zone \$binary_remote_addr zone=wsi_sync_peek:1m rate=600r/m;
     limit_req_zone \$binary_remote_addr zone=wsi_spa:1m         rate=600r/m;
     limit_req_zone \$wsi_dzi_uncached_key  zone=wsi_dzi_uncached:1m rate=600r/m;

@@ -37,6 +37,12 @@
 #      request, so the two login endpoints also cap each /64 ($wsi_rl_net64,
 #      the real map), generously enough for a class with an address each;
 #      IPv4 is keyed per address only.
+#   6. The branding images every page shows (logo, header and seasonal
+#      backgrounds) have a zone of their own (wsi_branding), so a class opening
+#      the site together neither 429s them nor drains wsi_api / wsi_page_reads.
+#   7. Requests that skip the shared cache with a non-Basic Authorization header
+#      are metered on /thumbs/ and /assets/ as on /dzi/ (wsi_dzi_authed), and
+#      /api/edge-authz, the edge gate's probe, is not reachable from outside.
 #
 # The test boots nginx with the ACTUAL snippet `include`d (behind a tiny
 # stdlib upstream) and the ACTUAL limit_req_zone lines from wsi.conf, asserts
@@ -413,6 +419,70 @@ else
     fail "a join by 200 followers from one address: first refusal $bad"
 fi
 
+# 4e. The branding images (logo, header background, seasonal backgrounds) that
+#     every page shows once set: a class opening the site behind one address
+#     loads each once per student. They have a zone of their own (wsi_branding),
+#     so they get through although wsi_api is exhausted for that address ...
+code7() { curl -s -o /dev/null -w '%{http_code}' -m 5 --interface 127.0.0.7 "http://127.0.0.1:${NG_PORT}$1"; }
+for _ in $(seq 1 80); do code7 /api/slides/AbC_-09xyz/tours >/dev/null; done
+if [ "$(code7 /api/slides/AbC_-09xyz/tours)" = "429" ]; then
+    printf 'ok   - (wsi_api is exhausted for 127.0.0.7)\n'
+else
+    fail "could not exhaust wsi_api for 127.0.0.7"
+fi
+bad=""
+for _ in $(seq 1 150); do
+    for path in '/api/viewer/logo?v=e1' '/api/viewer/header-default-background?v=e2' \
+                '/api/viewer/seasonal-background/3?v=e3'; do
+        c="$(code7 "$path")"; [ "$c" = "200" ] || { bad="$path:$c"; break 2; }
+    done
+done
+if [ -z "$bad" ]; then
+    printf 'ok   - 150 page loads x 3 branding images from one address are all admitted\n'
+else
+    fail "branding images from one address: first refusal $bad (still in wsi_api?)"
+fi
+# ... without spending the page reads' burst (the settings read still has all
+# of it: 300 in a row from this address) ...
+bad=""
+for _ in $(seq 1 300); do
+    c="$(code7 /api/viewer/settings)"; [ "$c" = "200" ] || { bad="$c"; break; }
+done
+[ -z "$bad" ] && printf 'ok   - ...and they leave the page reads (settings) their own burst\n' \
+    || fail "settings read after the branding images: refused with $bad (do they share a zone?)"
+# ... while other /api/viewer/ paths (and a slot that does not exist) stay in
+#     wsi_api (drained again: it refills at 2 r/s) ...
+for _ in $(seq 1 80); do code7 /api/slides/AbC_-09xyz/tours >/dev/null; done
+for path in /api/viewer/seasonal-background/9 /api/viewer/other; do
+    c="$(code7 "$path")"
+    [ "$c" = "429" ] && printf 'ok   - %s stays metered by wsi_api (429)\n' "$path" \
+        || fail "$path answered $c, expected 429 from the exhausted wsi_api"
+done
+# ... and a flood past the burst still meets a ceiling, answered with 429.
+c="$(first_rejection '/api/viewer/logo?v=e1' 700 '200')"
+if [ "$c" = "429" ]; then
+    printf 'ok   - the branding zone still throttles a flood, with 429\n'
+else
+    fail "branding images: first rejection '$c' in 700, expected 429"
+fi
+
+# 4f. The probe the edge gate uses is not reachable from outside: nginx answers
+#     /api/edge-authz itself (the stub upstream would say 200), in any spelling
+#     that normalises to it.
+bad=""
+for path in /api/edge-authz '/api/edge-authz?x=1' //api/edge-authz /api/./edge-authz /api/edge%2Dauthz; do
+    c="$(curl -s --path-as-is -o /dev/null -w '%{http_code}' -m 5 --interface 127.0.0.8 \
+        "http://127.0.0.1:${NG_PORT}${path}")"
+    [ "$c" = "404" ] || bad="${bad} ${path}:${c}"
+done
+[ -z "$bad" ] && printf 'ok   - /api/edge-authz answers 404 from outside (5 spellings)\n' \
+    || fail "external /api/edge-authz reached the app:${bad}"
+# ... while the gate itself (its internal subrequest) still works.
+c="$(curl -s -o /dev/null -w '%{http_code}' -m 5 --interface 127.0.0.8 \
+    "http://127.0.0.1:${NG_PORT}/thumbs/t.jpg?v=1")"
+[ "$c" = "200" ] && printf 'ok   - ...while the auth_request gate on /thumbs/ still admits (200)\n' \
+    || fail "/thumbs/ through the internal gate answered $c, expected 200"
+
 # 5. Same for the SPA catch-all, which sets limit_req_status separately.
 #    burst=100 on a 600r/min zone. 404 counts as served (no SPA files here).
 c="$(first_rejection /rate-limit-probe 260 '200 404')"
@@ -542,6 +612,28 @@ if [ "$codes" = "700 200," ]; then
 else
     fail "700 Basic /dzi/ requests from the flooded address: '${codes}' (expected 700 200s)"
 fi
+
+# 6c. /thumbs/ and /assets/ take the same cache bypass for the same header, so
+#     they are metered in the same zone: a Bearer flood is refused with 429,
+#     while requests without the header from that address are not counted.
+static_flood() {  # static_flood <count> <parallel> <address> <path-with-{}> [auth-header]
+    seq 1 "$1" | xargs -P "$2" -I{} curl -s -o /dev/null -w '%{http_code}\n' -m 8 \
+        --interface "$3" ${5:+-H "Authorization: $5"} \
+        "http://127.0.0.1:${NG_PORT}$4" | sort | uniq -c | awk '{ printf "%s %s,", $1, $2 }'
+}
+for base in /thumbs /assets/tours/t1; do
+    codes="$(static_flood 900 32 127.0.0.9 "${base}/f{}.jpg" 'Bearer junk')"
+    case ",${codes}" in
+        *" 429,"*) printf 'ok   - a flood of Bearer %s/ requests is refused with 429 (%s)\n' "$base" "${codes%,}" ;;
+        *) fail "900 Bearer ${base}/ requests never saw a 429 (${codes}) - is wsi_dzi_authed missing there?" ;;
+    esac
+    codes="$(static_flood 700 32 127.0.0.9 "${base}/f{}.jpg")"
+    if [ "$codes" = "700 200," ]; then
+        printf 'ok   - ...while %s/ requests without the header from that address are not counted\n' "$base"
+    else
+        fail "700 header-less ${base}/ requests from the flooded address: '${codes}' (expected 700 200s)"
+    fi
+done
 
 # 7. IPv6 clients are also keyed on their /64 for the two login endpoints.
 #    First the key itself ($wsi_rl_net64), for every way "::" can fall in the
