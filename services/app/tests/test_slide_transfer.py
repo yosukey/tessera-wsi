@@ -3904,6 +3904,66 @@ def test_import_tour_assets_refuse_a_full_data_volume(tmp_path, monkeypatch):
     assert _st._import_tour_assets(str(src), str(dst), dry_run=True) == []
 
 
+def test_plan_predicts_the_attachment_space_check_of_the_apply(db_session, monkeypatch):
+    """The plan's data_space covers the tour attachments too, with the
+    reserve the apply holds each one to (reserve_for, or
+    TOUR_ASSET_MIN_FREE_BYTES when larger) — even when the WSIs are
+    hard-linked and need no space, which used to skip the check entirely:
+    a plan that fits must not be followed by every slide with attachments
+    failing with importNoSpace."""
+    from wsi_app import disk_space
+
+    _patch_wsi_readers(monkeypatch)
+    # Hard-linked WSIs: nothing to copy for them.
+    monkeypatch.setattr(_st, "_same_filesystem", lambda a, b: True)
+    floor = disk_space.RESERVE_MIN_BYTES + 4096  # the operator floor wins
+    saved_floor = settings.tour_asset_min_free_bytes
+    object.__setattr__(settings, "tour_asset_min_free_bytes", floor)
+    # A volume whose free space goes down as attachments are copied onto it.
+    free = {"n": 0}
+    monkeypatch.setattr(disk_space, "free_bytes", lambda path: free["n"])
+    real_copyfile = _st.shutil.copyfile
+
+    def _copyfile(src, dst, *a, **kw):
+        out = real_copyfile(src, dst, *a, **kw)
+        if f"{os.sep}assets{os.sep}tours{os.sep}" in str(dst):
+            free["n"] -= os.path.getsize(src)
+        return out
+
+    monkeypatch.setattr(_st.shutil, "copyfile", _copyfile)
+    t = _tok()
+    tour_pid = f"ps{t}"
+    png = _png_bytes()
+    stage_id = _stage_bundle(
+        [_slide_doc(f"ps{t}", f"ps-{t}.svs", [{"public_id": tour_pid, "title": "S", "steps": []}])],
+        assets={tour_pid: {"a.png": png, "b.png": png}},
+    )
+    try:
+        _dir, manifest, doc = _st._read_stage(stage_id)
+        need = 2 * len(png)
+        # One byte short of both attachments plus the floor: the plan says
+        # so...
+        free["n"] = need + floor - 1
+        plan = _st.plan_import(stage_id, manifest, doc, db_session)
+        assert plan["data_space"] == {
+            "needed_bytes": need, "free_bytes": need + floor - 1, "reserve_bytes": floor,
+        }, plan["data_space"]
+        # ...and the apply indeed refuses the slide at its second attachment.
+        result = _st.apply_import(stage_id, {})
+        assert [f["code"] for f in result["failed"]] == ["importNoSpace"], result
+        # Room for both copies and the floor after them: the plan fits, and
+        # the apply (a retry of the stage) copies every attachment.
+        free["n"] = need + floor
+        assert _st.plan_import(stage_id, manifest, doc, db_session)["data_space"] is None
+        result = _st.apply_import(stage_id, {})
+        assert not result["failed"], result
+        assert len(result["imported"]) == 1, result
+        assert result["retry"] == {"failed_slides": 0, "skipped_assets": 0}
+    finally:
+        object.__setattr__(settings, "tour_asset_min_free_bytes", saved_floor)
+        _st.cleanup_import_stage(stage_id)
+
+
 def test_attachment_retry_skips_a_tour_deleted_before_its_lock(db_session, monkeypatch, asset_settings):
     """The retry reads the import's tours before taking each tour's
     tour_asset_lock; a tour deleted in between (row and asset directory gone
@@ -3962,6 +4022,24 @@ def _release_all_slots():
     _jobs.store.prune_terminal(max_age_seconds=0)
 
 
+def _drop_unhandled_error_logs():
+    """Delete the ``wsi_app.unhandled`` ErrorLog rows a simulated 500 left.
+
+    The tests below drive a request into an unhandled exception on purpose;
+    the error-log capture persists it to the shared test database, which
+    would make later tests that count ``wsi_app.unhandled`` rows (e.g.
+    test_error_logs) depend on test order.
+    """
+    from sqlalchemy import delete as sa_delete
+
+    from wsi_app.db import SessionLocal
+    from wsi_app.models import ErrorLog
+
+    with SessionLocal() as db:
+        db.execute(sa_delete(ErrorLog).where(ErrorLog.logger == "wsi_app.unhandled"))
+        db.commit()
+
+
 @pytest.fixture
 def running_write_fails(monkeypatch):
     """Make the ``state="running"`` write right after a claim raise, leaving
@@ -3974,9 +4052,13 @@ def running_write_fails(monkeypatch):
         return real(job_id, **fields)
 
     monkeypatch.setattr(_jobs.store, "update", update)
-    yield
-    monkeypatch.setattr(_jobs.store, "update", real)
-    _release_all_slots()
+    try:
+        yield
+    finally:
+        monkeypatch.setattr(_jobs.store, "update", real)
+        _release_all_slots()
+        # Each test using this fixture ends in a simulated unhandled 500.
+        _drop_unhandled_error_logs()
 
 
 def test_export_releases_the_slot_when_the_running_write_fails(

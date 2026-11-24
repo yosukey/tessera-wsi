@@ -60,7 +60,7 @@ from .. import login_throttle as _login_throttle
 from .. import network as _net
 from .. import sync_room as _sync_room_module
 from ..admin_helpers import api_error, audit
-from ..auth import STAFF_ROLES, require_staff
+from ..auth import STAFF_ROLES, get_current_user, require_staff
 from ..config import settings, env_bool, env_int, env_int_min, env_float
 from ..db import SessionLocal
 from ..models import Slide, User
@@ -690,11 +690,48 @@ def _peek(
 
 # ------------------------------------------------------------ REST endpoints
 
+def _resolve_staff_request(request: Request) -> User:
+    """``require_staff`` resolved in a session of the worker thread's own.
+
+    Runs ``auth.get_current_user`` + ``auth.require_staff`` themselves — not
+    a copy of their checks — so the token decode, user existence, is_active,
+    token_version revocation and the staff-role gate, and their 401 "Missing
+    token" / 401 "Invalid token" / 403 "Forbidden" answers, are exactly the
+    ones every other staff endpoint gives. Only the session differs: one
+    opened and closed here, in the thread, instead of the request's
+    ``Depends(get_db)`` one (see the note above _get_slide). The user's
+    column attributes are loaded before the session closes, so the detached
+    row still reads ``id`` / ``username`` / ``role`` for the audit records.
+    """
+    db = SessionLocal()
+    try:
+        return require_staff(get_current_user(request, db))
+    finally:
+        db.close()
+
+
+async def require_staff_off_loop(request: Request) -> User:
+    """Staff gate for the async sync endpoints, holding no pooled connection.
+
+    ``Depends(require_staff)`` reaches ``get_db`` through
+    ``get_current_user``, and a ``get_db`` session is a generator dependency
+    torn down only once the response is sent: its pooled connection would
+    stay checked out across the endpoint's awaits — the RoomManager's
+    create/supersede/end and the audit hop — so a burst of presenters
+    starting sessions, or a slow room teardown, could pin the whole pool.
+    (FastAPI already runs the plain ``def`` dependencies in its threadpool;
+    the problem is only how long their session lives.) Resolving the user in
+    a short-lived session inside ``asyncio.to_thread`` returns the
+    connection before the endpoint body starts.
+    """
+    return await asyncio.to_thread(_resolve_staff_request, request)
+
+
 @router.post("/api/admin/sync/sessions", response_model=SessionCreateOut)
 async def create_sync_session(
     body: SessionCreateIn,
     request: Request,
-    presenter: User = Depends(require_staff),
+    presenter: User = Depends(require_staff_off_loop),
 ):
     # Run the SQLite read off the event loop. This handler is ``async`` (it must
     # await the RoomManager), so a synchronous ``db.get`` here would block every
@@ -754,7 +791,7 @@ async def create_sync_session(
 @router.delete("/api/admin/sync/sessions/{sid}")
 async def end_sync_session(
     sid: str,
-    presenter: User = Depends(require_staff),
+    presenter: User = Depends(require_staff_off_loop),
     client_id: Optional[str] = None,
 ):
     # No owner-ID check: per the role-permission matrix any staff user may
@@ -809,7 +846,7 @@ async def peek_sync_session(sid: str):
 @router.get("/api/admin/sync/sessions", response_model=SessionListOut)
 async def list_owned_sync_sessions(
     request: Request,
-    presenter: User = Depends(require_staff),
+    presenter: User = Depends(require_staff_off_loop),
 ):
     # Owner-scoped list backing the presenter's "resume" affordance: after a
     # presenter leaves (reload / tab close / network drop) the room survives
@@ -839,10 +876,12 @@ async def list_owned_sync_sessions(
 # teardown would then ``close()`` the session on another thread while the
 # worker is still mid-query on it — a Session is not thread-safe, and the
 # connection could go back to the pool in use. A session born and closed in
-# the worker thread has no second owner. (It also keeps create_sync_session
-# from pinning a pooled connection while it awaits the RoomManager.) The rows
-# are read whole before the session closes, so their column attributes stay
-# readable on the detached instances.
+# the worker thread has no second owner. The staff gate of these endpoints
+# is resolved the same way (require_staff_off_loop), so no request-scoped
+# session — and no pooled connection — is held while create / end await the
+# RoomManager and the audit hop. The rows are read whole before the session
+# closes, so their column attributes stay readable on the detached
+# instances.
 
 def _get_slide(slide_id: int) -> Optional[Slide]:
     """The row of ``slide_id``, or None (for a to_thread hop)."""
@@ -868,7 +907,7 @@ def _load_slides(slide_ids: List[int]) -> Dict[int, Slide]:
 
 @router.get("/api/admin/sync/sessions/all", response_model=AdminSessionListOut)
 async def list_all_sync_sessions(
-    presenter: User = Depends(require_staff),
+    presenter: User = Depends(require_staff_off_loop),
 ):
     """Every active live-sync session, for the staff management surface.
 

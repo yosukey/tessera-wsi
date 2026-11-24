@@ -1443,6 +1443,62 @@ def _wsi_copy_needed(stage_dir: str) -> bool:
     return not _same_filesystem(stage_dir, _data_volume_path())
 
 
+def _tour_asset_volume_path() -> str:
+    """The nearest existing directory on the way to ``assets/tours`` (where
+    imported attachments land; _import_tour_assets creates the missing
+    levels), for free-space checks."""
+    path = os.path.join(settings.data_dir, "assets", "tours")
+    while not os.path.isdir(path) and path != settings.data_dir:
+        path = os.path.dirname(path)
+    return path
+
+
+def _plan_data_space(wsi_bytes: int, asset_bytes: int) -> Optional[dict]:
+    """The shortfall (``as_params``) of the copies an apply will make, or
+    None when they fit or the free space is unknown.
+
+    The apply checks each copy as it goes: a WSI against
+    ``disk_space.reserve_for(its size)`` (_check_wsi_copy_space), a tour
+    attachment against ``max(reserve_for(its size),
+    TOUR_ASSET_MIN_FREE_BYTES)`` (_import_tour_assets). The plan checks the
+    total against the same rule applied to the total: reserve_for grows
+    with its argument, so a copy made after everything before it was
+    written still finds its own size plus its own reserve free — a plan
+    that fits never has the apply refuse a slide it counted, short of
+    something else writing meanwhile. Notably, a stage whose WSIs are
+    hard-linked (nothing to copy for them) is still checked for its
+    attachments and the operator's floor.
+
+    WSIs and attachments on one volume (the usual case: both under the data
+    dir) are checked together; on two volumes, each against its own. One
+    measurement per volume, so the figures reported are the ones that
+    decided (a second statvfs could report a free figure that disagreed with
+    the verdict).
+    """
+    def _reserve(nbytes: int, with_assets: bool) -> int:
+        r = _disk_space.reserve_for(nbytes)
+        if with_assets:
+            r = max(r, settings.tour_asset_min_free_bytes)
+        return r
+
+    wsi_path = _data_volume_path()
+    asset_path = _tour_asset_volume_path()
+    checks = []
+    if wsi_bytes and asset_bytes and _same_filesystem(wsi_path, asset_path):
+        total = wsi_bytes + asset_bytes
+        checks.append((wsi_path, total, _reserve(total, True)))
+    else:
+        if wsi_bytes:
+            checks.append((wsi_path, wsi_bytes, _reserve(wsi_bytes, False)))
+        if asset_bytes:
+            checks.append((asset_path, asset_bytes, _reserve(asset_bytes, True)))
+    for path, nbytes, reserve in checks:
+        short = _disk_space.check(path, nbytes, reserve=reserve)
+        if short is not None:
+            return short.as_params()
+    return None
+
+
 def plan_import(stage_id: str, manifest: dict, slides_doc: dict, db: Session) -> dict:
     """Compute the additive-import preflight: version guard + per-slide conflicts.
 
@@ -1481,6 +1537,7 @@ def plan_import(stage_id: str, manifest: dict, slides_doc: dict, db: Session) ->
     failed_earlier = 0
     retryable_assets = 0
     wsi_bytes_to_copy = 0
+    asset_bytes_to_copy = 0
     for sd in slides:
         raw_basename = sd.get("wsi_original_basename") or ""
         norm = safe_filename(raw_basename).casefold()
@@ -1493,12 +1550,20 @@ def plan_import(stage_id: str, manifest: dict, slides_doc: dict, db: Session) ->
             content_errors.append({"tour": "", "step": 0, "detail": ext_error})
         tours = sd.get("tours") or []
         assets_over_limit = 0
+        slide_asset_bytes = 0
         for t in tours:
             src_assets = _staged_assets_dir(stage_dir, t["public_id"])
             if src_assets:
-                assets_over_limit += _preview_tour_asset_skips(src_assets)
+                over, accepted = _preview_tour_asset_skips(src_assets)
+                assets_over_limit += over
+                slide_asset_bytes += accepted
         rec = records.get(public_id)
         apply_status = _effective_status(db, rec) if rec is not None else None
+        if apply_status != "imported":
+            # Attachments are always copied (never hard-linked), whatever
+            # the WSI placement; an imported slide's are not copied again
+            # by an apply.
+            asset_bytes_to_copy += slide_asset_bytes
         if apply_status == "imported":
             already_imported += 1
             retryable_assets += _retryable_asset_count(rec)
@@ -1543,20 +1608,11 @@ def plan_import(stage_id: str, manifest: dict, slides_doc: dict, db: Session) ->
         })
 
     # The WSI files of the slides still to import are copied onto the data
-    # volume when it is not the stage's (hard-linked otherwise): say up front
-    # when they will not all fit — with the reserve each copy must leave free
-    # (_check_wsi_copy_space) — rather than only as per-slide failures.
-    # One measurement, so the figures reported are the ones that decided
-    # (a second statvfs could report a free figure that disagreed with the
-    # verdict). The per-slide check reserves for each
-    # slide's own size and the plan for the total — both
-    # disk_space.reserve_for, so a plan that fits never refuses a slide
-    # that the plan counted, short of something else writing meanwhile.
-    data_space = None
-    if wsi_bytes_to_copy:
-        short = _disk_space.check(_data_volume_path(), wsi_bytes_to_copy)
-        if short is not None:
-            data_space = short.as_params()
+    # volume when it is not the stage's (hard-linked otherwise), and their
+    # tour attachments are always copied: say up front when they will not
+    # all fit — with the reserve each copy must leave free — rather than only
+    # as per-slide failures (see _plan_data_space).
+    data_space = _plan_data_space(wsi_bytes_to_copy, asset_bytes_to_copy)
 
     return {
         "stage_id": stage_id,
@@ -1569,7 +1625,8 @@ def plan_import(stage_id: str, manifest: dict, slides_doc: dict, db: Session) ->
         # slides.json keys this build does not know (a newer exporter's
         # fields): they cannot be imported.
         "unknown_fields": _unknown_bundle_fields(slides),
-        # Set when the data volume cannot take the WSI files still to copy.
+        # Set when the data volume cannot take the WSI files and tour
+        # attachments still to copy.
         "data_space": data_space,
         # True once an apply has run against this stage (it was kept because
         # something is left to retry).
@@ -2064,10 +2121,13 @@ def _asset_limit_reason(entry, *, count: int, total: int) -> tuple[Optional[str]
     return None, size
 
 
-def _preview_tour_asset_skips(src_dir: str) -> int:
-    """How many of a staged tour's assets the limits alone will refuse — the
-    preflight's cheap estimate (no content decoding, so it is a lower bound
-    on what :func:`_import_tour_assets` will skip)."""
+def _preview_tour_asset_skips(src_dir: str) -> tuple[int, int]:
+    """How many of a staged tour's assets the limits alone will refuse, and
+    the bytes of the ones they let through — the preflight's cheap estimate.
+    No content decoding, so the count is a lower bound on what
+    :func:`_import_tour_assets` will skip, and the bytes an upper bound on
+    what it will copy (into an empty tour directory, as a fresh import's
+    is)."""
     count = total = skipped = 0
     for entry in _tour_asset_entries(src_dir):
         reason, size = _asset_limit_reason(entry, count=count, total=total)
@@ -2076,7 +2136,7 @@ def _preview_tour_asset_skips(src_dir: str) -> int:
             continue
         count += 1
         total += size
-    return skipped
+    return skipped, total
 
 
 # Attachment skip reasons a retry of the same stage can overcome: each is one

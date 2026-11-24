@@ -1521,9 +1521,20 @@ class _ZstdFrameTracker:
     several — ``pzstd``, or files concatenated — and skippable frames (magic
     ``0x184D2A5?``, which pzstd writes before each data frame). Every frame
     is followed: were the check to stop at the end of the first, or at a
-    leading skippable frame, a cut anywhere after it would again read as a
-    clean, shorter archive. Only bytes that are no frame at all end the
-    tracking; the codec refuses those itself."""
+    leading skippable frame, a cut inside any later frame would again read
+    as a clean, shorter archive. Only bytes that are no frame at all end the
+    tracking; the codec refuses those itself.
+
+    What this cannot see is a cut that lands exactly on a frame boundary.
+    The input then ends with every frame begun read to its checksum, so
+    :attr:`complete` is True, yet the frames after the cut are gone — for a
+    multi-frame archive, possibly with the tar end-of-archive blocks they
+    held, and tarfile ends such a stream quietly at the last whole member
+    (it does not require the end-of-archive marker). That archive reads as a
+    clean, shorter one. A single-frame archive (what the writer here
+    produces) has no such boundary short of its end, so for it every cut is
+    caught; for multi-frame archives made elsewhere only cuts inside a frame
+    are."""
 
     def __init__(self, inner) -> None:
         self._inner = inner
