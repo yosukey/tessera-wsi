@@ -587,16 +587,24 @@ export class RestoreWaitUnauthorizedError extends UnauthorizedError {
   }
 }
 
+//
+// `signal` ends the wait (rejecting with an AbortError) — the caller's
+// component unmounted, so nothing is left to act on the outcome.
 export async function waitForRestoreApplied(
   expectedStageId: string,
   timeoutMs = 90_000,
   intervalMs = 1500,
+  signal?: AbortSignal,
 ): Promise<NonNullable<RestoreResult['result']>> {
   const start = Date.now()
   let sawOutage = false
   let authRejected = 0
+  const throwIfAborted = () => {
+    if (signal?.aborted) throw new DOMException('restore wait aborted', 'AbortError')
+  }
   // eslint-disable-next-line no-constant-condition
   while (true) {
+    throwIfAborted()
     // 0 = no HTTP answer (connection refused / reset mid-restart).
     let status = 0
     let result: RestoreResult['result'] = null
@@ -604,12 +612,15 @@ export async function waitForRestoreApplied(
       const r = await fetch('/api/admin/restore/result', {
         headers: authHeaders(),
         cache: 'no-store',
+        signal,
       })
       status = r.status
       if (r.ok) result = ((await r.json()) as RestoreResult).result
     } catch {
       status = 0
     }
+    // An aborted fetch is not an outage: stop rather than count it as one.
+    throwIfAborted()
     if (result && result.stage_id === expectedStageId) return result
     if (status === 401 || status === 403) {
       if (sawOutage) throw new RestoreWaitUnauthorizedError(status, true)

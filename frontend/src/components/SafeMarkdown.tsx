@@ -7,6 +7,7 @@ import { useI18n } from '../lib/i18n'
 import { useDialogFocus } from '../hooks/useDialogFocus'
 import { adminFetchImageBlobUrl } from '../lib/api'
 import { adminAssetPath } from '../lib/adminAssetPath'
+import { fixedRight, FULL_VIEWPORT_FIXED } from '../lib/viewportBox'
 import styles from './SafeMarkdown.module.css'
 
 // True while rendering the descendants of a markdown link. An image inside a
@@ -85,6 +86,10 @@ function mergeLinkRel(existing: string | undefined): string {
   return tokens.join(' ')
 }
 
+// `src` is the image's markdown source, not what the inline <img> resolved
+// it to: in the admin editor that is a blob: URL owned (and revoked) by the
+// inline image, which can unmount or re-fetch while the lightbox is open, so
+// the lightbox resolves its own (see ImageLightbox).
 type ZoomTarget = { src: string; alt: string }
 
 // The src to render: `src` itself, or — in the admin editor, for a local asset
@@ -137,7 +142,7 @@ function MarkdownImage(props: React.ImgHTMLAttributes<HTMLImageElement>) {
     return <img {...props} src={src} style={{ maxWidth: '100%', height: 'auto' }} />
   }
 
-  const openZoom = () => { if (src) onZoom({ src, alt }) }
+  const openZoom = () => { if (src) onZoom({ src: rawSrc, alt }) }
   return (
     <img
       {...props}
@@ -163,6 +168,9 @@ function ImageLightbox({ zoom, onClose }: { zoom: ZoomTarget; onClose: () => voi
   const { t } = useI18n()
   const dialogRef = useRef<HTMLDivElement | null>(null)
   useDialogFocus(dialogRef)
+  // Its own blob: URL in the admin editor (the plain src elsewhere), owned by
+  // this overlay and revoked when it closes, so it can't be revoked under it.
+  const src = useMarkdownImageSrc(zoom.src)
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
@@ -185,8 +193,10 @@ function ImageLightbox({ zoom, onClose }: { zoom: ZoomTarget; onClose: () => voi
       aria-label={zoom.alt || t('markdown.imageZoomHint')}
       onClick={onClose}
       style={{
-        position: 'fixed',
-        inset: 0,
+        // Anchored to the measured viewport (lib/viewportBox), so the overlay
+        // and its close button stay on screen while Chrome on iPad keeps a
+        // stale layout viewport after a rotation.
+        ...FULL_VIEWPORT_FIXED,
         zIndex: 'calc(var(--z-modal, 1000) + 20)' as unknown as number,
         background: 'rgba(0, 0, 0, 0.85)',
         display: 'flex',
@@ -202,9 +212,11 @@ function ImageLightbox({ zoom, onClose }: { zoom: ZoomTarget; onClose: () => voi
         onClick={(e) => { e.stopPropagation(); onClose() }}
         aria-label={t('common.close')}
         style={{
+          // Fixed (not absolute) so it stays put while a large image scrolls
+          // the overlay.
           position: 'fixed',
           top: 12,
-          right: 12,
+          right: fixedRight(12),
           zIndex: 1,
           background: 'rgba(255, 255, 255, 0.92)',
           border: '1px solid var(--color-border, #ccc)',
@@ -218,7 +230,7 @@ function ImageLightbox({ zoom, onClose }: { zoom: ZoomTarget; onClose: () => voi
         {t('markdown.imageZoomClose')}
       </button>
       <img
-        src={zoom.src}
+        src={src}
         alt={zoom.alt}
         // Stop the backdrop's close handler so a click that lands on the
         // image itself doesn't dismiss the lightbox.
@@ -278,9 +290,10 @@ function SafeMarkdown({ markdown, adminImages = false }: Props) {
           <div className={styles.prose}>
             {rendered}
           </div>
+          {/* Inside the provider: the lightbox resolves the image itself. */}
+          {zoom && <ImageLightbox zoom={zoom} onClose={closeZoom} />}
         </AdminImagesContext.Provider>
       </ZoomContext.Provider>
-      {zoom && <ImageLightbox zoom={zoom} onClose={closeZoom} />}
     </>
   )
 }

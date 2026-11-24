@@ -1731,6 +1731,7 @@ const ja: Translation = {
     'adminBackup.restore.stagingOnServer': 'サーバー側で展開中…',
     'adminBackup.restore.copyingOnServer': 'サーバー側でアップロードをコピー中…',
     'adminBackup.restore.uploading': 'アップロード中…',
+    'adminBackup.busyLeaveConfirm': 'リストア用アーカイブのアップロード中、またはリストア／リセットの適用中です。移動するとアップロードは中断されます（リストア／リセットは続行され、結果はこのタブに戻ると表示されます）。移動しますか？',
     'adminBackup.restore.preview.title': 'リストアプレビュー',
     'adminBackup.restore.preview.from': 'バックアップの版',
     'adminBackup.restore.preview.to': '現在の版',

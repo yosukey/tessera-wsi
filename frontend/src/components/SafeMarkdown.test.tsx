@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import React from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render as rtlRender, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render as rtlRender, screen, waitFor } from '@testing-library/react'
 
 vi.mock('../lib/api', () => ({
   adminFetchImageBlobUrl: vi.fn(),
@@ -70,5 +70,23 @@ describe('SafeMarkdown images', () => {
     rerender(<SafeMarkdown markdown={`${md} world`} adminImages />)
     expect(container.querySelector('img')?.getAttribute('src')).toBe('blob:abc')
     expect(fetchBlob).toHaveBeenCalledTimes(1)
+  })
+
+  // The inline image's blob URL is revoked when that image goes (here: the
+  // markdown no longer has it); the open lightbox has its own.
+  it('gives the lightbox its own blob URL, which outlives the inline image', async () => {
+    fetchBlob.mockResolvedValueOnce('blob:inline').mockResolvedValueOnce('blob:zoom')
+    const md = '![a](/assets/tours/p1/a.png)'
+    const { container, rerender } = render(<SafeMarkdown markdown={md} adminImages />)
+    await waitFor(() => expect(container.querySelector('img')?.getAttribute('src')).toBe('blob:inline'))
+    fireEvent.click(container.querySelector('img')!)
+    const dialog = await screen.findByRole('dialog')
+    await waitFor(() => expect(dialog.querySelector('img')?.getAttribute('src')).toBe('blob:zoom'))
+    rerender(<SafeMarkdown markdown="no image now" adminImages />)
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:inline')
+    expect(URL.revokeObjectURL).not.toHaveBeenCalledWith('blob:zoom')
+    expect(dialog.querySelector('img')?.getAttribute('src')).toBe('blob:zoom')
+    fireEvent.keyDown(document, { key: 'Escape' })
+    await waitFor(() => expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:zoom'))
   })
 })

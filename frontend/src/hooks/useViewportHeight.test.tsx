@@ -118,6 +118,19 @@ describe('useViewportHeight', () => {
     })
   })
 
+  // A trackpad pinch on a desktop: visualViewport shows the zoomed-in
+  // region (height / scale); the layout keeps the unzoomed height.
+  it('ignores a pinch zoom', () => {
+    const vv = Object.assign(new EventTarget(), { width: 600, height: 450, scale: 2 })
+    vi.stubGlobal('visualViewport', vv)
+    try {
+      const { result } = renderHook(() => useViewportHeight())
+      expect(result.current).toBe('900px')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('stops measuring once unmounted', () => {
     const { unmount } = renderHook(() => useViewportHeight())
     const before = vi.getTimerCount()

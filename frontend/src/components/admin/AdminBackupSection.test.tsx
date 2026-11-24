@@ -203,7 +203,7 @@ describe('AdminBackupSection staged-archive release', () => {
     api.waitForRestoreApplied.mockRejectedValue(new Error('timed out'))
     const { container } = mount()
     await stageAndApply(container)
-    await waitFor(() => expect(api.waitForRestoreApplied).toHaveBeenCalledWith(STAGE, 90_000))
+    await waitFor(() => expect(api.waitForRestoreApplied).toHaveBeenCalledWith(STAGE, 90_000, undefined, expect.any(AbortSignal)))
     await waitFor(() => expect(screen.getByRole('dialog').textContent).toContain('Could not confirm whether the restore was applied'))
     // The generic "could not reach the server, try again" text would invite a
     // second apply while the first may be running.
@@ -522,7 +522,7 @@ describe('AdminBackupSection reset', () => {
     api.waitForJob.mockRejectedValue(new NetworkError())
     api.waitForRestoreApplied.mockRejectedValue(new Error('timed out'))
     const dialog = await submitReset()
-    await waitFor(() => expect(api.waitForRestoreApplied).toHaveBeenCalledWith(STAGE, 90_000))
+    await waitFor(() => expect(api.waitForRestoreApplied).toHaveBeenCalledWith(STAGE, 90_000, undefined, expect.any(AbortSignal)))
     await waitFor(() => expect(dialog.textContent).toContain('Service did not come back up'))
   })
 })
@@ -652,5 +652,84 @@ describe('AdminBackupSection saved backups', () => {
     await waitFor(() => expect(deletes.every((b) => b.disabled)).toBe(true))
     expect(api.adminDeleteBackup).toHaveBeenCalledTimes(1)
     vi.mocked(window.confirm).mockRestore()
+  })
+})
+
+describe('AdminBackupSection leaving while busy', () => {
+  it('reports a restore upload as busy until its body is sent, and asks before a reload meanwhile', async () => {
+    const call = {} as { sent?: () => void }
+    api.adminRestoreFromUpload.mockImplementation(
+      (_f: File, _p: unknown, opts: { onSent?: () => void } = {}) => {
+        call.sent = opts.onSent
+        return new Promise(() => {})
+      },
+    )
+    const onBusyChange = vi.fn()
+    const leaveRef = { current: null as ((go: () => void) => void) | null }
+    const { container } = render(
+      <I18nProvider><AdminBackupSection onBusyChange={onBusyChange} leaveRef={leaveRef} /></I18nProvider>,
+    )
+    expect(leaveRef.current).toBeTypeOf('function')
+    const reloadAsks = () => !window.dispatchEvent(new Event('beforeunload', { cancelable: true }))
+    expect(reloadAsks()).toBe(false)
+    upload(container)
+    await waitFor(() => expect(onBusyChange).toHaveBeenLastCalledWith(true))
+    // Browser Back would abort it: the guard has its history entry in place.
+    expect(window.history.state?.wsiNavGuard).toBeTruthy()
+    expect(reloadAsks()).toBe(true)
+    act(() => call.sent?.())
+    await waitFor(() => expect(onBusyChange).toHaveBeenLastCalledWith(false))
+    expect(reloadAsks()).toBe(false)
+  })
+
+  it('reports an apply in progress as busy', async () => {
+    api.adminApplyRestore.mockReturnValue(new Promise(() => {}))
+    const onBusyChange = vi.fn()
+    const { container } = render(
+      <I18nProvider><AdminBackupSection onBusyChange={onBusyChange} /></I18nProvider>,
+    )
+    await stageAndApply(container)
+    await waitFor(() => expect(onBusyChange).toHaveBeenLastCalledWith(true))
+  })
+
+  it('stops following an apply once unmounted, and does not reload whatever page is shown then', async () => {
+    api.adminApplyRestore.mockResolvedValue({ mode: 'restart' })
+    let finish: ((v: unknown) => void) | undefined
+    let signal: AbortSignal | undefined
+    api.waitForRestoreApplied.mockImplementation((_s: string, _t: number, _i: unknown, sig: AbortSignal) => {
+      signal = sig
+      return new Promise((resolve) => { finish = resolve })
+    })
+    const reload = vi.fn()
+    const assign = vi.fn()
+    const realLocation = window.location
+    Object.defineProperty(window, 'location', { configurable: true, value: { ...realLocation, reload, assign } })
+    try {
+      const { container, unmount } = mount()
+      await stageAndApply(container)
+      await waitFor(() => expect(signal).toBeDefined())
+      expect(signal!.aborted).toBe(false)
+      unmount()
+      expect(signal!.aborted).toBe(true)
+      // Even an answer that still arrives is not acted on.
+      finish!({ ok: true, stage_id: STAGE, scope: 'full', applied_at: 'x', app_version: '1.0.0' })
+      await new Promise((r) => setTimeout(r, 0))
+      expect(reload).not.toHaveBeenCalled()
+      expect(assign).not.toHaveBeenCalled()
+    } finally {
+      Object.defineProperty(window, 'location', { configurable: true, value: realLocation })
+    }
+  })
+
+  it('keeps the confirm dialogs scrollable on a short screen', async () => {
+    const { container } = mount()
+    upload(container)
+    fireEvent.click(await applyButtonReady())
+    const dialog = await screen.findByRole('dialog')
+    const panel = dialog.firstElementChild as HTMLElement
+    expect(panel.style.maxHeight).toBe('100%')
+    expect(panel.style.overflowY).toBe('auto')
+    // Portaled out of the section, so no ancestor can clip or offset it.
+    expect(container.contains(dialog)).toBe(false)
   })
 })

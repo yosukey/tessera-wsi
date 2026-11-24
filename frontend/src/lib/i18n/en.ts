@@ -1736,6 +1736,7 @@ const en = {
     'adminBackup.restore.stagingOnServer': 'Extracting on server…',
     'adminBackup.restore.copyingOnServer': 'Copying the upload on server…',
     'adminBackup.restore.uploading': 'Uploading…',
+    'adminBackup.busyLeaveConfirm': 'A restore archive is still being uploaded, or a restore / reset is being applied. Leaving now cancels the upload; a restore / reset carries on, and its result is shown when you come back to this tab. Leave anyway?',
     'adminBackup.restore.preview.title': 'Restore preview',
     'adminBackup.restore.preview.from': 'Backup version',
     'adminBackup.restore.preview.to': 'Current version',

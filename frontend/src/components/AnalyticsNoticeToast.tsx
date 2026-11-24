@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react'
 import { useLocation } from 'react-router'
 import { getViewerSettings, type AnalyticsMode } from '../lib/api'
 import { STORAGE_KEYS } from '../lib/storageKeys'
+import { fixedBottom, fixedRight } from '../lib/viewportBox'
 import { safeGetItem, safeSetItem } from '../lib/safeStorage'
 import { useI18n } from '../lib/i18n'
 
@@ -164,8 +165,11 @@ export default function AnalyticsNoticeToast() {
         }}
         style={{
           position: 'fixed',
-          bottom: 'calc(20px + env(safe-area-inset-bottom, 0px))',
-          right: 'calc(20px + env(safe-area-inset-right, 0px))',
+          // Anchored to the measured viewport's corner (lib/viewportBox), so
+          // the toast stays on screen while Chrome on iPad keeps a stale
+          // layout viewport after a rotation.
+          bottom: fixedBottom('20px + env(safe-area-inset-bottom, 0px)'),
+          right: fixedRight('20px + env(safe-area-inset-right, 0px)'),
           zIndex: 1000,
           maxWidth: 360,
           background: 'rgba(17, 24, 39, 0.96)',
