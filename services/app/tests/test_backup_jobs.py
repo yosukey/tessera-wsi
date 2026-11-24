@@ -585,3 +585,14 @@ def test_restore_apply_releases_the_slot_when_the_running_write_fails(admin_head
             if j.state in ("pending", "running"):
                 real(j.id, state="failed", error="test cleanup")
         _jobs.store.prune_terminal(max_age_seconds=0)
+        # The simulated failure surfaces as an unhandled 500, which the
+        # error-log capture persists to the shared test database. Drop that
+        # row so later tests that count "wsi_app.unhandled" rows start clean.
+        from sqlalchemy import delete as sa_delete
+
+        from wsi_app.db import SessionLocal
+        from wsi_app.models import ErrorLog
+
+        with SessionLocal() as db:
+            db.execute(sa_delete(ErrorLog).where(ErrorLog.logger == "wsi_app.unhandled"))
+            db.commit()
