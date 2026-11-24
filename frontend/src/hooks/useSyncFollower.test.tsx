@@ -325,3 +325,27 @@ describe('peek teardown, reconnect resets and end reasons', () => {
     expect(probe.current.hook.endedNext).toBeNull()
   })
 })
+
+describe('the hello frame measures the follower viewport', () => {
+  const realVV = Object.getOwnPropertyDescriptor(window, 'visualViewport')
+  afterEach(() => {
+    if (realVV) Object.defineProperty(window, 'visualViewport', realVV)
+    else delete (window as { visualViewport?: unknown }).visualViewport
+  })
+
+  it('falls back to the unzoomed visible height while the viewer is not built yet', async () => {
+    // A follower pinch-zoomed to 2x: visualViewport reports the zoomed-in
+    // region (half the height), but the layout - and so the viewer element
+    // once it exists - gets the full unzoomed height, as useViewportHeight
+    // gives it.
+    Object.defineProperty(window, 'visualViewport', {
+      configurable: true,
+      value: { width: 300, height: 350, scale: 2, addEventListener: () => {}, removeEventListener: () => {} },
+    })
+    const probe = mount('/slides/S1?sync=A')
+    await waitFor(() => expect(probe.current.hook.followerStatus).toBe('join'))
+    act(() => probe.current.hook.joinSession('dave'))
+    const measured = sockets[0].opts.getViewport()
+    expect(measured).toEqual({ vw: window.innerWidth, vh: 700 })
+  })
+})

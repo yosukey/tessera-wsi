@@ -33,6 +33,7 @@ import { peekSyncSession } from '../lib/api'
 import { isSyncPeekUnavailableError } from '../lib/api/sync'
 import { logger } from '../lib/logger'
 import { retryDelayMs } from '../lib/retryDelay'
+import { visibleViewportSize } from '../lib/viewportBox'
 import { SyncFollower, type ConnState, type CursorFrame, type EndFrame, type ViewFrame } from '../lib/sync'
 
 // How many times a peek the server could not answer right now (429, 5xx, no
@@ -426,9 +427,13 @@ export function useSyncFollower(
   //
   // The fallback mirrors how ViewerPage actually sizes that element rather
   // than using innerHeight: the layout's height comes from useViewportHeight,
-  // which prefers ``visualViewport.height`` precisely because iPadOS Safari
-  // gets the full-height computation wrong on a client-side route's first
-  // paint. Width stays on ``innerWidth`` (the layout viewport) since a
+  // which prefers the visible viewport's height precisely because iPadOS
+  // Safari gets the full-height computation wrong on a client-side route's
+  // first paint. Both read it through visibleViewportSize, which reports it at
+  // page scale 1: a follower who has pinch-zoomed the page has a zoomed-in
+  // visualViewport.height (height / scale), but the viewer element is still
+  // laid out at the unzoomed height, and that is the size fitBounds pads to.
+  // Width stays on ``innerWidth`` (the layout viewport) since a
   // follower's column spans the full width — there is no presenter sidebar on
   // this side — and visualViewport.width would shrink under a pinch.
   function measureViewport(): { vw: number; vh: number } | null {
@@ -441,7 +446,7 @@ export function useSyncFollower(
     }
     if (typeof window === 'undefined') return null
     const w = window.innerWidth
-    const h = window.visualViewport?.height ?? window.innerHeight
+    const h = visibleViewportSize().height
     if (w >= 1 && h >= 1) return { vw: Math.round(w), vh: Math.round(h) }
     return null
   }

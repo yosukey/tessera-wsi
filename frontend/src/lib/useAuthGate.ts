@@ -34,14 +34,30 @@ export function useAuthGate(): () => void {
   const navRef = useRef(nav)
   navRef.current = nav
   const aliveRef = useRef(true)
-  const probe = useRef<() => void>(() => {})
+  // The probe now under way, if any. A page calls the returned recheck on
+  // every 401 it gets, and with an app-access mode on and no session the
+  // mount probe and each of the page's first requests fail together (the
+  // index page fetches up to three things at once): without this, one
+  // visitor would send up to four /api/auth/state requests that all ask the
+  // same question. Calls made while one is pending share its answer instead.
+  const inFlightRef = useRef<Promise<void> | null>(null)
+  // Set once the probe has sent the visitor to /login. The page's remaining
+  // requests can still come back 401 before it unmounts, and asking again
+  // could only send them where they are already going.
+  const redirectedRef = useRef(false)
+  const probe = useRef<() => Promise<void>>(() => Promise.resolve())
   probe.current = () => {
-    getAuthState()
+    if (!aliveRef.current || redirectedRef.current) return Promise.resolve()
+    if (inFlightRef.current) return inFlightRef.current
+    const p = getAuthState()
       .then(s => {
         if (!aliveRef.current) return
         if (s.mode === 'none' || s.mode === 'basic') return
         // Remember the target so a shared live-sync / tour URL survives sign-in.
-        if (!s.authenticated) navRef.current(loginUrlFor(locRef.current), { replace: true })
+        if (!s.authenticated) {
+          redirectedRef.current = true
+          navRef.current(loginUrlFor(locRef.current), { replace: true })
+        }
       })
       .catch((err) => {
         // Deliberately fail open: if /api/auth/state itself is unreachable the
@@ -51,10 +67,18 @@ export function useAuthGate(): () => void {
         if (isAbortError(err)) return
         logger.warn('auth-state probe failed; rendering ungated', err)
       })
+      .finally(() => {
+        // Only coalesce while the question is open: a 401 that arrives after
+        // this answer (the session expiring an hour later) asks afresh.
+        if (inFlightRef.current === p) inFlightRef.current = null
+      })
+    inFlightRef.current = p
+    return p
   }
   useEffect(() => {
     aliveRef.current = true
-    probe.current()
+    redirectedRef.current = false
+    void probe.current()
     return () => { aliveRef.current = false }
   }, [])
   // The page probes once, when it opens. A page that stays mounted for long
@@ -62,6 +86,8 @@ export function useAuthGate(): () => void {
   // session; the page calls this when one of its own requests is answered 401,
   // and the visitor goes to the sign-in screen as if the page had just opened.
   // It redirects only when the server says the visitor is not authenticated,
-  // so a 401 for any other reason cannot loop.
-  return useCallback(() => probe.current(), [])
+  // so a 401 for any other reason cannot loop. Calls that arrive while a
+  // probe is pending share it, and none are made once the page has unmounted
+  // or the redirect has started (see inFlightRef / redirectedRef above).
+  return useCallback(() => { void probe.current() }, [])
 }
