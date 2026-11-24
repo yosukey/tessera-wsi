@@ -133,6 +133,10 @@ setup() {
     cp "$UPDATE_SH" "$REPO/infra/update.sh"
     cp "${HERE}/../lib/wsi-common.sh" "$REPO/infra/lib/wsi-common.sh"
     cp "${HERE}/../lib/nginx_tls_carry.py" "$REPO/infra/lib/nginx_tls_carry.py"
+    # update.sh's guard checks what install.sh's does, so these must exist
+    # (the fake install.sh below reads none of them).
+    mkdir -p "$REPO/infra/systemd" "$REPO/infra/nginx"
+    cp "${HERE}/../wsi.env.example" "$REPO/infra/wsi.env.example"
     # Fake install.sh: "deploys" the tree's version; fails on request.
     cat > "$REPO/infra/install.sh" <<'SH'
 #!/usr/bin/env bash

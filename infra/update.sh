@@ -123,12 +123,26 @@ done
 # drops SUDO_UID) the account the login session belongs to.
 _guard_op="${SUDO_UID:-}"
 if [[ -z "$_guard_op" ]]; then _guard_op="$(id -u -- "$(logname 2>/dev/null)" 2>/dev/null || true)"; fi
-# Everything root runs from the tree: lib/wsi-common.sh, install.sh, and
+# Everything root runs or installs from the tree: lib/wsi-common.sh,
 # lib/nginx_tls_carry.py (the pre-flight TLS check of the nginx site, run
-# before the services are stopped).
-for _guard_p in "$REPO_DIR" "$REPO_DIR/infra" "$REPO_DIR/infra/lib" "$REPO_DIR/infra/lib/wsi-common.sh" \
-                "$REPO_DIR/infra/lib/nginx_tls_carry.py" \
-                "$REPO_DIR/infra/install.sh" "$(realpath -- "${BASH_SOURCE[0]}")"; do
+# before the services are stopped), install.sh, and everything install.sh in
+# turn reads (the systemd units, the nginx configs, the wsi.env template).
+# This is the SAME set install.sh's own guard checks -- the same directories,
+# globbed the same way, so a unit or snippet added later is covered by both
+# without editing either -- plus install.sh and this script. It has to be:
+# install.sh only runs at step 4, after the snapshot and with the services
+# stopped, so a file only it refused (say a world-writable infra/nginx/*.conf)
+# would be found only then, and cost a rollback and the downtime that goes
+# with it instead of a refusal up front. Kept inline, not shared through
+# lib/: nothing may be sourced from the tree before it has been checked.
+shopt -s nullglob
+_guard_paths=("$REPO_DIR" "$REPO_DIR/infra" "$REPO_DIR/infra/wsi.env.example"
+              "$REPO_DIR/infra/lib" "$REPO_DIR/infra/lib"/*
+              "$REPO_DIR/infra/systemd" "$REPO_DIR/infra/systemd"/*
+              "$REPO_DIR/infra/nginx" "$REPO_DIR/infra/nginx"/*
+              "$REPO_DIR/infra/install.sh" "$(realpath -- "${BASH_SOURCE[0]}")")
+shopt -u nullglob
+for _guard_p in "${_guard_paths[@]}"; do
     read -r _guard_uid _guard_user _guard_mode < <(stat -L -c '%u %U %a' -- "$_guard_p" 2>/dev/null) \
         || _guard_refuse "$_guard_p is missing"
     if [[ "$_guard_uid" != 0 && "$_guard_uid" != "$EUID" && "$_guard_uid" != "$_guard_op" ]]; then
@@ -138,7 +152,7 @@ for _guard_p in "$REPO_DIR" "$REPO_DIR/infra" "$REPO_DIR/infra/lib" "$REPO_DIR/i
         _guard_refuse "$_guard_p is writable by every user"
     fi
 done
-unset _guard_repo_real _guard_home _guard_op _guard_p _guard_uid _guard_user _guard_mode
+unset _guard_repo_real _guard_home _guard_op _guard_paths _guard_p _guard_uid _guard_user _guard_mode
 INSTALL_SCRIPT="$REPO_DIR/infra/install.sh"
 # Helpers shared with install.sh (wsi_env_value, wsi_define_run_git), read
 # from the same clone as this script. Loaded now, before step 1 can move the

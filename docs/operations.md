@@ -184,13 +184,30 @@ the old release restarted, which applies it. `WSI_ALLOW_PENDING_RESTORE=1`
 skips the check. The start script also refuses a request made under another
 release than the one starting (`"stage": "version_changed"`).
 
-Run `update.sh` (and `sync-from.sh`) from **your own clone** (`cd ~/wsi && sudo
-bash infra/update.sh`), never from `/opt/wsi`: both run as root and source
-helpers from their own tree, so they refuse a tree the service user owns or
-could rewrite (anything inside `/opt/wsi`; the clone, its `infra/` or
-`infra/lib/` directory, the script or `infra/lib/wsi-common.sh` being
-world-writable; or any of them owned by an account that is neither root nor
-the user who ran `sudo`). An `origin` URL that is
+Run `install.sh`, `update.sh` and `sync-from.sh` from **your own clone**
+(`cd ~/wsi && sudo bash infra/update.sh`), never from `/opt/wsi`: all three run
+as root and source helpers from their own tree (and `install.sh` installs files
+from it into places root reads), so before reading anything from the tree they
+refuse one the service user owns or could rewrite: anything inside `/opt/wsi`,
+or a checked path that is world-writable or owned by an account that is
+neither root nor the user who ran `sudo`. `install.sh` and `update.sh` check
+the clone, its `infra/` directory, the script itself, `infra/wsi.env.example`,
+and the `infra/lib/`, `infra/systemd/` and `infra/nginx/` directories and
+every file in them (`update.sh` also checks `infra/install.sh`, so a tree that
+`install.sh` would refuse is refused before anything is stopped);
+`sync-from.sh` checks the clone, `infra/`, `infra/lib/` and the helpers it
+runs. A refused run changes nothing and names the path, e.g. on a fresh
+install:
+
+```
+Error: refusing to run /home/you/wsi/infra/install.sh: /home/you/wsi/infra/nginx/wsi.conf is writable by every user.
+```
+
+(or `... is owned by <user>, neither root nor you`). Fix the permissions in
+your clone and run it again: `chmod o-w <path>` for a world-writable path
+(`chmod -R o-w ~/wsi` for the whole clone, as a lax umask or an archive
+extraction tends to leave many), and `sudo chown -R "$USER": ~/wsi` for files
+owned by another account. An `origin` URL that is
 `http://`, `git://` or `ftp://` gets a warning (from `update.sh`, and from
 `install.sh` when it checks out a release itself): a release fetched over it can be
 rewritten by anything on the path, and its `install.sh` runs as root. Use

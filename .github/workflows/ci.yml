@@ -77,9 +77,12 @@ jobs:
               backend:frontend/package.json \
               | backend:frontend/src/lib/admin/validation.ts \
               | backend:frontend/src/lib/slideCredit.sourceUrlCases.json) return 0 ;;
-              # test_nginx_tls_carry.py parses the stock site and TLS snippet
-              # (and their git history), so these two are backend inputs even
-              # though the rest of infra/nginx/ is not.
+              # test_nginx_tls_carry.py parses the stock site and TLS snippet,
+              # so these two are backend inputs even though the rest of
+              # infra/nginx/ is not. (It also walks every past revision of the
+              # site file, but the backend job's checkout is depth 1, so here
+              # that covers only the checked-out one; the full walk runs in a
+              # complete local clone.)
               backend:infra/nginx/wsi.conf | backend:infra/nginx/wsi-tls.conf) return 0 ;;
               backend:docs/* | backend:*.md | backend:LICENSE | backend:.shellcheckrc \
               | backend:.github/* | backend:frontend/* \

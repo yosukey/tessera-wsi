@@ -528,6 +528,35 @@ r="$(jwt_get '' "/thumbs/cf.jpg?v=1")"
 [[ "${r%% *}" == "401" ]] && pass "...and an anonymous client is refused it (401)" \
                          || fail "anonymous client on a thumbnail cached for Access users: '${r}', expected 401"
 
+# 7. A realistically large Access assertion. Behind Cloudflare Access the
+#    browser sends the assertion twice -- once as Cf-Access-Jwt-Assertion and
+#    once inside the Cookie header as CF_Authorization (next to the session
+#    cookie) -- and the verdict key carries both. A real assertion is easily
+#    1.5-3 KB, so the key outgrows nginx's default proxy_buffer_size (4k),
+#    which also has to hold the cache file header the key is written into:
+#    nginx then logs "proxy_buffer_size ... is not enough for cache key" and
+#    stores nothing, so every tile of every Access user costs a live app
+#    request. The /_wsi_authz location must raise the buffer.
+BIG_JWT="good$(python3 -c 'import base64, os; print(base64.urlsafe_b64encode(os.urandom(1500)).decode().rstrip("="))')"
+BIG_SESSION="$(python3 -c 'import base64, os; print(base64.urlsafe_b64encode(os.urandom(150)).decode().rstrip("="))')"
+BIG_COOKIE="CF_Authorization=${BIG_JWT}; wsi_session=${BIG_SESSION}"
+big_codes=""
+for i in 1 2 3; do
+    big_codes+="$(curl -s -o /dev/null -w '%{http_code}' -m 5 -H "Cf-Access-Jwt-Assertion: ${BIG_JWT}" \
+        -b "${BIG_COOKIE}" "${BASE}/dzi/bigjwt_files/12/0_0.jpeg?v=1") "
+done
+[[ "${big_codes}" == "200 200 200 " ]] \
+    && pass "a ${#BIG_JWT}-byte assertion (header + CF_Authorization cookie) is admitted" \
+    || fail "large-assertion tile requests returned '${big_codes}', expected 200 x3"
+n="$(probes "jwt:${BIG_JWT}")"
+[[ "$n" == "1" ]] && pass "large assertion: 3 tile requests -> ${n} edge-authz probe (verdict cached)" \
+                  || fail "large assertion made ${n} edge-authz probes for 3 tiles, expected 1 (cache key too big for proxy_buffer_size?)"
+if grep -q 'is not enough for cache key' "${WORK}/error.log" 2>/dev/null; then
+    fail "nginx logged: $(grep -m1 'is not enough for cache key' "${WORK}/error.log")"
+else
+    pass "no 'proxy_buffer_size ... not enough for cache key' in the error log"
+fi
+
 printf -- '--------------------------------------------------------------\n'
 if [[ "$FAILED" -eq 0 ]]; then
     printf 'PASS - authz verdicts use their own zone, are per slide, and denials are not cached\n'
