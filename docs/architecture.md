@@ -905,7 +905,7 @@ location of its own. The security headers (and why the cached
 |-------|------|-------|---------|
 | Nginx | Disk HTTP cache (tiles) | Server-wide | `wsi_dzi_cache`, 50 GB; `/dzi/` tiles (30-day TTL, keyed by tile generation `?v=`), **shared across all authenticated users** |
 | Nginx | Disk HTTP cache (thumbnails / assets) | Server-wide | `wsi_static_cache`, no `max_size` (bounded by its 32 MB `keys_zone`); `/thumbs/` (60 s TTL) and `/assets/` (1h TTL), both revalidated, **shared across all authenticated users** |
-| Nginx | authz verdict cache | Server-wide | `/api/edge-authz` allow verdicts, 60 s per client (IP + session cookie) and, for `/dzi/`, per slide |
+| Nginx | authz verdict cache | Server-wide | `/api/edge-authz` allow verdicts, 60 s per client (IP + cookies + Cloudflare Access assertion) and, for `/dzi/`, per slide |
 | Application | Python LRU | Per worker process | Holds DeepZoomGenerator for default 8 slides (tunable via `DZI_CACHE_SIZE`) |
 | Application | slide resolve cache | Per worker process | `public_id → (id, is_published, wsi_generation)` for the `/dzi/` routes and the edge authz check; flushed across workers by a sentinel on publish / delete / replace (see `operations.md` → "Slide-metadata resolve cache") |
 | OS | Page cache | Server-wide | Kernel buffers WSI files in memory |
