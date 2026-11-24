@@ -804,3 +804,141 @@ def test_stored_attr_lists_are_bounded_on_read():
     assert "bad\x1b" not in out and "" not in out
     assert len(out) == ATTR_LIST_MAX_ITEMS
     assert len(set(out)) == len(out)
+
+
+def _upload_branding_images(client: TestClient, admin_headers) -> list[str]:
+    """Store a logo, a header background and an enabled seasonal slot 1;
+    returns their public URLs (etag query stripped)."""
+    png = _minimal_png()
+    for path in (
+        "/api/admin/viewer/settings/logo",
+        "/api/admin/viewer/settings/header-default-background",
+    ):
+        r = client.post(path, headers=admin_headers, files={"file": ("p.png", png, "image/png")})
+        assert r.status_code == 200, r.text
+    client.post("/api/admin/viewer/seasonal-backgrounds/1/reset", headers=admin_headers)
+    client.post(
+        "/api/admin/viewer/seasonal-backgrounds/1/image",
+        headers=admin_headers,
+        files={"file": ("p.png", png, "image/png")},
+    )
+    client.patch(
+        "/api/admin/viewer/seasonal-backgrounds/1", headers=admin_headers, data={"enabled": "1"},
+    )
+    return [
+        "/api/viewer/logo",
+        "/api/viewer/header-default-background",
+        "/api/viewer/seasonal-background/1",
+    ]
+
+
+def _clear_branding_images(client: TestClient, admin_headers) -> None:
+    client.post("/api/admin/viewer/seasonal-backgrounds/1/reset", headers=admin_headers)
+    client.post("/api/admin/viewer/header-default/reset", headers=admin_headers)
+    client.delete("/api/admin/viewer/settings/logo", headers=admin_headers)
+
+
+@pytest.mark.parametrize("gate", ["none", "app_auth", "cf_access"])
+def test_branding_images_are_private_behind_an_access_gate(
+    client: TestClient, admin_headers, monkeypatch, gate
+):
+    """A ``public`` response may be replayed by a shared cache to anyone
+    (RFC 9111 §3.5), bypassing the app-access gate; with app access or
+    Cloudflare Access on, the /api/viewer/* images must say ``private`` —
+    on the 304 revalidation too. Mirrors the macro image's policy."""
+    from wsi_app.routers import public as _public
+
+    urls = _upload_branding_images(client, admin_headers)
+    try:
+        if gate == "app_auth":
+            monkeypatch.setattr(_public._app_auth, "current_mode", lambda: "basic")
+        elif gate == "cf_access":
+            monkeypatch.setattr(_public._cf_access, "is_enabled", lambda: True)
+        expected = "public, max-age=300" if gate == "none" else "private, max-age=300"
+        for url in urls:
+            got = client.get(url)
+            assert got.status_code == 200, url
+            assert got.headers["cache-control"] == expected, url
+            again = client.get(url, headers={"If-None-Match": got.headers["etag"]})
+            assert again.status_code == 304, url
+            assert again.headers["cache-control"] == expected, url
+    finally:
+        monkeypatch.undo()
+        _clear_branding_images(client, admin_headers)
+
+
+def test_branding_image_revalidation_does_not_load_the_blob(client: TestClient, admin_headers):
+    """A 304 needs only the etag: the image bytes (up to a few MB) are read
+    only when a full 200 is sent."""
+    from sqlalchemy import event
+
+    from wsi_app.db import engine
+
+    urls = _upload_branding_images(client, admin_headers)
+    etags = {url: client.get(url).headers["etag"] for url in urls}
+    statements: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _record)
+    try:
+        for url in urls:
+            assert client.get(url, headers={"If-None-Match": etags[url]}).status_code == 304
+    finally:
+        event.remove(engine, "before_cursor_execute", _record)
+        _clear_branding_images(client, admin_headers)
+    for blob in (
+        "viewer_settings.logo_data", "viewer_settings.header_default_image_data",
+        "seasonal_backgrounds.image_data",
+    ):
+        for stmt in statements:
+            assert blob not in stmt.replace(f"length({blob})", ""), stmt
+
+
+def test_branding_image_with_a_legacy_empty_etag_is_still_served(
+    client: TestClient, admin_headers, db_session
+):
+    """A row stored before the etag column existed has the bytes but an
+    empty etag: the route hashes the bytes for its ETag, as before."""
+    import hashlib
+
+    from wsi_app.models import ViewerSettings
+
+    png = _minimal_png()
+    urls = _upload_branding_images(client, admin_headers)
+    try:
+        vs = db_session.get(ViewerSettings, 1)
+        vs.logo_etag = ""
+        db_session.commit()
+        got = client.get(urls[0])
+        assert got.status_code == 200
+        assert got.content == png
+        etag = '"' + hashlib.sha1(png).hexdigest()[:16] + '"'
+        assert got.headers["etag"] == etag
+        assert client.get(urls[0], headers={"If-None-Match": etag}).status_code == 304
+    finally:
+        _clear_branding_images(client, admin_headers)
+    assert client.get(urls[0]).status_code == 404
+
+
+def test_viewer_settings_image_blobs_are_deferred(db_session, client: TestClient, admin_headers):
+    """Loading the settings singleton must not pull its image blobs; they
+    load on first access, inside the session."""
+    from sqlalchemy import inspect as sa_inspect
+
+    from wsi_app.models import ViewerSettings
+
+    png = _minimal_png()
+    urls = _upload_branding_images(client, admin_headers)
+    try:
+        db_session.expire_all()
+        vs = db_session.get(ViewerSettings, 1)
+        unloaded = sa_inspect(vs).unloaded
+        for col in ("logo_data", "favicon_data", "header_default_image_data"):
+            assert col in unloaded, col
+        assert "site_title" not in unloaded
+        assert vs.logo_data == png  # lazy load on access still works
+    finally:
+        _clear_branding_images(client, admin_headers)
+    assert urls

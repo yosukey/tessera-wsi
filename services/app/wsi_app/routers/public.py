@@ -34,6 +34,7 @@ from ..admin_helpers import (
     resolve_slide_by_public_id,
     resolve_tour_by_public_id,
 )
+from ..admin_reports import escape_like
 from ..db import get_db
 from ..models import (
     MetadataOption,
@@ -213,6 +214,12 @@ _LISTED_TOUR = (Tour.is_published.is_(True), Tour.unlisted.is_(False))
 _MATCHED_TOURS_BATCH = 500
 
 
+def _ilike(column, pattern: str):
+    """Case-insensitive LIKE of ``column`` against an _IndexQuery.like pattern
+    (whose literal wildcards are backslash-escaped)."""
+    return column.ilike(pattern, escape="\\")
+
+
 class _IndexQuery:
     """Search / filter / sort / page inputs shared by the two index listings.
 
@@ -272,7 +279,11 @@ class _IndexQuery:
 
     @property
     def like(self) -> str:
-        return f"%{self.q}%"
+        """``q`` as a substring pattern, its own ``%`` / ``_`` / ``\\``
+        escaped so they match literally: a search for "A_01" must not also
+        hit "A-01", nor "%" every row. Pair with ``ilike(..., escape="\\")``
+        (see _ilike)."""
+        return f"%{escape_like(self.q)}%"
 
     def attribute_clauses(self) -> list:
         """One clause per selected metadata key: OR within a key, AND across.
@@ -329,9 +340,9 @@ class _IndexQuery:
         slide_id_q = _parse_db_id(self.q)
         if slide_id_q is not None:
             clauses.append(Slide.id == slide_id_q)
-        clauses.append(Slide.catalog_id.ilike(like))
-        clauses.append(Slide.title.ilike(like))
-        clauses.append(Slide.id.in_(select(SlideAttribute.slide_id).where(SlideAttribute.value.ilike(like))))
+        clauses.append(_ilike(Slide.catalog_id, like))
+        clauses.append(_ilike(Slide.title, like))
+        clauses.append(Slide.id.in_(select(SlideAttribute.slide_id).where(_ilike(SlideAttribute.value, like))))
         return or_(*clauses)
 
     def tour_match(self):
@@ -342,8 +353,8 @@ class _IndexQuery:
             return None
         like = self.like
         return or_(
-            Tour.title.ilike(like),
-            Tour.id.in_(select(TourAttribute.tour_id).where(TourAttribute.value.ilike(like))),
+            _ilike(Tour.title, like),
+            Tour.id.in_(select(TourAttribute.tour_id).where(_ilike(TourAttribute.value, like))),
         )
 
     def tour_criteria(self) -> list:
@@ -627,9 +638,14 @@ def get_slide_macro(public_id: _PublicIdPath, request: Request, db: Session = De
     apart, mirroring ``get_slide`` above.
     """
     s = db.execute(select(Slide).where(Slide.public_id == public_id)).scalar_one_or_none()
-    if not s or (not s.is_published and not _is_staff_request(request)) or not s.macro_data:
+    # Presence is ``macro_etag`` (non-empty exactly when the bytes are stored;
+    # see models.Slide.macro_data), not ``macro_data`` itself: the blob is a
+    # deferred column, so reading it here would SELECT the image for every
+    # conditional revalidation too, only for the If-None-Match check below to
+    # answer 304 and throw it away.
+    if not s or (not s.is_published and not _is_staff_request(request)) or not s.macro_etag:
         raise HTTPException(status_code=404, detail="No macro image")
-    etag = '"' + (s.macro_etag or "") + '"'
+    etag = '"' + s.macro_etag + '"'
     # ``public`` explicitly licenses a shared cache to store the response and
     # hand it to anyone presenting the URL, even when the request carried
     # Authorization (RFC 9111 §3.5) — and a cache HIT never reaches the
@@ -646,8 +662,13 @@ def get_slide_macro(public_id: _PublicIdPath, request: Request, db: Session = De
     cache_control = "public, max-age=300" if shareable else "private, max-age=300"
     if request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers={"ETag": etag, "Cache-Control": cache_control})
+    data = s.macro_data  # the deferred blob's own SELECT, only for a full response
+    if not data:
+        # An etag without bytes is an inconsistent row (hand-edited DB); answer
+        # as if there were no image rather than serve an empty 200.
+        raise HTTPException(status_code=404, detail="No macro image")
     return Response(
-        content=s.macro_data,
+        content=data,
         media_type=s.macro_mimetype or "image/jpeg",
         headers={"ETag": etag, "Cache-Control": cache_control},
     )
@@ -866,9 +887,99 @@ def get_viewer_settings(db: Session = Depends(get_db)):
     }
 
 
-_DEFAULT_FAVICON_PATH = os.path.realpath(
+# Deliberately NOT os.path.realpath: ``static`` is a symlink that install.sh /
+# update.sh atomically repoint at each new frontend build before deleting the
+# previous build directory. Resolving the link once at import would pin this
+# worker to the build that was live when it started, and /favicon.ico would
+# 404 from the moment that directory is removed until the next restart. Left
+# unresolved, every request's isfile/open follows the symlink as it is now —
+# the same reason main._spa_handler resolves its paths per request.
+_DEFAULT_FAVICON_PATH = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "static", "favicon.ico")
 )
+
+
+def _branding_cache_control() -> str:
+    """Cache-Control for the /api/viewer/* branding images (logo, header and
+    seasonal backgrounds).
+
+    ``public`` licenses a shared cache to store the response and replay it to
+    anyone presenting the URL, even when the request carried Authorization or
+    a session cookie (RFC 9111 §3.5) — and a cache HIT never reaches the
+    app-access gate. With app access (basic / LDAP / Google) or Cloudflare
+    Access gating the site, these routes sit behind that gate, so they must
+    say ``private`` lest an intermediary hand the image (and, with
+    WSI_SESSION_COOKIE_DOMAIN set, a response that may carry a Set-Cookie) to
+    an unauthenticated client. Same policy as get_slide_macro; 304s carry it
+    too, since they refresh the stored entry's freshness.
+
+    /favicon.ico does not use this: it is an app-access bypass path (see
+    app_auth.BYPASS_EXACT — the LAN-direct probe needs it before sign-in), so
+    the app serves it to anyone regardless and ``public`` reveals nothing.
+    """
+    if _app_auth.current_mode() == "none" and not _cf_access.is_enabled():
+        return "public, max-age=300"
+    return "private, max-age=300"
+
+
+def _serve_stored_image(
+    request: Request,
+    db: Session,
+    model,
+    key: int,
+    prefix: str,
+    *,
+    default_mimetype: str,
+    cache_control: str,
+    where: tuple = (),
+):
+    """Serve the image held in ``model``'s ``<prefix>_data`` / ``_etag`` /
+    ``_mimetype`` columns of row ``key``, or return None when that row holds
+    no image (or fails an extra ``where`` condition) so the caller can 404 or
+    fall back.
+
+    The blob is read only when a body is actually sent. The first SELECT
+    fetches the etag, the mimetype and ``length(blob)`` — which SQLite answers
+    from the record header without reading the bytes — so a conditional
+    revalidation (304) or a HEAD (the LAN-direct probe's ``HEAD
+    /favicon.ico``) never pulls up to a few MB out of the database, as a
+    ``db.get()`` of the whole row would. A legacy row whose etag column is
+    still empty (stored before the column existed) is the one case that needs
+    the bytes up front, to hash them.
+    """
+    data_col = getattr(model, f"{prefix}_data")
+    etag_col = getattr(model, f"{prefix}_etag")
+    mime_col = getattr(model, f"{prefix}_mimetype")
+    conds = (model.id == key, *where)
+    row = db.execute(
+        select(func.length(data_col), etag_col, mime_col).where(*conds)
+    ).first()
+    if row is None or not row[0]:
+        return None
+    size, stored_etag, mimetype = row
+    data = None
+    if not stored_etag:
+        data = db.execute(select(data_col).where(*conds)).scalar_one_or_none()
+        if not data:
+            return None
+        stored_etag = hashlib.sha1(data).hexdigest()[:16]
+    etag = '"' + stored_etag + '"'
+    headers = {"ETag": etag, "Cache-Control": cache_control}
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
+    media_type = mimetype or default_mimetype
+    if request.method == "HEAD" and data is None:
+        # The ASGI server drops a HEAD response's body anyway; announce the
+        # length the GET would carry without reading the bytes.
+        return Response(
+            media_type=media_type, headers={**headers, "Content-Length": str(size)},
+        )
+    if data is None:
+        data = db.execute(select(data_col).where(*conds)).scalar_one_or_none()
+        if not data:
+            # Deleted between the two reads: answer as if it never existed.
+            return None
+    return Response(content=data, media_type=media_type, headers=headers)
 
 
 # HEAD too: the LAN-direct probe (frontend/src/lib/lanProbe.ts) sends a
@@ -878,16 +989,12 @@ _DEFAULT_FAVICON_PATH = os.path.realpath(
 # same headers.
 @router.api_route("/favicon.ico", methods=["GET", "HEAD"])
 def get_favicon(request: Request, db: Session = Depends(get_db)):
-    vs = db.get(ViewerSettings, 1)
-    if vs and vs.favicon_data:
-        etag = '"' + (vs.favicon_etag or hashlib.sha1(vs.favicon_data).hexdigest()[:16]) + '"'
-        if request.headers.get("if-none-match") == etag:
-            return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "public, max-age=300"})
-        return Response(
-            content=vs.favicon_data,
-            media_type=vs.favicon_mimetype or "image/x-icon",
-            headers={"ETag": etag, "Cache-Control": "public, max-age=300"},
-        )
+    resp = _serve_stored_image(
+        request, db, ViewerSettings, 1, "favicon",
+        default_mimetype="image/x-icon", cache_control="public, max-age=300",
+    )
+    if resp is not None:
+        return resp
     if os.path.isfile(_DEFAULT_FAVICON_PATH):
         return FileResponse(_DEFAULT_FAVICON_PATH, media_type="image/x-icon",
                             headers={"Cache-Control": "public, max-age=300"})
@@ -898,7 +1005,6 @@ def get_favicon(request: Request, db: Session = Depends(get_db)):
 def get_seasonal_background(slot: int, request: Request, db: Session = Depends(get_db)):
     if slot < 1 or slot > 5:
         raise HTTPException(status_code=404, detail="No background")
-    sb = db.get(SeasonalBackground, slot)
     # Mirror the public listing's visibility contract (_list_seasonal_backgrounds
     # hides slots where ``enabled`` is false): a disabled slot must 404 here
     # too, otherwise an image the operator pulled by disabling its slot (e.g. an
@@ -906,31 +1012,26 @@ def get_seasonal_background(slot: int, request: Request, db: Session = Depends(g
     # dashboard previews slots through GET
     # /api/admin/viewer/seasonal-backgrounds/{slot}/image instead, which serves
     # a disabled slot too.
-    if not sb or not sb.enabled or not sb.image_data:
-        raise HTTPException(status_code=404, detail="No background")
-    etag = '"' + (sb.image_etag or hashlib.sha1(sb.image_data).hexdigest()[:16]) + '"'
-    if request.headers.get("if-none-match") == etag:
-        return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "public, max-age=300"})
-    return Response(
-        content=sb.image_data,
-        media_type=sb.image_mimetype or "image/png",
-        headers={"ETag": etag, "Cache-Control": "public, max-age=300"},
+    resp = _serve_stored_image(
+        request, db, SeasonalBackground, slot, "image",
+        default_mimetype="image/png", cache_control=_branding_cache_control(),
+        where=(SeasonalBackground.enabled.is_(True),),
     )
+    if resp is None:
+        raise HTTPException(status_code=404, detail="No background")
+    return resp
 
 
 @router.get("/api/viewer/logo")
 def get_viewer_logo(request: Request, db: Session = Depends(get_db)):
-    vs = db.get(ViewerSettings, 1)
-    if not vs or not vs.logo_data:
-        raise HTTPException(status_code=404, detail="No logo")
-    etag = '"' + (vs.logo_etag or hashlib.sha1(vs.logo_data).hexdigest()[:16]) + '"'
-    if request.headers.get("if-none-match") == etag:
-        return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "public, max-age=300"})
-    return Response(
-        content=vs.logo_data,
-        media_type=vs.logo_mimetype or "application/octet-stream",
-        headers={"ETag": etag, "Cache-Control": "public, max-age=300"},
+    resp = _serve_stored_image(
+        request, db, ViewerSettings, 1, "logo",
+        default_mimetype="application/octet-stream",
+        cache_control=_branding_cache_control(),
     )
+    if resp is None:
+        raise HTTPException(status_code=404, detail="No logo")
+    return resp
 
 
 @router.get("/api/viewer/header-default-background")
@@ -939,14 +1040,10 @@ def get_header_default_background(request: Request, db: Session = Depends(get_db
 
     Mirrors get_viewer_logo: 404 when unset, ETag-based 304s otherwise.
     """
-    vs = db.get(ViewerSettings, 1)
-    if not vs or not vs.header_default_image_data:
-        raise HTTPException(status_code=404, detail="No header background")
-    etag = '"' + (vs.header_default_image_etag or hashlib.sha1(vs.header_default_image_data).hexdigest()[:16]) + '"'
-    if request.headers.get("if-none-match") == etag:
-        return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "public, max-age=300"})
-    return Response(
-        content=vs.header_default_image_data,
-        media_type=vs.header_default_image_mimetype or "image/png",
-        headers={"ETag": etag, "Cache-Control": "public, max-age=300"},
+    resp = _serve_stored_image(
+        request, db, ViewerSettings, 1, "header_default_image",
+        default_mimetype="image/png", cache_control=_branding_cache_control(),
     )
+    if resp is None:
+        raise HTTPException(status_code=404, detail="No header background")
+    return resp

@@ -119,12 +119,13 @@ def _client_only(fn: Callable[[dict], Any]) -> Callable[[dict], Any]:
 
 
 def _defang_parts(text: str) -> str:
-    """``text`` with every ';'-separated part defanged on its own: a
-    spreadsheet that splits cells on ';' would otherwise see a later part
-    starting with "=" as a formula. Split on the joined text, not per value,
-    so a value that itself holds ';' (a slide title "A;=B") cannot carry a
-    formula past it."""
-    return ";".join(str(csv_safe(part)) for part in text.split(";"))
+    """``text`` with every ';'-separated part defanged on its own (see
+    csv_export.csv_safe, which does the per-part split for every exported
+    cell): a spreadsheet that splits cells on ';' would otherwise see a later
+    part starting with "=" as a formula. Applied to the joined text, not per
+    value, so a value that itself holds ';' (a slide title "A;=B") cannot
+    carry a formula past it."""
+    return csv_safe(text)
 
 
 def _join(values: Iterable[Any]) -> str:
@@ -333,9 +334,9 @@ def _cell(v: Any) -> Any:
     (_defang_parts), not just the ones expected to hold free text: a browser
     run is stored as the JSON its page posted, so any field of it — a
     timestamp, a tile format, a headline number — can arrive as a string
-    such as "x;=1", and csv_response only looks at a cell's start. A benign
-    value comes out unchanged (no part of it starts with a formula
-    character)."""
+    such as "x;=1". (csv_response's own csv_safe pass would defang it too;
+    doing it here keeps csv_row's output safe on its own.) A benign value
+    comes out unchanged (no part of it starts with a formula character)."""
     if isinstance(v, bool):
         return "true" if v else "false"
     if isinstance(v, (dict, list)):

@@ -296,6 +296,24 @@ def test_tour_index_q_matches_title_or_parent_slide_fields(client, make_slide, m
     assert mitosis.id in [it["id"] for it in by_id["items"]]
 
 
+def test_q_wildcards_match_literally(client, make_slide, make_tour):
+    """``%`` / ``_`` / ``\\`` in the search box are literal characters, not
+    LIKE wildcards: "A_01" must not also hit "A-01", nor "%" every row."""
+    underscore = make_slide("A_01", "Underscore")
+    make_slide("A-01", "Hyphen")
+    percent = make_slide("P-1", "Ki-67 50% positive")
+    make_slide("P-2", "Ki-67 500 cells")
+    backslash = make_slide("B-1", "path C:\\scans")
+    tour = make_tour(make_slide("T-1", "Plain"), "Tour 10_x")
+    make_tour(make_slide("T-2", "Plain too"), "Tour 10ax")
+
+    assert [it["id"] for it in _slides(client, q="A_01")["items"]] == [underscore.id]
+    assert [it["id"] for it in _slides(client, q="50%")["items"]] == [percent.id]
+    assert _slides(client, q="%")["total"] == 1  # only the slide containing "%"
+    assert [it["id"] for it in _slides(client, q="C:\\")["items"]] == [backslash.id]
+    assert [it["id"] for it in _tour_index(client, q="10_x")["items"]] == [tour.id]
+
+
 def test_tour_index_honours_filters_for_tours_anywhere_in_the_catalog(client, make_slide, make_tour):
     # The only HE tour sits on a slide that sorts after many other HE slides,
     # i.e. past any slide-list cap a client-side check would depend on.

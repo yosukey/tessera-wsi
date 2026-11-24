@@ -503,10 +503,24 @@ class ViewerSettings(Base):
     __tablename__ = "viewer_settings"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
-    logo_data: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True, default=None)
+    # The three image blobs (logo, favicon, header background; up to ~4.5 MiB
+    # together) are deferred like Slide.macro_data: almost every load of this
+    # singleton wants only the scalar settings (every PATCH of the viewer
+    # settings, every upload of one image), and the public image routes read
+    # metadata first and the bytes only for a full 200 (see
+    # routers/public._serve_stored_image). Deferred, a blob loads by its own
+    # SELECT when the attribute is read, which every reader does inside its
+    # request's session; nothing reads them on a detached instance (that would
+    # raise DetachedInstanceError). The backup code handles the table by name
+    # in raw SQL and is unaffected.
+    logo_data: Mapped[Optional[bytes]] = mapped_column(
+        LargeBinary, nullable=True, default=None, deferred=True,
+    )
     logo_mimetype: Mapped[str] = mapped_column(String(64), default="")
     logo_etag: Mapped[str] = mapped_column(String(64), default="", server_default="")
-    favicon_data: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True, default=None)
+    favicon_data: Mapped[Optional[bytes]] = mapped_column(
+        LargeBinary, nullable=True, default=None, deferred=True,
+    )
     favicon_mimetype: Mapped[str] = mapped_column(String(64), default="")
     favicon_etag: Mapped[str] = mapped_column(String(64), default="", server_default="")
     copyright_msg: Mapped[str] = mapped_column(String(512), default="")
@@ -578,7 +592,10 @@ class ViewerSettings(Base):
     # viewer. Default 200 matches OpenSeadragon's own default.
     max_image_cache_count: Mapped[int] = mapped_column(Integer, default=200, server_default="200")
     # Always-on header background (lowest priority below any active seasonal slot)
-    header_default_image_data: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True, default=None)
+    # Deferred; see logo_data.
+    header_default_image_data: Mapped[Optional[bytes]] = mapped_column(
+        LargeBinary, nullable=True, default=None, deferred=True,
+    )
     header_default_image_mimetype: Mapped[str] = mapped_column(String(64), default="", server_default="")
     header_default_image_etag: Mapped[str] = mapped_column(String(64), default="", server_default="")
     # Always-on title text color (CSS hex, e.g. "#1a2b3c"); empty means use CSS default

@@ -43,6 +43,28 @@ def test_parse_version_handles_suffixes_and_short():
     assert app_meta.parse_version("vabc1234") is None
 
 
+def test_parse_version_orders_four_component_versions():
+    """A fourth component must not collide with the rank marker that sits at
+    index 3 of a three-component version: "1.2.3" used to rank above
+    "1.2.3.1" (FINAL 4 > 1)."""
+    p = app_meta.parse_version
+    ordered = [
+        "1.2.3-rc1", "1.2.3", "1.2.3-5-gabc1234",
+        "1.2.3.1-rc1", "1.2.3.1", "1.2.3.1-2-gabc1234",
+        "1.2.3.1.1", "1.2.3.2", "1.2.3.10", "1.2.4",
+    ]
+    keys = [p(v) for v in ordered]
+    assert keys == sorted(keys), ordered
+    assert len(set(keys)) == len(keys)
+    # Trailing zero components are insignificant, as for "1.2" == "1.2.0".
+    assert p("1.2.3.0") == p("1.2.3") == p("v1.2.3.0.0")
+    assert p("1.2.3.0.1") > p("1.2.3")
+    assert p("1.2.3.0.1") < p("1.2.3.1")
+    assert not app_meta.is_downgrade("1.2.3", "1.2.3.1")
+    assert app_meta.is_downgrade("1.2.3.1", "1.2.3")
+    assert not app_meta.is_downgrade("1.2.3.0", "1.2.3")
+
+
 def test_is_downgrade_strict():
     assert app_meta.is_downgrade("0.2.0", "0.1.0")
     assert not app_meta.is_downgrade("0.1.0", "0.2.0")

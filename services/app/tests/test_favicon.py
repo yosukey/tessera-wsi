@@ -320,3 +320,73 @@ def test_bypass_is_strict_equality_not_prefix(client: TestClient):
     assert r.status_code in (200, 404)
     ct = r.headers.get("content-type", "")
     assert not ct.startswith("image/")
+
+
+def test_favicon_head_and_304_do_not_load_the_blob(client: TestClient, admin_headers):
+    """The LAN-direct probe's unauthenticated HEAD and every 304
+    revalidation answer from the etag / length alone; only a GET 200 reads
+    the stored bytes."""
+    from sqlalchemy import event
+
+    from wsi_app.db import engine
+
+    png = _minimal_png()
+    r = client.post(
+        "/api/admin/viewer/settings/favicon",
+        headers=admin_headers,
+        files={"file": ("f.png", png, "image/png")},
+    )
+    assert r.status_code == 200, r.text
+    etag = client.get("/favicon.ico").headers["etag"]
+    statements: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _record)
+    try:
+        head = client.head("/favicon.ico")
+        assert head.status_code == 200
+        assert head.headers["content-length"] == str(len(png))
+        assert client.get("/favicon.ico", headers={"If-None-Match": etag}).status_code == 304
+    finally:
+        event.remove(engine, "before_cursor_execute", _record)
+        client.delete("/api/admin/viewer/settings/favicon", headers=admin_headers)
+    blob = "viewer_settings.favicon_data"
+    for stmt in statements:
+        assert blob not in stmt.replace(f"length({blob})", ""), stmt
+
+
+def test_default_favicon_follows_a_repointed_static_symlink(
+    client: TestClient, admin_headers, tmp_path, monkeypatch
+):
+    """install.sh / update.sh repoint the ``static`` symlink at each new
+    build and delete the old one; the default favicon must be found through
+    the link as it is now, not the build resolved at import time."""
+    import os
+
+    from wsi_app.routers import public
+
+    assert client.delete("/api/admin/viewer/settings/favicon", headers=admin_headers).status_code == 200
+    # The shipped constant is normalised but not symlink-resolved.
+    assert public._DEFAULT_FAVICON_PATH == os.path.abspath(os.path.join(
+        os.path.dirname(public.__file__), "..", "..", "static", "favicon.ico",
+    ))
+
+    old_build, new_build = tmp_path / "build-old", tmp_path / "build-new"
+    for d, payload in ((old_build, b"old"), (new_build, _minimal_ico())):
+        d.mkdir()
+        (d / "favicon.ico").write_bytes(payload)
+    link = tmp_path / "static"
+    link.symlink_to(old_build)
+    monkeypatch.setattr(public, "_DEFAULT_FAVICON_PATH", str(link / "favicon.ico"))
+    assert client.get("/favicon.ico").content == b"old"
+    # Atomic repoint, then the old build is removed.
+    tmp_link = tmp_path / "static.tmp"
+    tmp_link.symlink_to(new_build)
+    os.replace(tmp_link, link)
+    (old_build / "favicon.ico").unlink()
+    old_build.rmdir()
+    got = client.get("/favicon.ico")
+    assert got.status_code == 200
+    assert got.content == _minimal_ico()
