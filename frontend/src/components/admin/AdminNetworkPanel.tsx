@@ -10,7 +10,7 @@ import {
 } from '../../lib/api'
 import { useI18n } from '../../lib/i18n'
 import { apiErrorMessage } from '../../lib/admin/apiError'
-import { firstMatchingIpRule, rulesAllowIp } from '../../lib/admin/ipFilter'
+import { MAX_IP_RULES, firstMatchingIpRule, rulesAllowIp } from '../../lib/admin/ipFilter'
 import { logger } from '../../lib/logger'
 import { useInFlight } from '../../hooks/useInFlight'
 import { LockFieldset } from '../ui'
@@ -356,6 +356,10 @@ export default function AdminNetworkPanel({ onDirtyChange }: {
                       setNewRuleErr(t('adminDash.ipRuleInvalid'))
                       return
                     }
+                    if ((netSettings.ip_rules || []).length >= MAX_IP_RULES) {
+                      setNewRuleErr(t('adminDash.ipRuleLimit', { n: MAX_IP_RULES }))
+                      return
+                    }
                     const newKey = canonicalIpRuleKey(ip)
                     if ((netSettings.ip_rules || []).some((r) => canonicalIpRuleKey(r.ip) === newKey)) {
                       setNewRuleErr(t('adminDash.ipRuleDuplicate'))
@@ -554,17 +558,23 @@ export default function AdminNetworkPanel({ onDirtyChange }: {
             setNetMsgIsError(true)
             return
           }
+          // The server refuses a longer list with a 422 (and only ever reads
+          // the first MAX_IP_RULES of a stored one); say so up front.
+          if (netSettings.ip_rules.length > MAX_IP_RULES) {
+            setNetMsg(t('adminDash.ipRuleLimit', { n: MAX_IP_RULES }))
+            setNetMsgIsError(true)
+            return
+          }
           // Lockout guard: warn before a save that would 403 the operator's
           // own IP on its very next request. rulesAllowIp mirrors the
           // server's network.rules_allow_ip (loopback always allowed, first
           // matching rule decides — IPv4 / IPv6 addresses and CIDRs — then
-          // the default policy; an IPv4-mapped loopback, which Ubuntu 24.04's
-          // Python 3.12.3 does not exempt, is judged by the rules), so this
-          // predicts (or errs towards warning about) the server's own
-          // self-lockout guard, which evaluates the same rules against the
-          // same IP that my-ip reported. Running it for every default (not
-          // just deny) also catches the default=allow case where an explicit
-          // deny rule names the operator's own IP.
+          // the default policy, with IPv4-mapped addresses and rules unwrapped
+          // to IPv4), so this predicts the server's own self-lockout guard,
+          // which evaluates the same rules against the same IP that my-ip
+          // reported. Running it for every default (not just deny) also
+          // catches the default=allow case where an explicit deny rule names
+          // the operator's own IP.
           // Once the operator confirms, the save carries override_ip_lockout
           // so the server's matching guard doesn't reject it with a 422.
           let overrideIpLockout = false

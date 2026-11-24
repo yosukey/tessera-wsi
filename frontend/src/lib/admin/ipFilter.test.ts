@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { firstMatchingIpRule, isLoopbackIp, parseIpAddress, rulesAllowIp } from './ipFilter'
+import { MAX_IP_RULES, firstMatchingIpRule, isLoopbackIp, parseIpAddress, rulesAllowIp } from './ipFilter'
 
 // Every expectation below is what services/app/wsi_app/network.rules_allow_ip
 // returns for the same rules after schemas.IpRuleIn has canonicalised them
-// (checked against the Python implementation), so the dashboard's pre-save
-// warning fires exactly when the server's self-lockout guard would refuse.
+// and network._rule_target has read them back (checked against the Python
+// implementation), so the dashboard's pre-save warning fires exactly when the
+// server's self-lockout guard would refuse.
 
 type Rule = { ip: string; action: 'allow' | 'deny' }
 const allow = (ip: string): Rule => ({ ip, action: 'allow' })
@@ -80,26 +81,53 @@ describe('rulesAllowIp — cases the server treats specially', () => {
     expect(isLoopbackIp('128.0.0.1')).toBe(false)
   })
 
-  // ::ffff:127.x is_loopback is True on Python 3.13+ but False on Ubuntu
-  // 24.04's 3.12.3, where the server's guard lets the rules decide. The
-  // prediction must not call a save lockout-free that 3.12.3 would refuse.
-  it('lets the rules decide for an IPv4-mapped loopback, as Python 3.12 does', () => {
+  // network.canonical_ip unwraps the client before the loopback check, so an
+  // IPv4-mapped loopback is exempt on every supported Python (3.12.3 included).
+  it('always allows an IPv4-mapped loopback', () => {
     check([
-      ['::ffff:127.0.0.1', [deny('::/0')], 'deny', false],
-      ['::ffff:7f00:1', [deny('::ffff:127.0.0.1')], 'allow', false],
+      ['::ffff:127.0.0.1', [deny('::/0')], 'deny', true],
+      ['::ffff:7f00:1', [deny('::ffff:127.0.0.1')], 'deny', true],
+      ['::ffff:127.0.0.1', [deny('0.0.0.0/0')], 'deny', true],
       ['::ffff:127.0.0.1', [], 'allow', true],
-      ['::ffff:127.0.0.1', [allow('::ffff:127.0.0.0/104')], 'deny', true],
     ])
-    expect(isLoopbackIp('::ffff:7f00:1')).toBe(false)
+    expect(isLoopbackIp('::ffff:7f00:1')).toBe(true)
+    expect(isLoopbackIp('::ffff:128.0.0.1')).toBe(false)
   })
 
-  it('never matches IPv4 against IPv6, so a mapped address needs an IPv6 rule', () => {
+  it('matches an IPv4-mapped client and IPv4-mapped rules as IPv4', () => {
+    check([
+      ['10.0.0.1', [deny('::ffff:10.0.0.1')], 'allow', false],
+      ['::ffff:10.0.0.1', [deny('10.0.0.0/8')], 'allow', false],
+      ['::ffff:10.0.0.1', [allow('10.0.0.1')], 'deny', true],
+      ['::ffff:10.0.0.1', [deny('::ffff:a00:1')], 'allow', false],
+      ['10.1.2.3', [deny('::ffff:10.0.0.0/104')], 'allow', false],
+      ['::ffff:10.1.2.3', [deny('::ffff:10.0.0.0/104')], 'allow', false],
+      ['11.0.0.1', [deny('::ffff:10.0.0.0/104')], 'allow', true],
+      ['10.0.0.1', [deny('::ffff:10.0.0.1/128')], 'allow', false],
+      ['203.0.113.5', [allow('::ffff:0:0/96')], 'deny', true],
+      ['2001:db8::5', [allow('::ffff:0:0/96')], 'deny', false],
+    ])
+  })
+
+  it('keeps IPv4 and IPv6 apart once mapped addresses are unwrapped', () => {
     check([
       ['2001:db8::5', [deny('0.0.0.0/0')], 'allow', true],
-      ['::ffff:10.0.0.1', [deny('10.0.0.0/8')], 'allow', true],
-      ['::ffff:10.0.0.1', [deny('::ffff:10.0.0.0/104')], 'allow', false],
-      ['::ffff:10.0.0.1', [deny('::ffff:a00:1')], 'allow', false],
-      ['10.0.0.1', [deny('::ffff:10.0.0.1')], 'allow', true],
+      ['::ffff:10.0.0.1', [deny('::/0')], 'allow', true],
+      // Shorter than /96: not wholly inside ::ffff:0:0/96, so it stays IPv6.
+      ['::ffff:10.0.0.1', [deny('::ffff:0:0/95')], 'allow', true],
+      ['::fffe:0:1', [deny('::ffff:0:0/95')], 'allow', false],
+      // Not an IPv4-mapped prefix (::a.b.c.d, IPv4-compatible): stays IPv6.
+      ['10.0.0.1', [deny('::10.0.0.1')], 'allow', true],
+    ])
+  })
+
+  it('reads only the first MAX_IP_RULES rules, as the server does', () => {
+    const filler = Array.from({ length: MAX_IP_RULES }, (_, i) =>
+      allow(`2001:db8::${(i + 1).toString(16)}`),
+    )
+    check([
+      ['10.0.0.1', [...filler, deny('10.0.0.1')], 'allow', true],
+      ['10.0.0.1', [...filler.slice(1), deny('10.0.0.1')], 'allow', false],
     ])
   })
 

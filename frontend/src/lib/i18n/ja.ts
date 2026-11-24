@@ -1014,6 +1014,7 @@ const ja: Translation = {
     'adminDash.placeholderIpCidr': '例: 192.168.1.0/24',
     'adminDash.ipRuleInvalid': '正しい IPv4 / IPv6 アドレスまたは CIDR を入力してください（例: 192.168.1.0/24）',
     'adminDash.ipRuleDuplicate': 'このアドレスのルールは既に登録されています',
+    'adminDash.ipRuleLimit': ({ n }) => `保存できるルールは最大 ${n} 件です。アドレスを CIDR 範囲（例: 192.168.1.0/24）にまとめてください。`,
     'adminDash.fieldAction': 'アクション',
     'adminDash.fieldNote': 'メモ（任意）',
     'adminDash.placeholderNote': '例: 研究室LAN',

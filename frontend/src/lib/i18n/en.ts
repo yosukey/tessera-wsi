@@ -1016,6 +1016,7 @@ const en = {
     'adminDash.placeholderIpCidr': 'e.g. 192.168.1.0/24',
     'adminDash.ipRuleInvalid': 'Enter a valid IPv4 / IPv6 address or CIDR (e.g. 192.168.1.0/24)',
     'adminDash.ipRuleDuplicate': 'A rule for this address already exists',
+    'adminDash.ipRuleLimit': ({ n }) => `At most ${n} rules can be saved. Combine addresses into CIDR ranges (e.g. 192.168.1.0/24).`,
     'adminDash.fieldAction': 'Action',
     'adminDash.fieldNote': 'Note (optional)',
     'adminDash.placeholderNote': 'e.g. Lab LAN',

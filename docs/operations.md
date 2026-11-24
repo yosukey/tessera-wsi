@@ -2861,7 +2861,9 @@ gate (`NetworkSettings.ip_filter_*`, `main.ip_filter_middleware`):
 - Loopback (`127.0.0.1`, `::1`) is always allowed. A save whose rules would
   block your own current address asks first, and goes through only if you
   confirm (the dashboard evaluates the rules exactly as the server does, IPv4
-  and IPv6 addresses and CIDRs alike; should the server still find a lockout
+  and IPv6 addresses and CIDRs alike, an IPv4-mapped address or rule such as
+  `::ffff:192.0.2.7` or `::ffff:192.0.2.0/120` counting as the IPv4 one it
+  carries; should the server still find a lockout
   the dashboard missed — say your address changed since the page loaded — it
   asks again with the address the server saw). Declining saves nothing; put
   an allow rule for your address above the rule that blocks it instead.

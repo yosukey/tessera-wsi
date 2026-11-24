@@ -8,26 +8,32 @@
 //   ipaddress.ip_network(strict=False) / ip_address; a single-host network
 //   (/32, /128) is stored as the bare address, so it then matches by address
 //   equality rather than by network membership;
+// - network._rule_target — an IPv4-mapped rule is rewritten to its IPv4 form:
+//   a bare ::ffff:a.b.c.d becomes a.b.c.d, and a network inside ::ffff:0:0/96
+//   (prefix 96 or longer) becomes the IPv4 network with the prefix less 96
+//   (::ffff:10.0.0.0/104 -> 10.0.0.0/8, ::ffff:0:0/96 -> 0.0.0.0/0); any other
+//   IPv6 rule stays IPv6;
+// - network.canonical_ip — the client address is unwrapped the same way, so
+//   an IPv4 client seen through a dual-stack socket as ::ffff:a.b.c.d is
+//   judged (loopback exemption included) as a.b.c.d;
 // - network.rules_allow_ip — loopback is always allowed; a disabled filter
-//   allows; an unparseable client IP gets the default policy; rules are tried
-//   in order and the first match decides (CIDR membership, or address
+//   allows; an unparseable client IP gets the default policy; only the first
+//   MAX_IP_RULES rules are read (the server refuses to save more); they are
+//   tried in order and the first match decides (CIDR membership, or address
 //   equality for a bare address); a rule that does not parse is skipped;
 //   nothing matching falls through to the default policy;
 // - Python's ipaddress parsing and comparison (3.12 – 3.14): IPv4 octets are
 //   strictly decimal without leading zeros; an IPv4 prefix may also be given
 //   as a netmask or hostmask, an IPv6 prefix only as a number; IPv6 accepts
-//   one "::", an embedded dotted-quad tail and a "%zone" suffix; IPv4 and
-//   IPv6 never match each other, so an IPv4-mapped address (::ffff:a.b.c.d)
-//   is matched only by IPv6 rules; a zone takes part in address equality but
-//   not in network membership.
+//   one "::", an embedded dotted-quad tail and a "%zone" suffix; after the
+//   unwrapping above IPv4 and IPv6 never match each other (::/0 does not
+//   cover an unwrapped ::ffff:a.b.c.d client); a zone takes part in address
+//   equality but not in network membership, and is dropped by the unwrapping.
 //
-// The one place those versions disagree is an IPv4-mapped loopback
-// (::ffff:127.x.y.z): its is_loopback is True on 3.13+ (and upstream 3.12.4+),
-// so the server exempts it there, but False on the 3.12.3 that Ubuntu 24.04
-// ships, where the rules decide for it. The prediction takes the stricter
-// reading and runs the rules for it: the server never refuses a save this
-// calls lockout-free, and elsewhere the worst case is a warning the server
-// would not have needed.
+// Because the unwrapping happens before the loopback check, an IPv4-mapped
+// loopback (::ffff:127.x.y.z) is exempt on every supported Python, including
+// the 3.12.3 that Ubuntu 24.04 ships (whose IPv6Address.is_loopback would
+// say False for the wrapped form).
 
 export type IpVersion = 4 | 6
 
@@ -51,6 +57,10 @@ interface ParsedNetwork {
 type CompiledRule =
   | { kind: 'host'; ip: ParsedIp }
   | { kind: 'net'; version: IpVersion; value: bigint; prefix: number }
+
+// network.MAX_IP_RULES: the server refuses to save a longer list and stops
+// reading a stored one at this many entries.
+export const MAX_IP_RULES = 1000
 
 export interface IpFilterRule {
   ip: string
@@ -233,21 +243,40 @@ function parseIpNetwork(s: string): ParsedNetwork | null {
   return { version: 6, value, prefix, scope: value === v6.value ? v6.scope : null }
 }
 
-// One rule's ip as IpRuleIn stores it, in the form rules_allow_ip matches it
-// with. null for a rule that does not parse (the server refuses the whole
-// save over it; the live filter would skip it).
+const IPV4_MAPPED_PREFIX = 0xffffn
+
+// The IPv4 value an IPv4-mapped IPv6 value (::ffff:a.b.c.d) wraps, else null
+// (IPv6Address.ipv4_mapped).
+function ipv4Mapped(version: IpVersion, value: bigint): bigint | null {
+  return version === 6 && value >> 32n === IPV4_MAPPED_PREFIX ? value & 0xffffffffn : null
+}
+
+// network.canonical_ip on a parsed address.
+function canonicalIp(ip: ParsedIp): ParsedIp {
+  const v4 = ipv4Mapped(ip.version, ip.value)
+  return v4 === null ? ip : { version: 4, value: v4, scope: null }
+}
+
+// One rule's ip as IpRuleIn stores it, then as network._rule_target reads the
+// stored string back: the form rules_allow_ip matches it with. null for a rule
+// that does not parse (the server refuses the whole save over it; the live
+// filter would skip it).
 function compileIpRule(raw: string): CompiledRule | null {
   const v = pyStrip(raw)
   if (v.includes('/')) {
     const net = parseIpNetwork(v)
     if (!net) return null
     if (net.prefix === maxPrefix(net.version)) {
-      return { kind: 'host', ip: { version: net.version, value: net.value, scope: net.scope } }
+      return { kind: 'host', ip: canonicalIp({ version: net.version, value: net.value, scope: net.scope }) }
     }
+    // A prefix of 96 or more keeps the network inside ::ffff:0:0/96 exactly
+    // when its network address is (net.subnet_of(_IPV4_MAPPED_NET)).
+    const v4 = net.prefix >= 96 ? ipv4Mapped(net.version, net.value) : null
+    if (v4 !== null) return { kind: 'net', version: 4, value: v4, prefix: net.prefix - 96 }
     return { kind: 'net', version: net.version, value: net.value, prefix: net.prefix }
   }
   const ip = parseIpAddress(v)
-  return ip ? { kind: 'host', ip } : null
+  return ip ? { kind: 'host', ip: canonicalIp(ip) } : null
 }
 
 function ruleMatches(rule: CompiledRule, ip: ParsedIp): boolean {
@@ -257,28 +286,34 @@ function ruleMatches(rule: CompiledRule, ip: ParsedIp): boolean {
   return rule.version === ip.version && (ip.value & maskOf(rule.version, rule.prefix)) === rule.value
 }
 
-// The loopback every supported server Python exempts: IPv4 127.0.0.0/8 and
-// IPv6 ::1. Not an IPv4-mapped loopback, which Ubuntu 24.04's Python 3.12.3
-// does not exempt (see the header).
+// IPv4 127.0.0.0/8 and IPv6 ::1, on an address already in canonical form.
 function isLoopback(ip: ParsedIp): boolean {
   if (ip.version === 4) return ip.value >> 24n === 127n
   return ip.value === 1n
 }
 
-export function isLoopbackIp(clientIp: string): boolean {
+// The client address as rules_allow_ip compares it: parsed, then unwrapped
+// if IPv4-mapped. null when it does not parse.
+function parseClientIp(clientIp: string): ParsedIp | null {
   const ip = parseIpAddress(clientIp)
+  return ip && canonicalIp(ip)
+}
+
+export function isLoopbackIp(clientIp: string): boolean {
+  const ip = parseClientIp(clientIp)
   return !!ip && isLoopback(ip)
 }
 
 // The first rule that matches `clientIp` (the one that decides for it, unless
 // it is loopback), or undefined when none does or the IP does not parse.
+// Like the server, only the first MAX_IP_RULES rules are considered.
 export function firstMatchingIpRule<R extends IpFilterRule>(
   clientIp: string,
   rules: readonly R[],
 ): R | undefined {
-  const ip = parseIpAddress(clientIp)
+  const ip = parseClientIp(clientIp)
   if (!ip) return undefined
-  return rules.find((r) => {
+  return rules.slice(0, MAX_IP_RULES).find((r) => {
     const compiled = compileIpRule(r.ip)
     return !!compiled && ruleMatches(compiled, ip)
   })
@@ -291,7 +326,7 @@ export function rulesAllowIp(
   defaultPolicy: string,
   rules: readonly IpFilterRule[],
 ): boolean {
-  const ip = parseIpAddress(clientIp)
+  const ip = parseClientIp(clientIp)
   if (ip && isLoopback(ip)) return true
   if (!enabled) return true
   if (!ip) return defaultPolicy === 'allow'
