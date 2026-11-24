@@ -724,3 +724,80 @@ def test_key_delete_refuses_when_the_confirmed_slide_set_changed(client, admin_h
     r = client.delete("/api/admin/metadata/keys", params={"key": "fp_cat"}, headers=admin_headers)
     assert r.status_code == 200, r.text
     assert r.json()["slides_affected"] == 2
+
+
+def test_option_delete_does_not_remove_an_option_renamed_while_it_ran(
+    client, admin_headers, db_session, monkeypatch,
+):
+    """A rename keeps the option row (and its id) and changes its value. If
+    it lands after the delete request started, the delete must remove what
+    is still called the old value (nothing), not the row under its new name."""
+    from wsi_app.db import SessionLocal
+    from wsi_app.routers import admin_metadata as am
+
+    db_session.add(MetadataOption(key="race_ren_key", value="old"))
+    db_session.commit()
+    real_delete = am.delete
+    fired = []
+
+    def delete_after_a_rename(model):
+        if not fired:
+            fired.append(model)
+            other = SessionLocal()
+            try:
+                other.execute(
+                    am.update(MetadataOption)
+                    .where(MetadataOption.key == "race_ren_key", MetadataOption.value == "old")
+                    .values(value="new")
+                )
+                other.commit()
+            finally:
+                other.close()
+        return real_delete(model)
+
+    monkeypatch.setattr(am, "delete", delete_after_a_rename)
+    r = client.delete(
+        "/api/admin/metadata/options",
+        params={"key": "race_ren_key", "value": "old"},
+        headers=admin_headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["options_removed"] == 0
+    db_session.expire_all()
+    assert [o.value for o in db_session.query(MetadataOption).filter(
+        MetadataOption.key == "race_ren_key"
+    )] == ["new"]
+
+
+def test_option_delete_of_an_option_deleted_concurrently_is_not_counted(
+    client, admin_headers, db_session, monkeypatch,
+):
+    """Deleting a stale instance whose row is already gone matches nothing
+    (an SAWarning) yet was reported, and audited, as options_removed=1."""
+    from wsi_app.db import SessionLocal
+    from wsi_app.routers import admin_metadata as am
+
+    db_session.add(MetadataOption(key="race_del_key", value="v"))
+    db_session.commit()
+    real_delete = am.delete
+    fired = []
+
+    def delete_after_another_delete(model):
+        if not fired:
+            fired.append(model)
+            other = SessionLocal()
+            try:
+                other.execute(real_delete(MetadataOption).where(MetadataOption.key == "race_del_key"))
+                other.commit()
+            finally:
+                other.close()
+        return real_delete(model)
+
+    monkeypatch.setattr(am, "delete", delete_after_another_delete)
+    r = client.delete(
+        "/api/admin/metadata/options",
+        params={"key": "race_del_key", "value": "v"},
+        headers=admin_headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["options_removed"] == 0

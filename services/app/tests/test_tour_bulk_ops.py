@@ -511,3 +511,31 @@ def test_a_bulk_metadata_change_reads_no_user_row_under_the_lock(client, staff_c
     last_commit_side = max(i for i, st in enumerate(statements) if "tour_attributes" in st)
     under_lock = statements[first_bump:last_commit_side + 1]
     assert not [st for st in under_lock if "FROM users" in st]
+
+
+def test_a_tour_deleted_while_waiting_for_its_lock_is_not_found(client, admin_headers, slide, monkeypatch):
+    """Two deletes of one tour: the second waits on tour_asset_lock while the
+    first commits. It must look the row up after taking the lock and answer
+    404, not delete its stale copy again and report (and audit) a success."""
+    import contextlib
+
+    from wsi_app.db import SessionLocal
+    from wsi_app.routers import admin_tours as at
+
+    tour_id = _make_tour(client, admin_headers, slide.id)
+    real_lock = at.tour_asset_lock
+
+    @contextlib.contextmanager
+    def lock_taken_after_a_concurrent_delete(tid):
+        other = SessionLocal()
+        try:
+            other.delete(other.get(Tour, tid))
+            other.commit()
+        finally:
+            other.close()
+        with real_lock(tid):
+            yield
+
+    monkeypatch.setattr(at, "tour_asset_lock", lock_taken_after_a_concurrent_delete)
+    r = client.delete(f"/api/admin/tours/{tour_id}", headers=admin_headers)
+    assert r.status_code == 404, r.text

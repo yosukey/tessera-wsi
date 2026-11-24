@@ -549,3 +549,39 @@ def test_verify_fails_when_the_recorded_sha256_does_not_match(client, admin_head
         assert rj["result"].get("damaged") is True, rj
     finally:
         _backup.delete_backup(backup_id)
+
+
+def test_restore_apply_releases_the_slot_when_the_running_write_fails(admin_headers, monkeypatch):
+    """The claim is ``pending`` until the "running" write: a failure there
+    (or anything else between the claim and the work) must still free the
+    slot, which this live worker's record would otherwise hold until the
+    process exits."""
+    from fastapi.testclient import TestClient
+
+    from wsi_app.main import app
+    from wsi_app.routers import admin_backup as ab
+
+    monkeypatch.setattr(ab, "verify_reauth_password", lambda *a, **k: True)
+    real = _jobs.store.update
+
+    def update(job_id, **fields):
+        if fields.get("state") == "running":
+            raise RuntimeError("simulated failure of the running write")
+        return real(job_id, **fields)
+
+    monkeypatch.setattr(_jobs.store, "update", update)
+    try:
+        with TestClient(app, raise_server_exceptions=False) as c:
+            r = c.post(
+                "/api/admin/restore/apply",
+                json={"stage_id": "stage-000000000000", "confirm_text": "RESTORE", "password": "x"},
+                headers=admin_headers,
+            )
+        assert r.status_code == 500
+        assert not _jobs.store.has_running()
+    finally:
+        monkeypatch.setattr(_jobs.store, "update", real)
+        for j in list(_jobs.store._iter_disk_jobs()):
+            if j.state in ("pending", "running"):
+                real(j.id, state="failed", error="test cleanup")
+        _jobs.store.prune_terminal(max_age_seconds=0)

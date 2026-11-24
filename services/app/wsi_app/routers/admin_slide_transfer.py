@@ -155,7 +155,6 @@ def start_export(
     if _restore_apply_pending():
         raise HTTPException(status_code=409, detail=_RESTORE_PENDING_DETAIL)
     job = _claim_job_slot("slide_export", _TRANSFER_BUSY_DETAIL)
-    _jobs.store.update(job.id, state="running", progress={"phase": "queued", "bytes_written": 0})
 
     slide_ids = list(payload.slide_ids)
     note = payload.note
@@ -191,15 +190,16 @@ def start_export(
             _jobs.store.update(job.id, state="failed", error=str(exc))
             audit(admin, "slide.export.failed", target=job.id, error=str(exc))
 
-    # Release the job slot if the worker thread never starts (thread
-    # exhaustion): the claimed record is owned by this live pid, so the
-    # orphan reaper would not free it and every later job would 409 until
+    # Release the job slot if the "running" write or the worker thread fails
+    # (thread exhaustion): the claimed record is owned by this live pid, so
+    # the orphan reaper would not free it and every later job would 409 until
     # this worker process exits.
     try:
+        _jobs.store.update(job.id, state="running", progress={"phase": "queued", "bytes_written": 0})
         threading.Thread(target=_run, name=f"slide-export-{job.id}", daemon=True).start()
     except BaseException as exc:
         _logger.exception("could not start slide export job %s", job.id)
-        _jobs.store.update(job.id, state="failed", error=str(exc))
+        _fail_if_running(job.id, exc)
         raise
     return {"job_id": job.id}
 
@@ -310,9 +310,20 @@ def download_export(
 # ---------------------------------------------------------------------------
 
 def _fail_if_running(job_id: str, exc: BaseException) -> None:
-    """Release a claimed job slot whose request failed before its job ran."""
+    """Release a claimed job slot whose request failed before its job ran.
+
+    The claim is created ``pending`` and only marked ``running`` by a later
+    write, so a failure in between leaves a ``pending`` record: both count as
+    holding the slot (``jobs.has_running``), and the record is owned by this
+    live worker, so the orphan reaper never frees it. Either is failed here;
+    a terminal record (the job's own thread got to it first) is left alone.
+
+    Synchronous on purpose, also from async endpoints: it is a small file
+    write, and an ``await`` in an ``except`` block of a cancelled request
+    (client gone, shutdown) is cancelled again before it runs, which would
+    leave the slot held until the worker exits."""
     j = _jobs.store.get(job_id)
-    if j is not None and j.state == "running":
+    if j is not None and j.state in ("pending", "running"):
         _jobs.store.update(job_id, state="failed", error=str(exc))
 
 
@@ -417,9 +428,14 @@ async def stage_slide_import(
             progress={"bytes_copied": 0, "total_bytes": held.size},
         )
     except BaseException as exc:
+        # No await in here: when the request is cancelled (the client went
+        # away, the server is shutting down) the cancellation is delivered
+        # again at every await of this scope, so an awaited cleanup would
+        # never run and the slot would stay claimed by this live worker.
+        # The cleanup is two quick local writes, as in restore_stage.
         if held is not None:
             held.close()
-        await run_in_threadpool(_fail_if_running, job.id, exc)
+        _fail_if_running(job.id, exc)
         raise
 
     def _stage(progress: Callable[[dict], None]) -> dict:
@@ -477,11 +493,18 @@ def _start_stage_job(
     if _restore_apply_pending():
         raise HTTPException(status_code=409, detail=_RESTORE_PENDING_DETAIL)
     job = _claim_job_slot(kind, _TRANSFER_BUSY_DETAIL)
-    _jobs.store.update(job.id, state="running", progress={"phase": "queued"})
-    return _launch_job(
-        job, kind, admin, work, audit_action, audit_fields,
-        target=lambda _result: stage_id, failure_target=stage_id,
-    )
+    # From the claim on, any failure must release the slot (see
+    # _fail_if_running); _launch_job does so itself for a thread that never
+    # starts, which leaves the record terminal and this a no-op.
+    try:
+        _jobs.store.update(job.id, state="running", progress={"phase": "queued"})
+        return _launch_job(
+            job, kind, admin, work, audit_action, audit_fields,
+            target=lambda _result: stage_id, failure_target=stage_id,
+        )
+    except BaseException as exc:
+        _fail_if_running(job.id, exc)
+        raise
 
 
 @router.post("/api/admin/slides/import/apply")

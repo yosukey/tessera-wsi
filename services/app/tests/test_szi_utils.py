@@ -623,3 +623,76 @@ def test_make_szi_thumbnail_skips_tile_larger_than_declared_geometry(
     make_szi_thumbnail(str(p), str(out), max_size=(128, 128))
     assert (6000, 6000) not in loaded
     assert out.exists()
+
+
+def _write_padded_stored_zip(path: Path, name: str, payload: bytes, pad: int) -> None:
+    """A one-member ZIP_STORED archive whose member declares
+    ``file_size=len(payload)`` but ``compress_size=len(payload)+pad``, with the
+    padding really present (so zipfile's overlap check passes). zipfile reads
+    ``compress_size`` bytes for such a member before trimming to
+    ``file_size``."""
+    import struct
+    import zlib
+
+    raw_name = name.encode()
+    crc = zlib.crc32(payload)
+    comp = len(payload) + pad
+    local = struct.pack(
+        "<4sHHHHHIIIHH", b"PK\x03\x04", 20, 0, 0, 0, 0, crc, comp, len(payload), len(raw_name), 0,
+    ) + raw_name
+    with open(path, "wb") as f:
+        f.write(local)
+        f.write(payload)
+        f.write(b"\0" * pad)
+        cd_off = f.tell()
+        cd = struct.pack(
+            "<4sHHHHHHIIIHHHHHII", b"PK\x01\x02", 20, 20, 0, 0, 0, 0, crc, comp, len(payload),
+            len(raw_name), 0, 0, 0, 0, 0, 0,
+        ) + raw_name
+        f.write(cd)
+        f.write(struct.pack("<4sHHHHIIH", b"PK\x05\x06", 0, 0, 1, 1, len(cd), cd_off, 0))
+
+
+def test_stored_member_with_inflated_compress_size_is_refused(tmp_path: Path) -> None:
+    """compress_type == STORED is not enough: a member whose compress_size
+    exceeds its file_size makes zipfile allocate compress_size bytes (up to
+    1 GiB per read) however small file_size is."""
+    p = tmp_path / "padded.szi"
+    _write_padded_stored_zip(p, "image.dzi", _dzi_xml(256, 256), pad=64 * 1024)
+    with zipfile.ZipFile(p) as zf:
+        info = zf.getinfo("image.dzi")
+        assert info.compress_type == zipfile.ZIP_STORED
+        assert info.compress_size > info.file_size
+    with pytest.raises(ValueError, match="compress_size"):
+        read_szi_properties(str(p))
+    # The per-member read refuses it as well, with no earlier sweep.
+    from wsi_app.szi_utils import _MAX_DZI_DESCRIPTOR_BYTES, _read_member_capped
+
+    with zipfile.ZipFile(p) as zf, pytest.raises(ValueError, match="compress_size"):
+        _read_member_capped(zf, "image.dzi", _MAX_DZI_DESCRIPTOR_BYTES, what="descriptor")
+
+
+def test_make_szi_thumbnail_rejects_compressed_archive(tmp_path: Path) -> None:
+    """The thumbnail is rebuilt for archives that never passed the upload
+    screen (restored, imported, placed by hand): it must refuse a deflated
+    one, whose file_size cap says nothing about decompression cost."""
+    p = tmp_path / "deflated.szi"
+    _build_szi(p, width=256, height=256, compression=zipfile.ZIP_DEFLATED)
+    out = tmp_path / "thumb.jpg"
+    with pytest.raises(ValueError, match="ZIP_STORED"):
+        make_szi_thumbnail(str(p), str(out))
+    assert not out.exists()
+
+
+def test_read_member_capped_reads_no_more_than_the_cap(tmp_path: Path) -> None:
+    from wsi_app.szi_utils import _read_member_capped
+
+    p = tmp_path / "ok.szi"
+    with zipfile.ZipFile(p, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr("image.dzi", b"x" * 100)
+    with zipfile.ZipFile(p) as zf:
+        assert _read_member_capped(zf, "image.dzi", 100, what="descriptor") == b"x" * 100
+        with pytest.raises(ValueError, match="cap"):
+            _read_member_capped(zf, "image.dzi", 99, what="descriptor")
+        with pytest.raises(KeyError):
+            _read_member_capped(zf, "missing.dzi", 100, what="descriptor")

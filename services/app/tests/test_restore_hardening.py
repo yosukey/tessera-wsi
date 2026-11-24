@@ -596,6 +596,24 @@ def test_held_upload_falls_back_to_a_copy_where_reflink_is_refused(tmp_path):
         os.remove(path)
 
 
+def test_held_upload_copy_is_never_world_readable(tmp_path):
+    """The staged copy of an upload holds a whole database (or unpublished
+    slides): 0640 like every archive the service writes, whatever the umask
+    of the process (the systemd unit's 0027 is not there in a dev server or
+    a container)."""
+    from wsi_app.routers import admin_backup as _ab
+
+    old = os.umask(0)
+    try:
+        path = _ab.receive_held_upload(_held_from_file(tmp_path, b"w" * 4096))
+    finally:
+        os.umask(old)
+    try:
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o640
+    finally:
+        os.remove(path)
+
+
 def test_a_new_staging_removes_the_stage_it_replaces_inside_its_job(client, admin_headers):
     backup_id = _make_backup_via_api(client, admin_headers)
     try:

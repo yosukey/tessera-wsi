@@ -1052,6 +1052,8 @@ _UPLOAD_NO_SPACE_CODE = "adminDash.apiErr.uploadNoSpace"
 # most once per interval (seconds).
 _UPLOAD_COPY_CHUNK = 64 * 1024 * 1024
 _UPLOAD_COPY_PROGRESS_INTERVAL = 1.0
+# Mode of the staged copy of an uploaded archive; see receive_held_upload.
+_UPLOAD_FILE_MODE = 0o640
 
 
 class UploadNoSpace(RuntimeError):
@@ -1188,9 +1190,23 @@ def receive_held_upload(held: HeldUpload, progress_cb=None) -> str:
             last_report = now
             progress_cb({"phase": "copying", "bytes_copied": done, "total_bytes": held.size})
 
-        out = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        # Created 0640, like every archive the service writes
+        # (backup._open_archive_writer): an uploaded backup holds the whole
+        # database (password hashes, OAuth / LDAP secrets, session signing
+        # material) and a slide bundle can carry unpublished slides. 0666
+        # left the mode to the umask, which is 0027 only under the systemd
+        # unit; a dev server, a container or a manual run (umask 022) would
+        # leave it world-readable for as long as the staging job keeps it.
+        # The fchmod pins the mode against a looser umask, and is inside the
+        # try so a failure still removes the file.
+        out = os.open(
+            dst,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            _UPLOAD_FILE_MODE,
+        )
         ok = False
         try:
+            os.fchmod(out, _UPLOAD_FILE_MODE)
             if held.data is None and held.fd is not None and _reflink(held.fd, out):
                 # The staged copy shares the spool file's blocks: no space taken.
                 copied(held.size)
@@ -1325,9 +1341,11 @@ async def restore_apply(
     # work so a backup that lands between has_running() and the swap can't
     # race the SQLite snapshot. Marked terminal before the function returns.
     job = await run_in_threadpool(_claim_job_slot, "restore_apply")
-    _jobs.store.update(job.id, state="running")
 
     try:
+        # Inside the try: from the claim on, any failure must release the
+        # slot, or this live worker's record holds it until the process exits.
+        _jobs.store.update(job.id, state="running")
         stage_dir = os.path.join(settings.backup_dir, ".staging", payload.stage_id)
         if not os.path.isdir(stage_dir):
             raise HTTPException(status_code=404, detail="stage not found (re-stage the archive)")
@@ -1478,10 +1496,12 @@ async def restore_apply(
         )
     except BaseException as exc:
         # Release the slot so a follow-up apply or backup isn't blocked by a
-        # stuck "running" record. HTTPExceptions still get re-raised so
-        # FastAPI emits the right status.
+        # stuck "running" record — or a "pending" one, if the failure came
+        # before the "running" write. HTTPExceptions still get re-raised so
+        # FastAPI emits the right status. Synchronous (no await), so a
+        # cancelled request cannot skip it.
         j = _jobs.store.get(job.id)
-        if j is not None and j.state == "running":
+        if j is not None and j.state in ("pending", "running"):
             _jobs.store.update(job.id, state="failed", error=str(exc))
         raise
 

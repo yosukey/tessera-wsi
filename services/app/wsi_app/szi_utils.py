@@ -22,10 +22,11 @@ _MAX_DZI_TILE_SIZE = 4096               # px; DZI spec defaults to 254/256
 _MAX_DZI_OVERLAP = 1024                 # px; spec values are 0-2
 
 # The `.dzi` descriptor and every tile inside an SZI are ZIP_STORED
-# (uncompressed), so ``zipfile.ZipInfo.file_size`` is the exact number of
-# bytes ``zf.read`` will pull into RAM. Both members come from an
-# admin-uploaded archive; without a ceiling a crafted (or accidental) SZI
-# could stage a multi-GB stored member and OOM the worker on a single read.
+# (uncompressed, with compress_size == file_size; see _check_stored), so
+# ``zipfile.ZipInfo.file_size`` is the exact number of bytes a read returns.
+# Both members come from an admin-uploaded archive; without a ceiling a
+# crafted (or accidental) SZI could stage a multi-GB stored member and OOM the
+# worker on a single read.
 # A real DZI descriptor is a few hundred bytes of XML — even a verbosely
 # commented one stays well under a KiB — so 1 MiB is ~1000x any legitimate
 # descriptor yet a trivial allocation. A legitimate tile is a JPEG/PNG at
@@ -310,15 +311,36 @@ def _find_dzi_member(zf: zipfile.ZipFile) -> str:
     raise ValueError("SZI archive missing root .dzi descriptor")
 
 
+def _check_stored(info: zipfile.ZipInfo) -> None:
+    """Refuse a member that is not plainly stored.
+
+    ``compress_type == ZIP_STORED`` alone is not enough: for a stored member
+    ``zipfile`` reads ``compress_size`` bytes from the archive and only then
+    trims them to ``file_size``, in one allocation of up to 1 GiB per read
+    (``ZipExtFile.read()`` pulls ``min(MAX_N, compress_size)`` at once). A
+    crafted entry declaring ``file_size=100`` but ``compress_size=1 GiB``
+    (with the padding really in the archive, so it passes ``zipfile``'s
+    overlap check) would sail through a ``file_size`` cap and still cost a GiB
+    of RAM per request. For a genuinely stored member the two sizes are equal
+    by construction, so any difference is a crafted archive.
+    """
+    if info.compress_type != zipfile.ZIP_STORED:
+        raise ValueError(
+            "SZI archive must be ZIP_STORED (uncompressed); "
+            f"entry {info.filename!r} uses compress_type={info.compress_type}"
+        )
+    if info.compress_size != info.file_size:
+        raise ValueError(
+            f"SZI entry {info.filename!r} is malformed: stored member declares "
+            f"compress_size={info.compress_size} but file_size={info.file_size}"
+        )
+
+
 def _ensure_stored(zf: zipfile.ZipFile) -> None:
     for info in zf.infolist():
         if info.is_dir():
             continue
-        if info.compress_type != zipfile.ZIP_STORED:
-            raise ValueError(
-                "SZI archive must be ZIP_STORED (uncompressed); "
-                f"entry {info.filename!r} uses compress_type={info.compress_type}"
-            )
+        _check_stored(info)
 
 
 def _read_member_capped(
@@ -326,18 +348,29 @@ def _read_member_capped(
 ) -> bytes:
     """Read a ZIP member into RAM only after its declared size clears ``cap``.
 
-    SZI members are ZIP_STORED, so ``file_size`` is the exact allocation
-    ``zf.read`` will make. Checking it first turns a crafted multi-GB member
-    into a fast ValueError instead of an OOM. Raises KeyError (from
+    The member must be plainly stored (``_check_stored``), so ``file_size``
+    is what the read returns; checking it first turns a crafted multi-GB
+    member into a fast ValueError instead of an OOM. The check is repeated
+    here per member, rather than trusted to an earlier ``_ensure_stored``
+    sweep, so every caller gets it, and the read itself is bounded to
+    ``cap + 1`` bytes through ``zf.open`` instead of ``zf.read`` (which reads
+    to EOF in up-to-1-GiB chunks): even a header the checks somehow missed
+    cannot make this allocate more than the cap. Raises KeyError (from
     ``getinfo``) when the member is absent, matching ``zf.read``'s contract so
     callers can keep their existing missing-member handling.
     """
-    size = zf.getinfo(name).file_size
+    info = zf.getinfo(name)
+    _check_stored(info)
+    size = info.file_size
     if size > cap:
         raise ValueError(
             f"SZI {what} {name!r} is {size} bytes, exceeding the {cap}-byte cap"
         )
-    return zf.read(name)
+    with zf.open(info) as fp:
+        data = fp.read(cap + 1)
+    if len(data) > cap:
+        raise ValueError(f"SZI {what} {name!r} exceeds the {cap}-byte cap")
+    return data
 
 
 def _parse_dzi_xml(xml_bytes: bytes) -> Dict[str, Any]:
@@ -462,6 +495,11 @@ def make_szi_thumbnail(
     max_size: Tuple[int, int] = (512, 512),
 ) -> None:
     with _open_szi(path) as zf:
+        # Same screen as read_szi_properties: the thumbnail is also rebuilt
+        # for archives that never went through the upload path (restored from
+        # a backup, imported, or dropped into the slide directory by hand),
+        # so this is the first place such an archive is looked at.
+        _ensure_stored(zf)
         dzi_name = _find_dzi_member(zf)
         meta = _parse_dzi_xml(
             _read_member_capped(

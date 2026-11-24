@@ -34,7 +34,8 @@ so a "schema drift" line in the boot log is the cue to run this.
 
 Safety model
 ------------
-Nothing is done in place. The script checkpoints the WAL, copies the DB
+Nothing is done in place. With ``--apply`` the script checkpoints the WAL
+(a report-only run opens the original read-only and skips that), copies the DB
 through SQLite's own backup API (so a live WAL cannot be missed), operates
 **only on that copy**, verifies the result, and only then swaps it in — after
 writing a timestamped ``.bak`` of the original alongside. Any failure leaves
@@ -89,6 +90,7 @@ import secrets
 import shutil
 import sqlite3
 import sys
+import urllib.request
 from typing import Iterable, Optional
 
 # Populated by _load_orm() once the app directory is known. The ORM import is
@@ -496,24 +498,43 @@ def _connect(path: str) -> sqlite3.Connection:
     return conn
 
 
-def _snapshot(src_path: str, dest_path: str) -> None:
+def _snapshot(src_path: str, dest_path: str, *, read_only: bool = False) -> None:
     """Copy a SQLite DB through its own backup API (WAL-safe).
 
-    The copy inherits the caller's umask, not the source's mode — running
-    under sudo that would leave a 0644 root-owned file holding password
-    hashes, session state and analytics identities next to a DB the installer
-    deliberately keeps at 0640. Mirror the source's mode and ownership onto
-    every copy instead.
+    The copy is created under a 0077 umask, so it is private to the running
+    user from its first byte: under the usual 0022 umask it would sit
+    world-readable (password hashes, session state, analytics identities) in
+    a world-traversable directory for as long as the copy takes, and for good
+    if the run is killed halfway. Only once it is complete does it get the
+    source's mode and ownership (the installer keeps the DB at 0640), so
+    every copy ends up exactly as readable as the original and never more.
+
+    ``read_only`` (the report-only run, and anything else that must leave the
+    original byte-for-byte alone) opens the source with ``mode=ro`` and skips
+    the WAL checkpoint: the backup API reads committed WAL frames as they
+    are, and a read-only connection neither checkpoints on close nor deletes
+    the -wal. A writable connection would do both even without the explicit
+    PRAGMA, which is a write to a live database the operator was promised
+    stays untouched. The --apply path still checkpoints, so the original's
+    WAL is folded in before the sidecars are cleared after the swap.
     """
-    src = sqlite3.connect(src_path)
+    if read_only:
+        src = sqlite3.connect(
+            f"file:{urllib.request.pathname2url(os.path.abspath(src_path))}?mode=ro", uri=True,
+        )
+    else:
+        src = sqlite3.connect(src_path)
+    old_umask = os.umask(0o077)
     try:
-        src.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        if not read_only:
+            src.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         dest = sqlite3.connect(dest_path)
         try:
             src.backup(dest)
         finally:
             dest.close()
     finally:
+        os.umask(old_umask)
         src.close()
     _mirror_ownership(src_path, dest_path)
 
@@ -676,7 +697,9 @@ def main() -> int:
         return 2
 
     print(f"Snapshotting {args.db} -> working copy")
-    _snapshot(args.db, work)
+    # A report-only run must not write to the original at all (not even a
+    # WAL checkpoint); --apply is going to replace it anyway.
+    _snapshot(args.db, work, read_only=not args.apply)
 
     # The swap happens inside the try block, so a failure anywhere before it
     # returns with the original still in place and the scratch copy removed.
