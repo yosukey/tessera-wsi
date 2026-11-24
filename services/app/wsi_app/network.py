@@ -1,8 +1,11 @@
 """IP-filter in-memory cache and mDNS (avahi-daemon) helper."""
 from __future__ import annotations
+import functools
+import ipaddress
+import itertools
 import json
 import os
-import ipaddress
+import tempfile
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
@@ -17,7 +20,17 @@ _TRUSTED_PROXIES: frozenset[str] = frozenset(
 )
 
 
-def forwarded_proto(headers, fallback: str = "") -> str:
+def is_trusted_proxy(client_host) -> bool:
+    """True when the immediate TCP peer is one of ``TRUSTED_PROXIES``.
+
+    The forwarded headers (``Cf-Connecting-IP``, ``X-Real-IP``,
+    ``X-Forwarded-Proto``) are written by nginx / cloudflared on the loopback
+    hop; from any other peer they are whatever the client chose to send.
+    """
+    return (client_host or "") in _TRUSTED_PROXIES
+
+
+def forwarded_proto(headers, fallback: str = "", *, client_host=None) -> str:
     """The scheme the client used, as reported by ``X-Forwarded-Proto``.
 
     Always takes the FIRST element. The documented single-nginx deployment
@@ -25,11 +38,27 @@ def forwarded_proto(headers, fallback: str = "") -> str:
     load balancer in front) delivers ``"https, http"`` — and comparing that
     whole string to ``"https"`` reads a TLS request as plaintext, which drops
     the ``Secure`` flag from session cookies and splices a comma into any URL
-    built from the value.
+    built from the value. (The first element is the one the outermost,
+    client-facing proxy wrote; the last is only the scheme of the innermost
+    hop, which behind a TLS-terminating balancer is always ``http``. A client
+    able to prepend its own value is one talking to an appending proxy that
+    does not overwrite, and such a client could equally send the header
+    straight through: no choice of element defends that topology, the trusted
+    hop below and nginx's overwrite do.)
+
+    ``client_host`` is the immediate TCP peer (``request.client.host``). When
+    it is given and is not a trusted proxy, the header is ignored like the
+    forwarded-IP headers in :func:`get_client_ip`: it came from the client
+    itself, so it says nothing about the listener it reached — the result is
+    ``fallback``. Call sites that make an access decision on the scheme must
+    pass it; ``None`` (the default) keeps the historic header-trusting
+    behaviour for callers that have no peer to hand.
 
     ``fallback`` (typically ``request.url.scheme``) is used when the header is
     absent; pass nothing to distinguish "no header" from a real scheme.
     """
+    if client_host is not None and not is_trusted_proxy(client_host):
+        return (fallback or "").strip().lower()
     raw = (headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
     return raw or (fallback or "").strip().lower()
 
@@ -65,7 +94,29 @@ def get_client_ip(headers, client_host: str) -> str:
             value = _ip_literal(headers.get(name))
             if value:
                 return value
-    return client_host or "127.0.0.1"
+    # The socket peer is reported the same way: a dual-stack listener hands
+    # IPv4 clients over as ``::ffff:a.b.c.d`` (see :func:`canonical_ip`).
+    return _ip_literal(client_host) or client_host or "127.0.0.1"
+
+
+def canonical_ip(value):
+    """``value`` parsed as an IP address, an IPv4-mapped IPv6 address unwrapped.
+
+    A dual-stack socket (or a proxy listening on one) reports an IPv4 client
+    as ``::ffff:203.0.113.5``. ``ipaddress`` treats that as an IPv6 address
+    and never as a member of an IPv4 network
+    (``IPv6Address("::ffff:203.0.113.5") in IPv4Network("203.0.113.0/24")`` is
+    False), so without unwrapping it every IPv4 rule — an IP-filter deny, the
+    LAN / break-glass ranges — would silently miss the client. Mirrors
+    ``login_throttle.ip_bucket``. Accepts a string or an address object;
+    raises ``ValueError`` for anything that is not an address.
+    """
+    if isinstance(value, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+        addr = value
+    else:
+        addr = ipaddress.ip_address(value)
+    mapped = getattr(addr, "ipv4_mapped", None)
+    return mapped or addr
 
 
 def _ip_literal(value) -> str:
@@ -73,15 +124,21 @@ def _ip_literal(value) -> str:
 
     An IPv6 zone id (``fe80::1%eth0``) is refused: ``ipaddress`` accepts any text
     after the ``%`` (spaces, colons, thousands of characters), and a real client
-    address never has one, so the string would be the client's again."""
+    address never has one, so the string would be the client's again.
+
+    An IPv4-mapped IPv6 address comes back as the plain IPv4 address
+    (:func:`canonical_ip`), so the client is the same string — for the IP
+    filter, the LAN checks, the throttles and the analytics record — whichever
+    socket family the request arrived on."""
     text = (value or "").strip()
     if "%" in text:
         return ""
     try:
-        ipaddress.ip_address(text)
+        addr = ipaddress.ip_address(text)
     except ValueError:
         return ""
-    return text
+    mapped = getattr(addr, "ipv4_mapped", None)
+    return str(mapped) if mapped is not None else text
 
 
 # ---- IP filter cache (refreshed at startup and after settings change) ----
@@ -146,6 +203,48 @@ def ip_allowed(client_ip: str) -> bool:
     return rules_allow_ip(client_ip, snap.enabled, snap.default, snap.rules)
 
 
+# Upper bound on stored IP-filter rules. The rules are evaluated in order on
+# every request (first match wins), so an unbounded list is a per-request cost
+# the settings PATCH could grow without limit; a deployment needing more than
+# this many entries should aggregate them into CIDRs. Enforced on save
+# (routers/admin_settings); :func:`rules_allow_ip` also stops reading past it,
+# so a row written some other way (a restore, a hand edit) cannot either.
+MAX_IP_RULES = 1000
+
+_IPV4_MAPPED_NET = ipaddress.ip_network("::ffff:0:0/96")
+
+
+@functools.lru_cache(maxsize=4 * MAX_IP_RULES)
+def _rule_target(ip_str: str):
+    """The address or network one rule's ``ip`` names, or None if malformed.
+
+    Cached: the live filter runs every rule on every request, and the rule
+    strings only change on a settings save, so parsing each one once per
+    process (instead of once per request) removes the bulk of the cost. The
+    cache is keyed on the string alone, so a changed rule simply misses.
+
+    An IPv4-mapped rule (``::ffff:10.0.0.0/104``, ``::ffff:10.0.0.1``) is
+    rewritten to its IPv4 form, because the client address it is compared to
+    is unwrapped the same way (:func:`canonical_ip`); left as IPv6 it could
+    never match.
+    """
+    try:
+        if "/" in ip_str:
+            net = ipaddress.ip_network(ip_str, strict=False)
+            if (
+                net.version == 6
+                and net.prefixlen >= 96
+                and net.subnet_of(_IPV4_MAPPED_NET)
+            ):
+                net = ipaddress.ip_network(
+                    (int(net.network_address) & 0xFFFFFFFF, net.prefixlen - 96)
+                )
+            return net
+        return canonical_ip(ip_str)
+    except ValueError:
+        return None
+
+
 def rules_allow_ip(client_ip: str, enabled: bool, default: str, rules) -> bool:
     """Evaluate one IP against an IP-filter rule set.
 
@@ -154,34 +253,43 @@ def rules_allow_ip(client_ip: str, enabled: bool, default: str, rules) -> bool:
     refuse a change that would lock the requesting admin out. Loopback is
     always allowed (prevents lockout); the first matching rule decides; an
     unparseable or unmatched IP falls through to ``default``.
+
+    The client address is compared in its canonical form
+    (:func:`canonical_ip`): an IPv4 client seen through a dual-stack socket as
+    ``::ffff:a.b.c.d`` must hit the IPv4 rules written for it — otherwise a
+    ``deny`` rule is skipped under ``default="allow"`` and an ``allow`` rule
+    under ``default="deny"`` refuses the very client it names.
     """
     try:
-        if ipaddress.ip_address(client_ip).is_loopback:
-            return True
+        addr = canonical_ip(client_ip)
     except ValueError:
-        pass
+        addr = None
+
+    if addr is not None and addr.is_loopback:
+        return True
 
     if not enabled:
         return True
 
-    try:
-        addr = ipaddress.ip_address(client_ip)
-    except ValueError:
+    if addr is None:
         return default == "allow"
 
-    for rule in rules:
+    for rule in itertools.islice(rules, MAX_IP_RULES):
         if not isinstance(rule, dict):
             continue
         ip_str = rule.get("ip", "")
-        action = rule.get("action", "allow")
-        try:
-            if "/" in ip_str:
-                if addr in ipaddress.ip_network(ip_str, strict=False):
-                    return action == "allow"
-            elif addr == ipaddress.ip_address(ip_str):
-                return action == "allow"
-        except ValueError:
+        # (Checked before the cached parse: a non-string — a list from a
+        # hand-edited row — is unhashable and would raise inside lru_cache.)
+        target = _rule_target(ip_str) if isinstance(ip_str, str) else None
+        if target is None:
             continue
+        action = rule.get("action", "allow")
+        if isinstance(target, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
+            # ``addr in net`` is False (no error) when the versions differ.
+            if addr in target:
+                return action == "allow"
+        elif addr == target:
+            return action == "allow"
 
     return default == "allow"
 
@@ -213,17 +321,39 @@ def apply_mdns(enabled: bool) -> Tuple[bool, str]:
     try:
         if enabled:
             os.makedirs(_AVAHI_SERVICES_DIR, exist_ok=True)
-            with open(_AVAHI_SERVICE_FILE, "w") as f:
-                f.write(_AVAHI_SERVICE_XML)
-            # avahi-daemon runs as the unprivileged `avahi` user and must be
-            # able to READ this file to publish the mDNS record. The unit sets
-            # UMask=0027, which would otherwise create it 0640 wsi:wsi and hide
-            # it from avahi. The file only carries the public service
-            # advertisement (host + port), so force it world-readable.
-            os.chmod(_AVAHI_SERVICE_FILE, 0o644)
+            # Written to a temp file in the same directory and renamed over
+            # the target, so avahi-daemon (woken by wsi-avahi-reload.path the
+            # moment the directory changes) never reads a half-written or
+            # still-unreadable file, and two processes applying it at once
+            # (several workers at startup) each publish a complete file
+            # rather than truncating each other's.
+            fd, tmp = tempfile.mkstemp(
+                dir=_AVAHI_SERVICES_DIR, prefix=".wsi.service.", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(_AVAHI_SERVICE_XML)
+                    f.flush()
+                    # avahi-daemon runs as the unprivileged `avahi` user and
+                    # must be able to READ this file to publish the mDNS
+                    # record. mkstemp creates it 0600 (and the unit's
+                    # UMask=0027 would make an open() 0640 wsi:wsi), hiding it
+                    # from avahi. The file only carries the public service
+                    # advertisement (host + port), so make it world-readable
+                    # before it becomes visible under its real name.
+                    os.fchmod(f.fileno(), 0o644)
+                os.replace(tmp, _AVAHI_SERVICE_FILE)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
         else:
-            if os.path.isfile(_AVAHI_SERVICE_FILE):
+            try:
                 os.remove(_AVAHI_SERVICE_FILE)
+            except FileNotFoundError:
+                pass
         return True, ""
 
     except PermissionError:

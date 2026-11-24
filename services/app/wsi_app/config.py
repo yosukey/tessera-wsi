@@ -275,7 +275,15 @@ class Settings:
     wsi_allowed_extensions: tuple[str, ...] = wsi_allowed_extensions_from_env()
     wsi_max_upload_bytes: int = env_int("WSI_MAX_UPLOAD_BYTES", 8 * 1024 * 1024 * 1024)
     # Failed admin logins per user before triggering a temporary lockout.
-    admin_login_max_failures: int = env_int("ADMIN_LOGIN_MAX_FAILURES", 5)
+    # At least 1: unlike the per-IP throttles below, 0 does NOT mean "off".
+    # routers/admin_auth.reserve_login_attempt trips the lockout once the
+    # count would reach the limit, so 0 (or a negative number) already locked
+    # an account on its first failure, exactly like 1 — while reading, next to
+    # the "0 to disable" throttles, like a way to switch the lockout off.
+    # Raised to 1 with a warning so the effective value is the one logged.
+    # (The lockout is the only per-account bound on password guessing, so
+    # there is deliberately no way to disable it.)
+    admin_login_max_failures: int = env_int_min("ADMIN_LOGIN_MAX_FAILURES", 5, 1)
     # Duration of the lockout window once the failure threshold is hit.
     admin_login_lockout_seconds: int = env_int("ADMIN_LOGIN_LOCKOUT_SECONDS", 900)
     # Per-IP failed-login throttle (complements the per-USER lockout above,

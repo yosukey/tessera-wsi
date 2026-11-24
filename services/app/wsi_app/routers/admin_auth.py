@@ -558,9 +558,19 @@ def admin_login(body: LoginIn, request: Request, response: Response, db: Session
 def reauth_throttle_key(request: Request, user: User) -> str:
     """The re-auth throttle bucket of this request's token (see
     verify_reauth_password)."""
-    token_digest = hashlib.sha256(
-        (bearer_token(request.headers.get("authorization", "")) or "").rstrip("=").encode()
-    ).hexdigest()[:16]
+    # Keyed on the signed part, "header.payload", not the whole token. Only
+    # the signature segment has alternative spellings the decoder may accept
+    # for one token: the padded form, and — for a 32-byte HS256 MAC, 43
+    # base64url characters carrying 258 bits — the 2 unused low bits of the
+    # last character, which a lenient base64 decoder ignores (four spellings,
+    # four buckets, four times the guesses). The pinned PyJWT happens to
+    # refuse the latter, but the key should not depend on that. The signed
+    # part has no such slack: the MAC covers its exact bytes, so any other
+    # spelling of it is a different token that fails verification before this
+    # runs, and HS256 is deterministic, so one signed part is one token.
+    token = bearer_token(request.headers.get("authorization", "")) or ""
+    signed_part = token.rsplit(".", 1)[0]
+    token_digest = hashlib.sha256(signed_part.encode()).hexdigest()[:16]
     return f"reauth:{user.id}:{token_digest}"
 
 
@@ -594,8 +604,9 @@ def verify_reauth_password(
     password change that revokes the leaked one. Only a correct password
     mints a token, so holding one buys no further guesses. The account id
     stays in the key, and clear_ip on success only forgives THIS token's
-    bucket. Trailing "=" is stripped first: the JWT decoder also accepts the
-    padded spelling of a signature, which must not open a second bucket for
+    bucket. The bucket is named after the token's signed part only (see
+    reauth_throttle_key): the JWT decoder may accept more than one spelling of
+    a signature (a padded one, say), which must not open a second bucket for
     the same token.
 
     One bucket per token across every endpoint that re-authenticates (the
@@ -712,7 +723,34 @@ def admin_update_me(
         # same two-near-identical-accounts confusion.
         if staff_username_taken(db, new_username, exclude_id=user.id):
             raise HTTPException(status_code=400, detail="Username already in use")
-        user.username = new_username
+        # A rename alone is authorised by the same re-auth, so it commits
+        # through the same compare-and-swap as a password change: a password
+        # change, suspension or forced logout landing between the re-auth and
+        # this write means the password just checked may no longer be the
+        # account's, and the rename must not ride on it. With a new password
+        # the swap above already pinned the generation in this transaction
+        # (and moved it to read_tv + 1), so the row is matched by id alone.
+        where = [User.id == user.id]
+        if not new_password:
+            where += [User.password_hash == read_hash, User.token_version == read_tv]
+        try:
+            renamed = db.execute(
+                update(User)
+                .where(*where)
+                .values(username=new_username)
+                .execution_options(synchronize_session="fetch")
+            )
+        except IntegrityError:
+            # Lost the race against a concurrent rename / create to the same
+            # username (users.username UNIQUE).
+            db.rollback()
+            raise HTTPException(status_code=400, detail="Username already in use")
+        if renamed.rowcount != 1:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="The account changed while this request was in flight. Sign in again and retry.",
+            )
 
     # Mint from this request's own outcome, not a fresh read of the row after
     # the commit (which expires it): a sign-out-everywhere, suspension or other
@@ -804,6 +842,12 @@ def admin_register(body: LoginIn, db: Session = Depends(get_db)):
             status_code=422,
             detail=f"username: at most {MAX_USERNAME_LEN} characters",
         )
+    # Control characters (C0/DEL) refused as on every other path that names a
+    # staff account (admin_create_user, admin_update_me): the name flows into
+    # the audit log, the history CSV export and journald, where an embedded
+    # ESC / NUL could smuggle terminal escapes or truncate the value.
+    if CTRL_CHAR_RE.search(username):
+        raise HTTPException(status_code=422, detail="username: invalid characters")
     # Serialise the gate-check + insert so two concurrent first-launch
     # callers can't both pass "no admin exists yet" and create duplicate
     # admins. See the lock declaration above for scope rationale.
@@ -813,7 +857,10 @@ def admin_register(body: LoginIn, db: Session = Depends(get_db)):
         # created the first admin while this request waited on flock.
         if db.execute(select(User).where(User.role == "admin")).first():
             raise HTTPException(status_code=403, detail="Disabled")
-        if db.execute(select(User).where(User.username == username)).scalar_one_or_none():
+        # Case-insensitive, matching admin_create_user: an existing manager /
+        # instructor "Alice" and a new admin "alice" would be two accounts an
+        # operator cannot tell apart.
+        if staff_username_taken(db, username):
             raise HTTPException(status_code=400, detail="Exists")
         u = User(username=username, password_hash=hash_password(body.password), role="admin")
         db.add(u)
@@ -823,4 +870,18 @@ def admin_register(body: LoginIn, db: Session = Depends(get_db)):
             # Another worker process beat this one to the unique-username constraint.
             db.rollback()
             raise HTTPException(status_code=400, detail="Exists")
+        account = SimpleNamespace(id=u.id, username=username, role="admin")
+    # Unauthenticated by design (first launch / disaster recovery), which is
+    # exactly why the creation of an admin through it must leave a trace in
+    # the admin history like every other account creation: the same
+    # "user.create" event admin_create_user records, with no actor and
+    # via="register" marking the route.
+    audit(
+        None,
+        "user.create",
+        target=str(account.id),
+        target_username=account.username,
+        role=account.role,
+        via="register",
+    )
     return {"ok": True}

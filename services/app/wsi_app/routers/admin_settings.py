@@ -785,6 +785,17 @@ def admin_update_network_settings(
             raise HTTPException(status_code=422, detail=f"ip_rules must be valid JSON: {exc.msg}")
         if not isinstance(raw_rules, list):
             raise HTTPException(status_code=422, detail="ip_rules must be a JSON array")
+        # Every request walks the list in order (network.rules_allow_ip), so
+        # its length is a per-request cost; bounded here, before validation
+        # builds a model per entry.
+        if len(raw_rules) > _net.MAX_IP_RULES:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"ip_rules: at most {_net.MAX_IP_RULES} rules "
+                    "(aggregate addresses into CIDR ranges)"
+                ),
+            )
         try:
             parsed = TypeAdapter(List[IpRuleIn]).validate_python(raw_rules)
         except ValidationError as exc:
@@ -1428,6 +1439,7 @@ def admin_test_ldap(
     username: str = Form("", max_length=512),
     password: str = Form("", max_length=1024),
     admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
 ):
     """Probe the saved LDAP config; optionally try a sample user bind.
 
@@ -1436,7 +1448,14 @@ def admin_test_ldap(
     the password — the username is recorded only when supplied so an
     accidentally-pasted password into the wrong field never reaches the
     audit log.
+
+    The snapshot is re-read from the DB first. Each uvicorn worker keeps its
+    own copy, refreshed only by its own saves and the periodic
+    ``WSI_SETTINGS_REFRESH_SECONDS`` loop (never, when that is <= 0), so a
+    "Save" handled by one worker followed by a "Test" landing on another
+    would otherwise test the configuration from before the save.
     """
+    _app_auth.refresh(db)
     result = _app_auth.test_ldap_settings(username=username, password=password)
     audit(
         admin,
