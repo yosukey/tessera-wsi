@@ -183,6 +183,9 @@ _RANK_BETA = 2
 _RANK_RC = 3
 _RANK_FINAL = 4
 _RANK_POST = 5
+# Precedes each numeric component past the third ("1.2.3.1"); above every
+# rank, so 1.2.3-rc1 < 1.2.3 < 1.2.3-5-gabc < 1.2.3.1 (see app_meta).
+_EXTRA_COMPONENT = 6
 _PRERELEASE_RANKS = {
     "a": _RANK_ALPHA, "alpha": _RANK_ALPHA,
     "b": _RANK_BETA, "beta": _RANK_BETA,
@@ -206,6 +209,15 @@ def parse_version(v: str) -> tuple | None:
     nums = tuple(int(x) for x in m.group(1).split("."))
     if len(nums) < 3:
         nums = nums + (0,) * (3 - len(nums))
+    # Components past the third, each behind the _EXTRA_COMPONENT marker and
+    # with trailing zeros dropped ("1.2.3.0" is "1.2.3"): appended bare they
+    # would collide with the rank pair, and "1.2.3" would outrank "1.2.3.1".
+    extra = nums[3:]
+    while extra and extra[-1] == 0:
+        extra = extra[:-1]
+    nums = nums[:3]
+    for n in extra:
+        nums = nums + (_EXTRA_COMPONENT, n)
     rest = s[m.end():]
     if not rest:
         return nums + (_RANK_FINAL, 0)

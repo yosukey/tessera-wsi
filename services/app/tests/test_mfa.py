@@ -12,6 +12,7 @@ import contextlib
 import importlib.util
 import json
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -715,28 +716,45 @@ def test_cli_refuses_root_from_a_copy_the_service_user_owns(tmp_path, monkeypatc
 
 
 class _FakeSt:
-    def __init__(self, st, uid, gid=None):
+    def __init__(self, st, uid, gid=None, mode=None):
         self._st, self.st_uid = st, uid
         self.st_gid = st.st_gid if gid is None else gid
+        self.st_mode = st.st_mode if mode is None else mode
 
     def __getattr__(self, name):
         return getattr(self._st, name)
 
 
-def _as_root(tool, monkeypatch, *, db_uid, dir_uid, db):
+def _as_root(tool, monkeypatch, *, db_uid, dir_uid, db, ancestors=None):
     """Pretend to be root, with ``db`` owned by ``db_uid`` and its directory
-    by ``dir_uid``; record the identity switch instead of making it."""
+    by ``dir_uid``; record the identity switch instead of making it.
+
+    Every directory above (the ancestor walk run when root stays root) reads
+    as root-owned 0755 unless ``ancestors`` maps its path to a
+    ``(uid, permission bits)`` pair, so the outcome does not depend on who
+    owns the real temporary directory."""
     monkeypatch.setattr(tool.os, "geteuid", lambda: 0)
     real_stat, real_lstat = tool.os.stat, tool.os.lstat
     d = os.path.dirname(os.path.abspath(db))
+    # Resolved before os.lstat is replaced: realpath itself calls it.
+    real_d = os.path.realpath(d)
+    above = set(tool._ancestor_chain(os.path.dirname(d))) | set(
+        tool._ancestor_chain(os.path.realpath(os.path.dirname(d)))
+    )
+    ancestors = {os.path.abspath(k): v for k, v in (ancestors or {}).items()}
 
     def fake(real, p, *a, **k):
         st = real(p, *a, **k)
         p = os.path.abspath(p)
         if p == os.path.abspath(db):
             return _FakeSt(st, db_uid, 4242)
-        if p == d:
-            return _FakeSt(st, dir_uid)
+        if p == d or p == real_d:
+            return _FakeSt(st, dir_uid, mode=stat.S_IFDIR | 0o755)
+        if p in ancestors:
+            uid, bits = ancestors[p]
+            return _FakeSt(st, uid, mode=stat.S_IFDIR | bits)
+        if p in above and stat.S_ISDIR(st.st_mode):
+            return _FakeSt(st, 0, mode=stat.S_IFDIR | 0o755)
         return st
 
     monkeypatch.setattr(tool.os, "stat", lambda p, *a, **k: fake(real_stat, p, *a, **k))
@@ -764,7 +782,7 @@ def test_cli_as_root_refuses_a_symlinked_database(tmp_path, monkeypatch):
     assert calls == []
 
 
-def test_cli_as_root_switches_to_the_directory_owner_even_for_a_root_owned_file(tmp_path, monkeypatch):
+def test_cli_as_root_refuses_a_root_owned_file_in_the_service_users_directory(tmp_path, monkeypatch):
     """A root-owned file in the service user's directory is still theirs to
     swap: root does not keep its rights there."""
     tool = _reset_tool()
@@ -803,6 +821,59 @@ def test_cli_as_root_stays_root_when_root_owns_everything(tmp_path, monkeypatch)
     calls = _as_root(tool, monkeypatch, db_uid=0, dir_uid=0, db=str(db))
     tool._become_owner(str(db))
     assert calls == []
+
+
+def test_cli_as_root_refuses_a_root_owned_path_under_a_directory_someone_else_controls(
+    tmp_path, monkeypatch,
+):
+    """Root stays root only when nobody else can swap the path: a non-root
+    owner, or a group/other-writable directory (without the sticky bit),
+    anywhere above the database could rename root's directory aside."""
+    tool = _reset_tool()
+    sub = tmp_path / "a" / "b"
+    sub.mkdir(parents=True)
+    db = sub / "wsi.db"
+    db.write_bytes(b"")
+    upper = str(tmp_path / "a")
+
+    calls = _as_root(tool, monkeypatch, db_uid=0, dir_uid=0, db=str(db),
+                     ancestors={upper: (999, 0o755)})
+    with pytest.raises(tool._Unreadable, match="not owned by root"):
+        tool._become_owner(str(db))
+    assert calls == []
+
+    monkeypatch.undo()
+    calls = _as_root(tool, monkeypatch, db_uid=0, dir_uid=0, db=str(db),
+                     ancestors={upper: (0, 0o777)})
+    with pytest.raises(tool._Unreadable, match="writable by group or others"):
+        tool._become_owner(str(db))
+    assert calls == []
+
+    monkeypatch.undo()
+    calls = _as_root(tool, monkeypatch, db_uid=0, dir_uid=0, db=str(db),
+                     ancestors={upper: (0, 0o775)})
+    with pytest.raises(tool._Unreadable, match="writable by group or others"):
+        tool._become_owner(str(db))
+
+    # A sticky world-writable directory (like /tmp) is fine.
+    monkeypatch.undo()
+    calls = _as_root(tool, monkeypatch, db_uid=0, dir_uid=0, db=str(db),
+                     ancestors={upper: (0, 0o1777)})
+    tool._become_owner(str(db))
+    assert calls == []
+
+
+def test_cli_as_root_documented_layout_drops_privileges_whatever_is_above(tmp_path, monkeypatch):
+    """/var/lib/wsi owned by the service user: the tool switches to that user
+    and never applies the root-only ancestor check (a parent it does not own
+    does not matter then)."""
+    tool = _reset_tool()
+    db = tmp_path / "wsi.db"
+    db.write_bytes(b"")
+    calls = _as_root(tool, monkeypatch, db_uid=999, dir_uid=999, db=str(db),
+                     ancestors={str(tmp_path.parent): (1234, 0o777)})
+    tool._become_owner(str(db))
+    assert calls[-1] == ("setuid", 999)
 
 
 def test_fresh_tokens_buy_no_fresh_code_guesses(client, db_session):

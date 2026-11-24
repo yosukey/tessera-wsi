@@ -210,12 +210,29 @@ def format_in_analytics_tz(dt: Optional[datetime], tz: tzinfo) -> str:
 # ---------------------------------------------------------------------------
 # Audit-history / error-log listings
 # ---------------------------------------------------------------------------
+# The calendar days a filter may name: the same bounds the analytics
+# dashboard's date parameters accept (routers/analytics._MIN_REQUEST_DATE /
+# _MAX_REQUEST_DATE). ``date`` itself spans 0001-01-01 .. 9999-12-31, but
+# :func:`day_range_filters` steps a day past ``until`` and converts each local
+# midnight to UTC, and at either end of that span the arithmetic overflows
+# (``date.max + timedelta(days=1)``, or 0001-01-01 00:00 in a zone east of
+# UTC) — an OverflowError FastAPI reported as a 500, or a 422 from the
+# conversion helper, rather than the caller's "invalid date". A year past
+# these bounds is a typo, not a real filter.
+MIN_FILTER_DAY = date(1900, 1, 1)
+MAX_FILTER_DAY = date(9998, 12, 31)
+
+
 def parse_day(value: str, error_code: str) -> date:
-    """A ``YYYY-MM-DD`` filter value; 400 with ``error_code`` otherwise."""
+    """A ``YYYY-MM-DD`` filter value within ``MIN_FILTER_DAY`` ..
+    ``MAX_FILTER_DAY``; 400 with ``error_code`` otherwise."""
     try:
-        return date.fromisoformat(value)
+        day = date.fromisoformat(value)
     except ValueError:
         raise api_error(400, error_code, value=value)
+    if not MIN_FILTER_DAY <= day <= MAX_FILTER_DAY:
+        raise api_error(400, error_code, value=value)
+    return day
 
 
 def day_range_filters(column, since: Optional[str], until: Optional[str], error_code: str) -> list:

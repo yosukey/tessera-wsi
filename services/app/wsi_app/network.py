@@ -1,9 +1,11 @@
 """IP-filter in-memory cache and mDNS (avahi-daemon) helper."""
 from __future__ import annotations
 import functools
+import hashlib
 import ipaddress
 import itertools
 import json
+import logging
 import os
 import tempfile
 from dataclasses import dataclass, field
@@ -11,10 +13,55 @@ from typing import List, Tuple
 
 from .models import NetworkSettings
 
+logger = logging.getLogger("wsi_app.network")
+
+
+def canonical_ip(value):
+    """``value`` parsed as an IP address, an IPv4-mapped IPv6 address unwrapped.
+
+    A dual-stack socket (or a proxy listening on one) reports an IPv4 client
+    as ``::ffff:203.0.113.5``. ``ipaddress`` treats that as an IPv6 address
+    and never as a member of an IPv4 network
+    (``IPv6Address("::ffff:203.0.113.5") in IPv4Network("203.0.113.0/24")`` is
+    False), so without unwrapping it every IPv4 rule — an IP-filter deny, the
+    LAN / break-glass ranges — would silently miss the client. Mirrors
+    ``login_throttle.ip_bucket``. Accepts a string or an address object;
+    raises ``ValueError`` for anything that is not an address.
+    """
+    if isinstance(value, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+        addr = value
+    else:
+        addr = ipaddress.ip_address(value)
+    mapped = getattr(addr, "ipv4_mapped", None)
+    return mapped or addr
+
+
+def _canonical_host(value) -> str:
+    """``value`` as the string of its :func:`canonical_ip` form, or unchanged.
+
+    Used to compare a socket peer against the trusted-proxy list: both sides
+    go through it, so ``::ffff:127.0.0.1`` (nginx reaching a dual-stack bind
+    over IPv4) and ``127.0.0.1`` are the same peer, and ``::0001`` matches
+    ``::1``. Anything that is not an IP address (a test client's sentinel
+    host name, a Unix-socket peer) is returned stripped but otherwise as is,
+    so it can still match a literal entry of the same spelling.
+    """
+    text = (value or "").strip() if isinstance(value, str) else ""
+    if not text:
+        return ""
+    try:
+        return str(canonical_ip(text))
+    except ValueError:
+        return text
+
+
 # Comma-separated list of upstream proxy IPs whose X-Real-IP header is trusted.
-# Defaults to loopback only (nginx on the same host).
+# Defaults to loopback only (nginx on the same host). Entries are stored in
+# their canonical form (:func:`_canonical_host`), so an operator writing
+# ``::ffff:10.0.0.2`` or ``10.0.0.2`` configures the same proxy, and the peer
+# is canonicalised the same way before the lookup (:func:`is_trusted_proxy`).
 _TRUSTED_PROXIES: frozenset[str] = frozenset(
-    ip.strip()
+    _canonical_host(ip)
     for ip in os.getenv("TRUSTED_PROXIES", "127.0.0.1,::1").split(",")
     if ip.strip()
 )
@@ -26,8 +73,21 @@ def is_trusted_proxy(client_host) -> bool:
     The forwarded headers (``Cf-Connecting-IP``, ``X-Real-IP``,
     ``X-Forwarded-Proto``) are written by nginx / cloudflared on the loopback
     hop; from any other peer they are whatever the client chose to send.
+
+    The peer is compared in its canonical form (:func:`canonical_ip`): when
+    the app is bound to a dual-stack socket, nginx connecting over IPv4
+    loopback is reported as ``::ffff:127.0.0.1``, which as a plain string is
+    not ``127.0.0.1`` — every forwarded header would then be ignored and all
+    clients recorded (and throttled, and IP-filtered) as the proxy itself.
+    The raw spelling is checked too, so a non-address entry (a test client's
+    host name patched into the set) still matches itself.
     """
-    return (client_host or "") in _TRUSTED_PROXIES
+    if not isinstance(client_host, str) or not client_host:
+        return False
+    return (
+        client_host in _TRUSTED_PROXIES
+        or _canonical_host(client_host) in _TRUSTED_PROXIES
+    )
 
 
 def forwarded_proto(headers, fallback: str = "", *, client_host=None) -> str:
@@ -89,7 +149,9 @@ def get_client_ip(headers, client_host: str) -> str:
     string: one named after another account's throttle would fill it. A value
     that is not an address is ignored, as if the header were absent.
     """
-    if client_host in _TRUSTED_PROXIES:
+    # (The same canonical comparison as every other trusted-hop check, so a
+    # proxy seen as ``::ffff:127.0.0.1`` on a dual-stack bind is trusted.)
+    if is_trusted_proxy(client_host):
         for name in ("cf-connecting-ip", "x-real-ip"):
             value = _ip_literal(headers.get(name))
             if value:
@@ -97,26 +159,6 @@ def get_client_ip(headers, client_host: str) -> str:
     # The socket peer is reported the same way: a dual-stack listener hands
     # IPv4 clients over as ``::ffff:a.b.c.d`` (see :func:`canonical_ip`).
     return _ip_literal(client_host) or client_host or "127.0.0.1"
-
-
-def canonical_ip(value):
-    """``value`` parsed as an IP address, an IPv4-mapped IPv6 address unwrapped.
-
-    A dual-stack socket (or a proxy listening on one) reports an IPv4 client
-    as ``::ffff:203.0.113.5``. ``ipaddress`` treats that as an IPv6 address
-    and never as a member of an IPv4 network
-    (``IPv6Address("::ffff:203.0.113.5") in IPv4Network("203.0.113.0/24")`` is
-    False), so without unwrapping it every IPv4 rule — an IP-filter deny, the
-    LAN / break-glass ranges — would silently miss the client. Mirrors
-    ``login_throttle.ip_bucket``. Accepts a string or an address object;
-    raises ``ValueError`` for anything that is not an address.
-    """
-    if isinstance(value, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
-        addr = value
-    else:
-        addr = ipaddress.ip_address(value)
-    mapped = getattr(addr, "ipv4_mapped", None)
-    return mapped or addr
 
 
 def _ip_literal(value) -> str:
@@ -180,6 +222,11 @@ def refresh(db) -> None:
             rules = [r for r in parsed if isinstance(r, dict)]
     except Exception:
         rules = []
+    if len(rules) > MAX_IP_RULES:
+        _warn_oversized_rules(
+            hashlib.sha256((ns.ip_rules or "").encode("utf-8", "replace")).hexdigest(),
+            len(rules),
+        )
     _snapshot = _Snapshot(
         enabled=bool(ns.ip_filter_enabled),
         default=ns.ip_filter_default or "allow",
@@ -212,6 +259,28 @@ def ip_allowed(client_ip: str) -> bool:
 MAX_IP_RULES = 1000
 
 _IPV4_MAPPED_NET = ipaddress.ip_network("::ffff:0:0/96")
+
+
+@functools.lru_cache(maxsize=16)
+def _warn_oversized_rules(digest: str, count: int) -> None:
+    """Log, once per distinct stored rule list, that rules past the cap are ignored.
+
+    The save path refuses a list longer than :data:`MAX_IP_RULES`, but a row
+    written some other way (a backup restored from an older release, a hand
+    edit) can still hold one, and :func:`rules_allow_ip` silently stops
+    reading at the cap — a ``deny`` entry past it would simply never apply.
+    That has to be visible to the operator, so :func:`refresh` reports it
+    here. The settings refresh loop reloads the same row every few seconds in
+    every process; caching on the digest of the stored JSON keeps that to a
+    single line per process per distinct list (a changed list has a new
+    digest and is reported again).
+    """
+    logger.warning(
+        "IP filter: the stored rule list has %d entries; only the first %d are "
+        "evaluated and the remaining %d are IGNORED. Aggregate the rules into "
+        "CIDR ranges and save the IP filter again.",
+        count, MAX_IP_RULES, count - MAX_IP_RULES,
+    )
 
 
 @functools.lru_cache(maxsize=4 * MAX_IP_RULES)

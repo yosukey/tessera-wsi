@@ -30,7 +30,8 @@ file is root-only, hence sudo), else /var/lib/wsi/wsi.db; the path used is
 printed. Run as root, the tool switches to the database file's owner before
 opening it, so SQLite's -wal / -shm files keep their owner; it refuses a
 database path that is a symlink, or whose file and directory belong to
-different users (see ``_become_owner``).
+different users, and, when root owns both, one under a directory that is not
+root's or is writable by others (see ``_become_owner``).
 
 The services may keep running. Standard library only: it touches nothing but
 the ``users`` and ``audit_logs`` tables, through ``sqlite3``.
@@ -138,8 +139,9 @@ def _become_owner(db_path: str) -> None:
       whatever is there by then is opened with no more rights than the
       service already has.
 
-    Root stays root only when root owns both, i.e. nobody else could have
-    planted anything."""
+    Root stays root only when root owns both and every directory above them
+    is root's and not writable by anyone else (_refuse_unsafe_ancestors),
+    i.e. nobody else could have planted anything."""
     if os.geteuid() != 0:
         return
     directory = os.path.dirname(os.path.abspath(db_path))
@@ -157,6 +159,9 @@ def _become_owner(db_path: str) -> None:
         raise _Unreadable(f"refusing to run as root on {db_path}: not a regular file")
     owners = {st.st_uid, dir_st.st_uid} - {0}
     if not owners:
+        # Root keeps its rights here, so the rest of the path must be root's
+        # too: see _refuse_unsafe_ancestors.
+        _refuse_unsafe_ancestors(directory)
         return
     if len(owners) > 1 or st.st_uid == 0:
         # Two different non-root owners, or a root-owned database in a
@@ -188,6 +193,69 @@ def _become_owner(db_path: str) -> None:
         os.setgroups([])
     os.setgid(gid)
     os.setuid(uid)
+
+
+def _ancestor_chain(path: str) -> list:
+    """``path`` and every directory above it, up to and including ``/``."""
+    chain = []
+    while True:
+        chain.append(path)
+        parent = os.path.dirname(path)
+        if parent == path:
+            return chain
+        path = parent
+
+
+def _refuse_unsafe_ancestors(directory: str) -> None:
+    """Refuse (``_Unreadable``) unless nobody but root can change what the
+    path to ``directory`` leads to.
+
+    Called when root stays root because root owns both the database and its
+    directory. That decision only holds if the directories above are root's
+    as well: whoever owns, or may write to, any ancestor can rename the
+    root-owned directory aside and put one of their own — holding a database
+    of their choosing, or a symlink — at the same path, between the check in
+    _become_owner and SQLite's open (and SQLite then creates its -wal / -shm
+    there as root). So every directory from ``directory`` up to ``/`` must be
+    owned by root and must not be writable by group or others, unless it
+    has the sticky bit (``/tmp``: others may create entries there but not
+    rename or remove root's).
+
+    Both the path as given and its symlink-resolved form are checked: a
+    symlink along the way is followed on every open, so the directories it
+    leads to matter as much as the ones it sits in. A symlink itself is
+    skipped (its own mode means nothing; replacing it is a write to its
+    parent, which is in the chain).
+
+    The documented layout never gets here: /var/lib/wsi belongs to the
+    service user, so the tool switches to that user instead of staying root.
+    """
+    abspath = os.path.abspath(directory)
+    seen = set()
+    for chain in (_ancestor_chain(abspath), _ancestor_chain(os.path.realpath(abspath))):
+        for path in chain:
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                st = os.lstat(path)
+            except OSError as exc:
+                raise _Unreadable(f"cannot inspect {path} ({exc.strerror})") from None
+            if stat.S_ISLNK(st.st_mode):
+                continue
+            if st.st_uid != 0:
+                raise _Unreadable(
+                    f"refusing to run as root on a database under {path}: that "
+                    "directory is not owned by root, so its owner could swap the "
+                    "database's path; run the tool as that user, or move the "
+                    "database to a root-owned location"
+                )
+            if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not st.st_mode & stat.S_ISVTX:
+                raise _Unreadable(
+                    f"refusing to run as root on a database under {path}: that "
+                    "directory is writable by group or others (without the sticky "
+                    "bit), so they could swap the database's path"
+                )
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set:

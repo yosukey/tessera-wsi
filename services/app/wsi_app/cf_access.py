@@ -210,9 +210,15 @@ def _is_trusted_hop(client_host: str) -> bool:
     take effect here without a separate patch on this module. The set
     itself is read from the ``TRUSTED_PROXIES`` env var at network-module
     import time, so a runtime env change still requires a service restart.
+
+    Delegates to :func:`network.is_trusted_proxy`, which compares the peer in
+    its canonical form: on a dual-stack bind cloudflared / nginx reaching the
+    app over IPv4 loopback appears as ``::ffff:127.0.0.1``, and a plain string
+    lookup would read that trusted hop as an outsider and refuse every CF
+    Access JWT.
     """
     from . import network as _net
-    return client_host in _net._TRUSTED_PROXIES
+    return _net.is_trusted_proxy(client_host)
 
 
 def cf_jwt_status(

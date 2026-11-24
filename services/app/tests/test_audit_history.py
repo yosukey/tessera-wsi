@@ -8,6 +8,7 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from sqlalchemy import func, select
 
 from wsi_app import app_meta, audit_log
@@ -219,6 +220,26 @@ def test_history_reports_the_analytics_timezone(client, admin_headers):
 def test_history_invalid_date_is_400(client, admin_headers):
     r = client.get("/api/admin/history", params={"since": "not-a-date"}, headers=admin_headers)
     assert r.status_code == 400
+
+
+@pytest.mark.parametrize("params", [
+    {"until": "9999-12-31"}, {"since": "0001-01-01"},
+    {"since": "1899-12-31"}, {"until": "9999-01-01"},
+])
+def test_history_invalid_date_out_of_range_is_400(client, admin_headers, params):
+    """A day at the edge of ``date``'s span overflows the local-midnight / UTC
+    arithmetic; it is the caller's bad date (400), not a 422 / 500."""
+    r = client.get("/api/admin/history", params=params, headers=admin_headers)
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"]["code"] == "adminHistory.invalidDate"
+
+
+def test_history_invalid_date_bounds_are_accepted(client, admin_headers):
+    r = client.get(
+        "/api/admin/history", params={"since": "1900-01-01", "until": "9998-12-31"},
+        headers=admin_headers,
+    )
+    assert r.status_code == 200, r.text
 
 
 def test_history_pagination(client, admin_headers, db_session):

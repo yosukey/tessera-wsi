@@ -269,3 +269,70 @@ def test_report_only_snapshot_leaves_the_live_wal_alone(tmp_path):
     # ... and the copy still has the rows that live only in the WAL.
     assert sqlite3.connect(copy).execute("SELECT a FROM t").fetchall() == [(1,)]
     live.close()
+
+
+def _wal_db_without_sidecars(path):
+    """A WAL-mode database, closed cleanly: no -wal / -shm on disk."""
+    import sqlite3
+
+    live = sqlite3.connect(path)
+    live.execute("PRAGMA journal_mode=WAL")
+    live.execute("CREATE TABLE t(a)")
+    live.execute("INSERT INTO t VALUES (1)")
+    live.commit()
+    live.close()
+
+
+def test_report_only_snapshot_removes_the_sidecars_it_created(tmp_path):
+    """With the service stopped the DB has no -wal / -shm; opening it (even
+    read-only) creates both. The report-only run removes them again."""
+    import os
+    import sqlite3
+
+    tool = _load_tool()
+    src = tmp_path / "wsi.db"
+    _wal_db_without_sidecars(src)
+    assert not os.path.exists(f"{src}-wal") and not os.path.exists(f"{src}-shm")
+
+    copy = tmp_path / "copy.db"
+    tool._snapshot(str(src), str(copy), read_only=True)
+    assert not os.path.exists(f"{src}-wal")
+    assert not os.path.exists(f"{src}-shm")
+    assert sqlite3.connect(copy).execute("SELECT a FROM t").fetchall() == [(1,)]
+
+
+def test_report_only_snapshot_never_removes_a_pre_existing_sidecar(tmp_path):
+    """An empty -wal that was already there (and its -shm) stays put."""
+    import os
+
+    tool = _load_tool()
+    src = tmp_path / "wsi.db"
+    _wal_db_without_sidecars(src)
+    Path(f"{src}-wal").write_bytes(b"")
+    tool._snapshot(str(src), str(tmp_path / "copy.db"), read_only=True)
+    assert os.path.exists(f"{src}-wal")
+    # The -shm was created by this run, but its -wal stays, so it stays too.
+    assert os.path.exists(f"{src}-shm")
+
+
+def test_sidecar_cleanup_keeps_a_wal_that_gained_frames(tmp_path):
+    """A -wal the run created but someone then wrote to is not removed, and
+    neither is its -shm."""
+    import os
+
+    tool = _load_tool()
+    src = tmp_path / "wsi.db"
+    Path(src).write_bytes(b"")
+    Path(f"{src}-wal").write_bytes(b"frames")
+    Path(f"{src}-shm").write_bytes(b"index")
+    tool._remove_sidecars_created_by_us(str(src), {"-wal": False, "-shm": False})
+    assert os.path.exists(f"{src}-wal") and os.path.exists(f"{src}-shm")
+    # An empty one it created goes, and the -shm with it.
+    Path(f"{src}-wal").write_bytes(b"")
+    tool._remove_sidecars_created_by_us(str(src), {"-wal": False, "-shm": False})
+    assert not os.path.exists(f"{src}-wal") and not os.path.exists(f"{src}-shm")
+    # A -shm that pre-existed is kept even when the -wal goes.
+    Path(f"{src}-wal").write_bytes(b"")
+    Path(f"{src}-shm").write_bytes(b"index")
+    tool._remove_sidecars_created_by_us(str(src), {"-wal": False, "-shm": True})
+    assert not os.path.exists(f"{src}-wal") and os.path.exists(f"{src}-shm")

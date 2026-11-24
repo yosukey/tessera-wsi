@@ -121,7 +121,8 @@ def _client_only(fn: Callable[[dict], Any]) -> Callable[[dict], Any]:
 def _defang_parts(text: str) -> str:
     """``text`` with every ';'-separated part defanged on its own (see
     csv_export.csv_safe, which does the per-part split for every exported
-    cell): a spreadsheet that splits cells on ';' would otherwise see a later
+    cell that csv.writer leaves unquoted — a quoted cell stays one cell even
+    in a ';'-separated locale): a spreadsheet that splits cells on ';' would otherwise see a later
     part starting with "=" as a formula. Applied to the joined text, not per
     value, so a value that itself holds ';' (a slide title "A;=B") cannot
     carry a formula past it."""
