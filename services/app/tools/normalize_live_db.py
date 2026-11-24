@@ -89,7 +89,6 @@ import pwd
 import secrets
 import shutil
 import sqlite3
-import stat
 import sys
 import urllib.request
 from typing import Iterable, Optional
@@ -522,15 +521,14 @@ def _snapshot(src_path: str, dest_path: str, *, read_only: bool = False) -> None
     Opening a WAL database at all — read-only included — makes SQLite create
     its ``-wal`` and ``-shm`` when they are absent (the normal state once the
     service has stopped and checkpointed), and it leaves them behind on
-    close. A read-only run removes the ones it created itself afterwards
-    (:func:`_remove_sidecars_created_by_us`), so the directory is left as it
-    was found.
+    close. They are deliberately left there: they are empty (the read-only
+    connection writes no frames), the next writable open reuses them, and
+    deleting them is unsafe — the tool cannot tell its own empty sidecars
+    from those of a service that was started meanwhile (a writer also holds
+    an empty -wal until its first commit), and unlinking a live connection's
+    -wal/-shm loses its writes. The database file itself is not modified.
     """
-    sidecars_before = None
     if read_only:
-        sidecars_before = {
-            suffix: os.path.lexists(src_path + suffix) for suffix in ("-wal", "-shm")
-        }
         src = sqlite3.connect(
             f"file:{urllib.request.pathname2url(os.path.abspath(src_path))}?mode=ro", uri=True,
         )
@@ -548,56 +546,7 @@ def _snapshot(src_path: str, dest_path: str, *, read_only: bool = False) -> None
     finally:
         os.umask(old_umask)
         src.close()
-        if sidecars_before is not None:
-            _remove_sidecars_created_by_us(src_path, sidecars_before)
     _mirror_ownership(src_path, dest_path)
-
-
-def _remove_sidecars_created_by_us(db_path: str, existed_before: dict) -> None:
-    """Delete the empty ``-wal`` / ``-shm`` a read-only open of ``db_path``
-    created, once that connection is closed.
-
-    Deliberately conservative — a sidecar of a live database holds committed
-    data (``-wal``) or the lock state other connections rely on (``-shm``),
-    and deleting the wrong one loses writes:
-
-    * a sidecar that existed before this run is never touched, whatever its
-      size (the service may be running after all, or a crash left a WAL that
-      only the next writable open may recover);
-    * the ``-wal`` is removed only if it is a regular file of size 0, i.e.
-      it holds no frames — nothing has been written through it;
-    * the ``-shm`` is removed only if the ``-wal`` was ALSO absent before and
-      has just been removed here. The shared-memory index is meaningless
-      without its WAL, and is non-empty even when this run's open merely
-      initialised it; if the ``-wal`` has to stay (it gained frames: someone
-      started writing meanwhile), so does its index.
-
-    Errors are ignored: the leftovers are harmless clutter, and the report
-    has already been produced from the copy.
-    """
-    wal, shm = db_path + "-wal", db_path + "-shm"
-    wal_removed = False
-    if not existed_before.get("-wal", True):
-        try:
-            st = os.lstat(wal)
-        except OSError:
-            st = None
-        if st is not None and stat.S_ISREG(st.st_mode) and st.st_size == 0:
-            try:
-                os.remove(wal)
-                wal_removed = True
-            except OSError:
-                pass
-    if wal_removed and not existed_before.get("-shm", True):
-        try:
-            st = os.lstat(shm)
-        except OSError:
-            st = None
-        if st is not None and stat.S_ISREG(st.st_mode):
-            try:
-                os.remove(shm)
-            except OSError:
-                pass
 
 
 def _mirror_ownership(src_path: str, dest_path: str) -> None:

@@ -1447,9 +1447,12 @@ def _tour_asset_volume_path() -> str:
     """The nearest existing directory on the way to ``assets/tours`` (where
     imported attachments land; _import_tour_assets creates the missing
     levels), for free-space checks."""
-    path = os.path.join(settings.data_dir, "assets", "tours")
-    while not os.path.isdir(path) and path != settings.data_dir:
-        path = os.path.dirname(path)
+    path = os.path.abspath(os.path.join(settings.data_dir, "assets", "tours"))
+    while not os.path.isdir(path):
+        parent = os.path.dirname(path)
+        if parent == path:  # reached the root without finding a directory
+            break
+        path = parent
     return path
 
 

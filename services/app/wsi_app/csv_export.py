@@ -193,12 +193,6 @@ def _formula_like(part: str) -> bool:
     )
 
 
-# Characters that make csv.writer (QUOTE_MINIMAL, the dialect _iter_csv uses)
-# wrap the field in double quotes. A quoted field is one cell in every locale,
-# whatever list separator the spreadsheet splits unquoted text on.
-_CSV_QUOTED_BY_WRITER = (",", '"', "\r", "\n")
-
-
 def csv_safe(v):
     """Defang spreadsheet formula injection on a single cell value.
 
@@ -214,37 +208,32 @@ def csv_safe(v):
 
     A second pass covers the ';'-separated parts of the value. A spreadsheet
     in a locale whose list separator is ';' (most of continental Europe)
-    splits UNQUOTED text on ';' when it opens a .csv, and csv.writer does not
-    quote a value for holding ';' — so "x;=HYPERLINK(…)" would land as two
-    cells, the second a live formula. That pass runs only when csv.writer
-    will leave the value unquoted (it holds none of ``,`` ``"`` CR LF): a
-    quoted field stays one cell even in a ';' locale, so only its start
-    matters, and inserting quotes into its middle would just corrupt it.
-    Within the pass a part is quoted ("x;'=HYPERLINK(…)") when it STARTS with
-    a formula character; a part that starts with whitespace is left alone.
-    Common crawler User-Agents look exactly like that —
-    ``Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)``
-    has no comma, so it is not quoted, and its last part is
-    " +http://…" — and the cell such a part becomes keeps its leading space
-    in Excel and in LibreOffice's default import, which reads it as text.
-    (The whole-value check above still looks past leading whitespace: the
-    start of the value is the first cell in every locale.)
+    splits text on ';' when it opens a .csv, and csv.writer does not quote a
+    value for holding ';' — so "x;=HYPERLINK(…)" would land as two cells, the
+    second a live formula. Quoting does not help either: in a ';' locale the
+    commas between columns are not separators, so a quoted field that is not
+    the first column starts in the middle of a cell, its double quotes are
+    read as literal characters, and its ';' still splits the cell
+    ("lead,\"x,y;=1+2;\"" evaluates =1+2 in LibreOffice). So every part is
+    checked whatever the quoting, with the same rule as the whole value
+    (formula character first, or after leading whitespace, which a trimming
+    import strips). The cost is cosmetic: a crawler User-Agent such as
+    ``Mozilla/5.0 (compatible; Googlebot/2.1; +http://…)`` exports as
+    ``…Googlebot/2.1;' +http://…)``.
 
     A value with no such part comes out unchanged. Idempotent (a defanged
-    part starts with the quote, and quoting adds none of the characters the
-    gate looks at), so applying it twice — perf_export defangs its cells,
+    part starts with the quote), so applying it twice — perf_export defangs its cells,
     then the CSV writer runs every cell through here — changes nothing more.
     Non-string values pass through untouched.
     """
     if not isinstance(v, str):
         return v
     head = "'" + v if _formula_like(v) else v
-    if ";" not in v or any(c in v for c in _CSV_QUOTED_BY_WRITER):
+    if ";" not in v:
         return head
     first, sep, rest = head.partition(";")
     return first + sep + ";".join(
-        "'" + part if part.startswith(_CSV_FORMULA_LEAD) else part
-        for part in rest.split(";")
+        "'" + part if _formula_like(part) else part for part in rest.split(";")
     )
 
 

@@ -194,13 +194,17 @@ neither root nor the user who ran `sudo`. `install.sh` and `update.sh` check
 the clone, its `infra/` directory, the script itself, `infra/wsi.env.example`,
 and the `infra/lib/`, `infra/systemd/` and `infra/nginx/` directories and
 every file in them (`update.sh` also checks `infra/install.sh`, so a tree that
-`install.sh` would refuse is refused before anything is stopped);
+`install.sh` would refuse is refused before anything is stopped — as long as
+the files the release checkout rewrites come out owned the same way, which
+they do when you run it with plain `sudo`; a `GIT_AS_USER` other than the
+clone's owner can still make `install.sh` refuse later, and the update rolls
+back);
 `sync-from.sh` checks the clone, `infra/`, `infra/lib/` and the helpers it
 runs. A refused run changes nothing and names the path, e.g. on a fresh
 install:
 
 ```
-Error: refusing to run /home/you/wsi/infra/install.sh: /home/you/wsi/infra/nginx/wsi.conf is writable by every user.
+Error: refusing to run infra/install.sh: /home/you/wsi/infra/nginx/wsi.conf is writable by every user.
 ```
 
 (or `... is owned by <user>, neither root nor you`). Fix the permissions in
