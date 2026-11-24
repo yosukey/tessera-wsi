@@ -20,3 +20,33 @@ ExecStart=/usr/local/bin/wsi-cache-stat
 RuntimeDirectory=wsi-cache-stat
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes
+# Sandbox. All this does is `du` / `find` over the tile cache and write one
+# small JSON file into the RuntimeDirectory above, so it gets the same
+# lockdown as wsi-app / wsi-sync, and tighter where it can: no network at all
+# (AF_UNIX only, for the journal), no writable path but its RuntimeDirectory
+# (which ProtectSystem=strict leaves writable by itself), and no capabilities.
+# The cache directory stays readable: strict makes it read-only, not hidden.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+CapabilityBoundingSet=
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM

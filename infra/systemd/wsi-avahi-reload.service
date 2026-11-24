@@ -1,6 +1,16 @@
 [Unit]
 Description=Reload avahi-daemon after WSI mDNS service file change
 After=avahi-daemon.service
+# The watched /etc/avahi/services is writable by the wsi user, and every
+# write there fires this unit. Under systemd's default start limit (5 starts /
+# 10 s) a few quick mDNS toggles in the admin UI -- each writes or removes a
+# service file -- latch this unit into `failed`, and the path unit with it
+# (unit-start-limit-hit): it stops watching, so no later change reaches
+# avahi until someone runs `systemctl reset-failed` by hand. Allow ordinary
+# bursts, while still capping a runaway writer at a handful of reloads a
+# second, as wsi-restart.service does for its trigger.
+StartLimitIntervalSec=60
+StartLimitBurst=30
 
 [Service]
 Type=oneshot

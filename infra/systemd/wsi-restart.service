@@ -34,6 +34,11 @@ Type=oneshot
 # running (the wait gives up early if wsi-app fails to start, and after 15
 # minutes at most). A trigger without a staged request (dropped by hand) just
 # restarts wsi-app and leaves wsi-sync, and its in-memory live-sync rooms, alone.
+# "Running" includes `activating` -- still starting, or waiting out
+# Restart=on-failure's RestartSec after a crash -- which `is-active --quiet`
+# does not count as active: the stop below cancels that pending start, so
+# treating it as "not running" would leave live sync down after every restore
+# that happened to land in that window.
 # ($$ is systemd's escape for a literal $ in the shell snippet.)
 #
 # -r: /run/wsi is writable by the unprivileged wsi user, who can make the
@@ -48,7 +53,9 @@ ExecStart=/bin/sh -c '\
         exec /usr/bin/systemctl restart wsi-app.service; \
     fi; \
     sync_was_active=0; \
-    /usr/bin/systemctl is-active --quiet wsi-sync.service && sync_was_active=1; \
+    case "$$(/usr/bin/systemctl is-active wsi-sync.service)" in \
+        active|reloading|refreshing|activating) sync_was_active=1 ;; \
+    esac; \
     /usr/bin/systemctl stop wsi-sync.service; \
     /usr/bin/systemctl restart wsi-app.service; rc=$$?; \
     i=0; \

@@ -52,14 +52,20 @@ expect() {
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/bin"
-# Stubs: nginx -t fails while $WORK/nginx-fails exists; systemctl succeeds.
+# Stubs: nginx -t fails while $WORK/nginx-fails exists; systemctl succeeds,
+# except `is-active` while $WORK/nginx-stopped exists (nginx not running).
 cat > "$WORK/bin/nginx" <<SH
 #!/bin/sh
 echo "nginx \$*" >> "$WORK/calls"
 [ -e "$WORK/nginx-fails" ] && exit 1
 exit 0
 SH
-printf '#!/bin/sh\necho "systemctl $*" >> "%s/calls"\nexit 0\n' "$WORK" > "$WORK/bin/systemctl"
+cat > "$WORK/bin/systemctl" <<SH
+#!/bin/sh
+echo "systemctl \$*" >> "$WORK/calls"
+[ "\$1" = is-active ] && [ -e "$WORK/nginx-stopped" ] && exit 3
+exit 0
+SH
 chmod +x "$WORK/bin/nginx" "$WORK/bin/systemctl"
 
 # run_tool SCRIPT ANSWERS [ENV...] : runs it on a fresh copy of wsi.conf,
@@ -134,6 +140,15 @@ if [[ ${EUID:-$(id -u)} -eq 0 ]] && id nobody >/dev/null 2>&1; then
     chown nobody "$CLONE/nginx-cache.sh"
     refused "script owned by another account" "$CLONE/nginx-cache.sh is owned by nobody" \
         "$CLONE/nginx-cache.sh"
+    # ...but that account is the operator in a root shell from `sudo su -`,
+    # which leaves no SUDO_UID: the login session's account (the stub logname
+    # names nobody) is accepted, as by update.sh / sync-from.sh.
+    mkdir -p "$WORK/stub-logname"
+    printf '#!/bin/sh\necho nobody\n' > "$WORK/stub-logname/logname"
+    chmod +x "$WORK/stub-logname/logname"
+    run_tool "$CLONE/nginx-cache.sh" $'2\n100g\ny\n' SUDO_UID= PATH="$WORK/stub-logname:$WORK/bin:$PATH"
+    expect "script owned by the login session's account, no SUDO_UID (sudo su -): accepted" "no" \
+        "$(grep -qF 'refusing to run' <<<"$OUT" && echo yes || echo no)"
     chown 0 "$CLONE/nginx-cache.sh"
 else
     printf 'SKIP - foreign-owner refusal (needs root and a "nobody" user)\n'
@@ -204,6 +219,17 @@ expect "nginx -t rejects: config byte-identical to before" "same" \
     "$(cmp -s "$INFRA/nginx/wsi.conf" "$CONF" && echo same)"
 expect "nginx -t rejects: nothing persisted, no reload"  "none|0" \
     "$(cat "$WORK/max-size" 2>/dev/null || echo none)|$(grep -c 'reload' "$WORK/calls")"
+
+# nginx stopped: the change is made and persisted, and the run succeeds; it
+# applies when nginx starts (a reload of a stopped nginx would fail).
+: > "$WORK/calls"
+touch "$WORK/nginx-stopped"
+run_tool "$INFRA/nginx-cache.sh" $'2\n100g\ny\n'
+rm -f "$WORK/nginx-stopped"
+expect "nginx stopped: succeeds, config and persisted size changed, no reload" "0|100g|100g|0" \
+    "$RC|$(max_size_of "$CONF")|$(cat "$WORK/max-size" 2>/dev/null)|$(grep -c 'reload' "$WORK/calls")"
+expect "nginx stopped: says it applies on start" "yes" \
+    "$(grep -q 'nginx is not running; new max_size=100g' <<<"$OUT" && echo yes)"
 
 # And the generated directive is one a real nginx accepts.
 # (The real nginx, not the stub: a scratch prefix, the directive verbatim but

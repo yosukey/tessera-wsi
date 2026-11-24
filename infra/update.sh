@@ -76,6 +76,19 @@
 # failure before install.sh has run deploys nothing, so it only resets the
 # source tree and restarts the services.
 # =====================================================================
+# The whole script is one { ... } group (closed after the final `exit 0`),
+# so bash has parsed all of it before running the first line. Step 1 moves
+# this very file with git, and the rollback moves it back; bash otherwise
+# reads a script from disk as it goes, so a file rewritten in place under a
+# running update would be read on from the old byte offset, mid-statement in
+# the new text. (git itself replaces the file with a new one, which the
+# running bash does not see, but nothing about an update should depend on
+# that.) What runs is therefore always THIS release's update.sh, start to
+# finish, also on the rollback path -- the new release's update.sh applies
+# from the next update on; install.sh, which does the deployment, is started
+# from the moved tree and so is always the new release's. A group, not a
+# main() function, so every variable stays a global, as the traps expect.
+{
 # -E (errtrace): without it the ERR trap below is NOT inherited by shell
 # functions, so a failing `run_git ...` (every git call goes through that
 # helper) would exit the script silently with no on_error diagnostic and no
@@ -110,7 +123,11 @@ done
 # drops SUDO_UID) the account the login session belongs to.
 _guard_op="${SUDO_UID:-}"
 if [[ -z "$_guard_op" ]]; then _guard_op="$(id -u -- "$(logname 2>/dev/null)" 2>/dev/null || true)"; fi
+# Everything root runs from the tree: lib/wsi-common.sh, install.sh, and
+# lib/nginx_tls_carry.py (the pre-flight TLS check of the nginx site, run
+# before the services are stopped).
 for _guard_p in "$REPO_DIR" "$REPO_DIR/infra" "$REPO_DIR/infra/lib" "$REPO_DIR/infra/lib/wsi-common.sh" \
+                "$REPO_DIR/infra/lib/nginx_tls_carry.py" \
                 "$REPO_DIR/infra/install.sh" "$(realpath -- "${BASH_SOURCE[0]}")"; do
     read -r _guard_uid _guard_user _guard_mode < <(stat -L -c '%u %U %a' -- "$_guard_p" 2>/dev/null) \
         || _guard_refuse "$_guard_p is missing"
@@ -1069,3 +1086,4 @@ printf '   Sync logs:       sudo journalctl -u wsi-sync -f\n'
 printf '   nginx logs:      sudo tail -f /var/log/nginx/error.log\n'
 printf '%s================================================================%s\n' "$C_BOLD" "$C_OFF"
 exit 0
+}

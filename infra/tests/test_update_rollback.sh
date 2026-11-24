@@ -148,6 +148,12 @@ if [[ -f "$FAKE_STATE/signal_install_$v" ]]; then
     if [[ "$sig" == INT ]]; then kill -s INT 0; else kill -s "$sig" "$PPID"; fi
     sleep 1
 fi
+# Rewrite update.sh IN PLACE (same inode, as `cat >` / an editor's in-place
+# save would) while it runs (one-shot): it must carry on with what it parsed.
+if [[ -f "$FAKE_STATE/rewrite_update_$v" ]]; then
+    rm -f "$FAKE_STATE/rewrite_update_$v"
+    printf 'echo REWRITTEN-UPDATE-SH-RAN; exit 7\n' > "$(dirname "$0")/update.sh"
+fi
 if [[ -f "$FAKE_STATE/fail_install_$v" ]]; then
     echo "install.sh: simulated failure (network?) for $v" >&2
     exit 1
@@ -212,6 +218,19 @@ if [[ "$RC" -eq 0 && "$(cat "$STATE/app_state")" == healthy && "$(db_version)" =
     pass "healthy update: exit 0, v2 serving, snapshot cleaned up"
 else
     fail "healthy update: rc=$RC state=$(cat "$STATE/app_state") db=$(db_version) snapshots=$(snapshots_left)"
+    show_log
+fi
+
+# --- A2. update.sh rewritten in place while it runs: it is parsed whole up
+# front (one { ... } group), so the run finishes as it started ---------------
+setup rewritten
+touch "$STATE/rewrite_update_2.0.0"
+run_update
+if [[ "$RC" -eq 0 && "$(cat "$STATE/app_state")" == healthy && "$(db_version)" == 2.0.0 ]] \
+   && grep -q "Update complete" "$CASE/out.log" && ! grep -q REWRITTEN-UPDATE-SH-RAN "$CASE/out.log"; then
+    pass "update.sh rewritten in place mid-run: the running update completes unchanged"
+else
+    fail "update.sh rewritten in place mid-run: rc=$RC state=$(cat "$STATE/app_state") db=$(db_version)"
     show_log
 fi
 

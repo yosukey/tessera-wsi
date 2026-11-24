@@ -518,6 +518,30 @@ cp "$TMP_ROOT/managed/tls.conf" "$TMP_ROOT/managed/tls.conf.keep"
 out="$(run_fn)"; rc=$?
 expect "tls link: with the lines in its target the run goes through, link and target as they were" "0|yes|same" \
     "$rc|$([[ -L "$NGINX_ETC/snippets/wsi-tls.conf" ]] && echo yes)|$(cmp -s "$TMP_ROOT/managed/tls.conf" "$TMP_ROOT/managed/tls.conf.keep" && echo same)"
+# ...also when its target holds exactly the carried text (here without the final
+# newline, as an earlier release wrote it): that once fell through to the write,
+# whose mv replaced the link by a regular file.
+cp "$TMP_ROOT/site.keep" "$NGINX_ETC/sites-available/wsi"
+printf '%s' "$(cat "$TMP_ROOT/carried.txt")" > "$TMP_ROOT/managed/tls.conf"
+cp "$TMP_ROOT/managed/tls.conf" "$TMP_ROOT/managed/tls.conf.keep"
+out="$(run_fn)"; rc=$?
+expect "tls link: a target identical to the carried text leaves link and target as they were" "0|yes|same|0" \
+    "$rc|$([[ -L "$NGINX_ETC/snippets/wsi-tls.conf" ]] && echo yes)|$(cmp -s "$TMP_ROOT/managed/tls.conf" "$TMP_ROOT/managed/tls.conf.keep" && echo same)|$(find "$NGINX_ETC/snippets" -name 'wsi-tls.conf.bak-*' | wc -l | tr -d ' ')"
+
+# The carried snippet ends with a newline (the command substitution that reads
+# the carried text strips it), so a line appended later stays a line of its own.
+# A snippet an earlier release wrote without it is given it, with no backup.
+scratch_etc tls-newline
+printf '%s\n' "$CERTBOT_OLD_SITE" > "$NGINX_ETC/sites-available/wsi"
+python3 -I "$REPO/infra/lib/nginx_tls_carry.py" "$NGINX_ETC/sites-available/wsi" > "$TMP_ROOT/carried-nl.txt"
+out="$(run_fn)"; rc=$?
+expect "tls newline: a fresh carry is written with its final newline" "0|same" \
+    "$rc|$(cmp -s "$TMP_ROOT/carried-nl.txt" "$NGINX_ETC/snippets/wsi-tls.conf" && echo same)"
+printf '%s\n' "$CERTBOT_OLD_SITE" > "$NGINX_ETC/sites-available/wsi"
+printf '%s' "$(cat "$TMP_ROOT/carried-nl.txt")" > "$NGINX_ETC/snippets/wsi-tls.conf"
+out="$(run_fn)"; rc=$?
+expect "tls newline: an earlier release's snippet without it gains it, without a backup" "0|same|0" \
+    "$rc|$(cmp -s "$TMP_ROOT/carried-nl.txt" "$NGINX_ETC/snippets/wsi-tls.conf" && echo same)|$(find "$NGINX_ETC/snippets" -name 'wsi-tls.conf.bak-*' | wc -l | tr -d ' ')"
 
 # A snippet of comments only (the shipped one) is replaced; its copy is kept and the run says so.
 scratch_etc tls-shipped

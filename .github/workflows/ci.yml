@@ -77,6 +77,10 @@ jobs:
               backend:frontend/package.json \
               | backend:frontend/src/lib/admin/validation.ts \
               | backend:frontend/src/lib/slideCredit.sourceUrlCases.json) return 0 ;;
+              # test_nginx_tls_carry.py parses the stock site and TLS snippet
+              # (and their git history), so these two are backend inputs even
+              # though the rest of infra/nginx/ is not.
+              backend:infra/nginx/wsi.conf | backend:infra/nginx/wsi-tls.conf) return 0 ;;
               backend:docs/* | backend:*.md | backend:LICENSE | backend:.shellcheckrc \
               | backend:.github/* | backend:frontend/* \
               | backend:infra/tests/* | backend:infra/nginx/*) return 1 ;;

@@ -90,6 +90,60 @@ NODE_MAJOR="${NODE_MAJOR:-24}"
 
 # Source repo = directory containing this script's parent.
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Every file root installs into a root-consumed location (the systemd units —
+# including the root-run wsi-restart.service / wsi-avahi-reload.service —
+# /usr/local/bin/wsi-cache-stat, the nginx configs, the wsi.env template), and
+# every helper root sources or runs (lib/wsi-common.sh just below,
+# lib/nginx_tls_carry.py), is read from REPO_DIR, never from $APP_HOME:
+# $APP_HOME is owned by the service user, and by the time those files are
+# installed that user has run pip and `npm ci` / `npm run build` there, so any
+# package install hook could have rewritten $APP_HOME/infra/*. That only helps
+# if REPO_DIR is not itself the service user's tree, nor one any account other
+# than root or the operator could have rewritten. So, exactly like update.sh,
+# sync-from.sh and set-workers.sh, refuse the deployed copy (e.g.
+# `sudo bash /opt/wsi/infra/install.sh`) and a tree with a file or directory
+# root reads that is owned by someone else or writable by every user. Checked
+# before ANYTHING is read from the tree -- the `. "$WSI_COMMON_SH"` below runs
+# its code as root. Symlinks are resolved first, so a link into /opt/wsi is
+# caught too. (die() is not defined yet here, so the refusal prints inline.)
+_guard_refuse() {
+    printf '\033[31mError: refusing to run %s: %s.\033[0m\n' "${BASH_SOURCE[0]}" "$1" >&2
+    printf 'It runs code from %s as root, so only root or you may be able\n' "$REPO_DIR" >&2
+    printf 'to change that tree. Run it from your clone instead:\n' >&2
+    printf '  cd ~/wsi && sudo bash infra/%s\n' "$(basename -- "${BASH_SOURCE[0]}")" >&2
+    exit 1
+}
+_guard_repo_real="$(realpath -- "$REPO_DIR")"
+for _guard_home in /opt/wsi ${APP_HOME:+"$APP_HOME"}; do
+    _guard_home="$(realpath -m -- "$_guard_home")"
+    case "$_guard_repo_real/" in
+        "$_guard_home"/*) _guard_refuse "it is inside $_guard_home, the service user's deployed copy" ;;
+    esac
+done
+# The operator: whoever ran sudo, else (a root shell from `sudo su -`, which
+# drops SUDO_UID) the account the login session belongs to.
+_guard_op="${SUDO_UID:-}"
+if [[ -z "$_guard_op" ]]; then _guard_op="$(id -u -- "$(logname 2>/dev/null)" 2>/dev/null || true)"; fi
+# The directories root reads from, and everything directly in them (globbed,
+# so a unit or snippet added later is covered without editing this list).
+shopt -s nullglob
+_guard_paths=("$REPO_DIR" "$REPO_DIR/infra" "$REPO_DIR/infra/wsi.env.example"
+              "$REPO_DIR/infra/lib" "$REPO_DIR/infra/lib"/*
+              "$REPO_DIR/infra/systemd" "$REPO_DIR/infra/systemd"/*
+              "$REPO_DIR/infra/nginx" "$REPO_DIR/infra/nginx"/*
+              "$(realpath -- "${BASH_SOURCE[0]}")")
+shopt -u nullglob
+for _guard_p in "${_guard_paths[@]}"; do
+    read -r _guard_uid _guard_user _guard_mode < <(stat -L -c '%u %U %a' -- "$_guard_p" 2>/dev/null) \
+        || _guard_refuse "$_guard_p is missing"
+    if [[ "$_guard_uid" != 0 && "$_guard_uid" != "$EUID" && "$_guard_uid" != "$_guard_op" ]]; then
+        _guard_refuse "$_guard_p is owned by $_guard_user, neither root nor you"
+    fi
+    if (( 8#$_guard_mode & 8#002 )); then
+        _guard_refuse "$_guard_p is writable by every user"
+    fi
+done
+unset _guard_repo_real _guard_home _guard_op _guard_paths _guard_p _guard_uid _guard_user _guard_mode
 # Helpers shared with update.sh (wsi_env_value, wsi_define_run_git), read
 # from the same tree as this script.
 WSI_COMMON_SH="$REPO_DIR/infra/lib/wsi-common.sh"
@@ -342,23 +396,8 @@ for marker in Makefile services/app/requirements.txt frontend/package.json; do
     fi
 done
 
-# Every file root installs into a root-consumed location (the systemd units —
-# including the root-run wsi-restart.service / wsi-avahi-reload.service —
-# /usr/local/bin/wsi-cache-stat, the nginx configs, the wsi.env template) is
-# read from REPO_DIR, never from $APP_HOME: $APP_HOME is owned by the service
-# user, and by the time those files are installed that user has run pip and
-# `npm ci` / `npm run build` there, so any package install hook could have
-# rewritten $APP_HOME/infra/*. That only helps if REPO_DIR is not itself the
-# service user's tree, so refuse to run from the deployed copy (e.g.
-# `sudo bash /opt/wsi/infra/install.sh`). Compared physically so a symlinked
-# path to /opt/wsi is caught too.
-_repo_real="$(cd "$REPO_DIR" && pwd -P)"
-_app_real="$(realpath -m -- "$APP_HOME")"
-case "$_repo_real/" in
-    "$_app_real"/*)
-        die "REPO_DIR=$REPO_DIR is inside $APP_HOME (the service user's deployed copy). Run install.sh from your source clone (e.g. ~/wsi) instead." ;;
-esac
-unset _repo_real _app_real
+# (REPO_DIR itself -- not the deployed copy, not rewritable by another
+# account -- was checked at the top, before lib/wsi-common.sh was sourced.)
 
 log "Source repo: $REPO_DIR"
 
@@ -1358,6 +1397,27 @@ install_wsi_tls_snippet() {
     local dest="$1" carried="$2" staged
     TLS_SNIPPET_BAK=""
     if [[ -n "$carried" ]]; then
+        # CARRIED comes from a command substitution, which strips the trailing
+        # newline nginx_tls_carry.py printed; every write below puts it back
+        # (printf '%s\n'), or the file would end mid-line in "# managed by
+        # Certbot" and a line an operator later appends (`echo ... >>`) would
+        # be swallowed into that comment.
+        #
+        # A link is the operator's arrangement: install_nginx_site has already
+        # stopped the run unless the file it points to holds the carried lines,
+        # so there is nothing to write -- and nothing may replace the link by a
+        # regular file (the fall-through below would, with an mv over it).
+        if [[ -L "$dest" ]]; then
+            return 0
+        fi
+        # Already exactly what would be written: leave the file (its mtime,
+        # owner and mode) alone, and make no backup of it.
+        if [[ -s "$dest" ]] && printf '%s\n' "$carried" | cmp -s - "$dest"; then
+            return 0
+        fi
+        # The same text without the final newline (what an earlier release
+        # wrote) is not "other content" either: it is rewritten below with the
+        # newline, without a backup or a warning.
         if [[ -s "$dest" ]] && ! printf '%s' "$carried" | cmp -s - "$dest"; then
             TLS_SNIPPET_BAK="$dest.bak-$(date +%Y%m%d-%H%M%S)"
             # (never an earlier copy's name: two runs in one second would
@@ -1397,7 +1457,7 @@ install_wsi_tls_snippet() {
             POST_INSTALL_WARNINGS+=("$dest was replaced by the TLS settings carried over from the site file; the previous file is kept as $TLS_SNIPPET_BAK")
         fi
         staged="$(mktemp "$dest.XXXXXX")" || return 1
-        if ! { printf '%s' "$carried" > "$staged" && tls_snippet_attrs "$staged" "$dest" && mv -f -- "$staged" "$dest"; }; then
+        if ! { printf '%s\n' "$carried" > "$staged" && tls_snippet_attrs "$staged" "$dest" && mv -f -- "$staged" "$dest"; }; then
             rm -f -- "$staged"
             return 1
         fi
