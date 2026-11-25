@@ -9,6 +9,7 @@ import {
   getToken,
   getTour,
   getViewerSettings,
+  httpStatusOf,
   isAbortError,
   isRateLimitError,
   isStaffFromToken,
@@ -63,7 +64,11 @@ type LoadedTour = {
 const NO_STEPS: TourStep[] = []
 
 export default function TourViewerPage() {
-  useAuthGate()
+  // The gate probes once on mount; the returned callback re-runs that probe
+  // when one of this page's own requests is answered 401 (the session expired
+  // while the tour stayed open), so the visitor is sent to sign in rather
+  // than left on a generic load-failure banner. Stable identity.
+  const recheckAuth = useAuthGate()
   const { id, tourId } = useParams()
   const navigate = useNavigate()
   // URL segments are the slide/tour public_id tokens, not numeric PKs. They
@@ -191,6 +196,11 @@ export default function TourViewerPage() {
     }).catch((err) => {
       if (isAbortError(err)) return
       logger.error('failed to load slide', err)
+      // Same as ViewerPage: a 401 here means the session lapsed (stepping to a
+      // tour on another slide re-fetches it), so re-run the auth probe, which
+      // redirects to /login only if the server confirms the visitor is
+      // signed out.
+      if (httpStatusOf(err) === 401) recheckAuth()
       // Drop the prior slide so a failed navigation doesn't leave the old
       // slide's image on screen beneath the error banner (the OSD-init guard
       // keys on slide.public_id, so clearing it also tears the viewer down).
@@ -209,7 +219,7 @@ export default function TourViewerPage() {
         setViewerSettingsLoaded(true)
       })
     return () => ctrl.abort()
-  }, [slidePublicId, fromAdmin])
+  }, [slidePublicId, fromAdmin, recheckAuth])
 
   useEffect(() => {
     if (!tourPublicId) return
@@ -266,6 +276,8 @@ export default function TourViewerPage() {
       if (d.tour?.title) document.title = d.tour.title
     }).catch((err) => {
       if (isAbortError(err)) return
+      // Session expired mid-visit: hand off to the auth probe (see above).
+      if (httpStatusOf(err) === 401) recheckAuth()
       // Drop the prior tour's steps/overlays so a failed navigation to a
       // broken or deleted tour doesn't keep rendering the old tour's step list
       // and annotations as if they were still valid. (The route tag already
@@ -274,7 +286,7 @@ export default function TourViewerPage() {
       setTourLoadError(true)
     })
     return () => ctrl.abort()
-  }, [tourPublicId, slidePublicId, navigate, fromAdmin])
+  }, [tourPublicId, slidePublicId, navigate, fromAdmin, recheckAuth])
 
   // Wait for the slide metadata before opening OSD: SZI tile sources need an
   // async fetch of the archive descriptor, so the format must be known

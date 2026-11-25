@@ -214,6 +214,31 @@ def test_published_macro_behind_cloudflare_access_is_private(client, db_session,
     assert r.headers["cache-control"].startswith("private")
 
 
+def test_macro_revalidation_does_not_load_the_blob(client, db_session, slide):
+    """``macro_data`` is deferred: a 304 answers from ``macro_etag`` alone,
+    and only a full 200 SELECTs the bytes."""
+    from sqlalchemy import event
+
+    from wsi_app.db import engine
+
+    _with_macro(db_session, slide, published=True)
+    statements: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _record)
+    try:
+        r = client.get(f"/api/slides/{slide.public_id}/macro", headers={"If-None-Match": '"m1"'})
+    finally:
+        event.remove(engine, "before_cursor_execute", _record)
+    assert r.status_code == 304
+    assert not any("macro_data" in s for s in statements), statements
+    r = client.get(f"/api/slides/{slide.public_id}/macro")
+    assert r.status_code == 200
+    assert r.content == b"FAKE-MACRO"
+
+
 # --------------------------------------------------------------------------
 # Non-finite numbers in file metadata
 # --------------------------------------------------------------------------

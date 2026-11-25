@@ -33,17 +33,21 @@ for _home in /opt/wsi ${APP_HOME:+"$APP_HOME"}; do
         "$_home"/*) untrusted_tree "it is inside $_home, the service user's deployed copy" ;;
     esac
 done
+# The operator: whoever ran sudo, else (a root shell from `sudo su -`, which
+# drops SUDO_UID) the account the login session belongs to -- as in update.sh.
+_op="${SUDO_UID:-}"
+if [[ -z "$_op" ]]; then _op="$(id -u -- "$(logname 2>/dev/null)" 2>/dev/null || true)"; fi
 for _p in "$SELF_DIR" "$SELF" "$SELF_DIR/lib" "$SELF_DIR/lib/envfile_set.py"; do
     read -r _uid _user _mode < <(stat -L -c '%u %U %a' -- "$_p" 2>/dev/null) \
         || untrusted_tree "$_p is missing"
-    if [[ "$_uid" != 0 && "$_uid" != "$EUID" && "$_uid" != "${SUDO_UID:-}" ]]; then
+    if [[ "$_uid" != 0 && "$_uid" != "$EUID" && "$_uid" != "$_op" ]]; then
         untrusted_tree "$_p is owned by $_user, neither root nor you"
     fi
     if (( 8#$_mode & 8#002 )); then
         untrusted_tree "$_p is writable by every user"
     fi
 done
-unset _home _p _uid _user _mode
+unset _home _op _p _uid _user _mode
 
 # ---- helpers -------------------------------------------------------
 

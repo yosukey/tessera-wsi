@@ -247,6 +247,20 @@ if [[ $EUID -eq 0 ]] && id nobody >/dev/null 2>&1; then
         "${CLONE}/systemd/wsi-calc.sh is owned by nobody" "${CLONE}/set-workers.sh"
     refused "set-cache-size.sh, envfile_set.py owned by another account" \
         "${CLONE}/lib/envfile_set.py is owned by nobody" "${CLONE}/set-cache-size.sh"
+    # ...but that account is the operator in a root shell from `sudo su -`,
+    # which leaves no SUDO_UID: the login session's account (the stub logname
+    # names nobody) is accepted as it is by update.sh / sync-from.sh.
+    mkdir -p "${WORK}/stub-logname"
+    printf '#!/bin/sh\necho nobody\n' > "${WORK}/stub-logname/logname"
+    chmod +x "${WORK}/stub-logname/logname"
+    for s in set-workers.sh set-cache-size.sh; do
+        answers=$'1\n1\ny\n'; [[ "$s" == set-cache-size.sh ]] && answers=$'9\ny\n'
+        f="$(fresh_copy su-login.env)"
+        out="$(printf '%s' "${answers}" | env PATH="${WORK}/stub-logname:${WORK}/bin:$PATH" \
+            WSI_ENV="$f" SUDO_UID= bash "${CLONE}/${s}" 2>&1)"
+        expect "${s}: owned by the login session's account, no SUDO_UID (sudo su -): accepted" no \
+            "$(grep -qF 'refusing to run' <<<"$out" && echo yes || echo no)"
+    done
     chown 0 "${CLONE}/systemd/wsi-calc.sh" "${CLONE}/lib/envfile_set.py"
 else
     printf 'SKIP - foreign-owner refusal (needs root and a "nobody" user)\n'

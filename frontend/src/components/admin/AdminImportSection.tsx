@@ -177,12 +177,25 @@ type InFlightUpload = {
   sent: boolean
   onChange: Set<() => void>
   done: Promise<{ jobId: string } | { error: unknown }>
+  // The admin sign-in (currentAdminSessionEpoch) that started it. The
+  // variable below outlives a sign-out and a different admin signing in on
+  // the same tab; their section must not attach to (show the progress of,
+  // and be locked by) the previous admin's upload.
+  epoch: number
 }
 let inFlightUpload: InFlightUpload | null = null
 
+// The in-flight upload if it belongs to the current sign-in. One left over
+// from a signed-out admin is forgotten here: its answer is already dropped
+// (startUpload's epoch check) and nothing of this sign-in should follow it.
+function currentInFlightUpload(): InFlightUpload | null {
+  if (inFlightUpload && !adminSessionIsCurrent(inFlightUpload.epoch)) inFlightUpload = null
+  return inFlightUpload
+}
+
 function startUpload(file: File, signal: AbortSignal | undefined): InFlightUpload {
-  const upload = { pct: 0, sent: false, onChange: new Set() } as InFlightUpload
   const epoch = currentAdminSessionEpoch()
+  const upload = { pct: 0, sent: false, onChange: new Set(), epoch } as InFlightUpload
   const changed = () => upload.onChange.forEach((fn) => fn())
   upload.done = adminStageSlideImport(file, (pct) => {
     upload.pct = pct
@@ -257,7 +270,8 @@ export default function AdminImportSection({ onImported, onSendingChange, leaveR
     // server's answer; one uploaded before a tab switch or reload may still
     // be being staged, or have been staged meanwhile: pick it up again.
     const jobId = safeSessionGetItem(STORAGE_KEYS.importStageJobId)
-    if (inFlightUpload) void followUpload(inFlightUpload)
+    const upload = currentInFlightUpload()
+    if (upload) void followUpload(upload)
     else if (jobId) void watchStageJob(jobId)
     return () => ctrl.abort()
   }, [])

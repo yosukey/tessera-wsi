@@ -224,9 +224,17 @@ export default function AdminDashboard() {
   // uploadRunning) so a sidebar tab switch away from the Network tab can
   // confirm before unmounting the section and dropping the edits.
   const [networkDirty, setNetworkDirty] = useState(false)
+  // Same for the Settings tab's seasonal-background slots: their edits are
+  // local to AdminSeasonalBackgroundsSection (the rest of the Settings form
+  // is held here and survives the unmount), so leaving the tab asks first.
+  const [seasonalDirty, setSeasonalDirty] = useState(false)
   // True while AdminImportSection is sending a bundle, which unmounting the
   // section cancels: leaving the Import / Export tab asks first, as above.
   const [importSending, setImportSending] = useState(false)
+  // True while AdminBackupSection is sending a restore archive (unmounting
+  // the section aborts it) or applying a restore / reset (unmounting stops
+  // following it): leaving the Backup tab asks first, as above.
+  const [backupBusy, setBackupBusy] = useState(false)
   const [showAbout, setShowAbout] = useState(false)
   // True once the metadata options fetch has actually returned. The
   // viewer-settings panel needs this to tell "no custom categories" apart
@@ -766,7 +774,9 @@ export default function AdminDashboard() {
   // browser Back themselves.)
   const mayLeaveTab = (): boolean => {
     if (activeTab === 'network' && networkDirty) return window.confirm(t('adminDash.unsavedChangesConfirm'))
+    if (activeTab === 'settings' && seasonalDirty) return window.confirm(t('adminDash.unsavedChangesConfirm'))
     if (activeTab === 'import' && importSending) return window.confirm(t('adminImport.uploadLeaveConfirm'))
+    if (activeTab === 'backup' && backupBusy) return window.confirm(t('adminBackup.busyLeaveConfirm'))
     return true
   }
   // mayLeaveTab for an exit that follows at once: a second click on the way
@@ -774,7 +784,9 @@ export default function AdminDashboard() {
   const confirmLeaveTab = (): boolean => {
     if (!mayLeaveTab()) return false
     setNetworkDirty(false)
+    setSeasonalDirty(false)
     setImportSending(false)
+    setBackupBusy(false)
     return true
   }
 
@@ -1321,13 +1333,15 @@ export default function AdminDashboard() {
               onSavedOverlays={setSavedOverlays}
               loadError={vsLoadError}
               onRetryLoad={() => { loadViewerSettings() }}
+              onSeasonalDirtyChange={setSeasonalDirty}
+              leaveRef={tabLeaveRef}
             />
           )}
           {activeTab === 'network' && (
             <AdminNetworkAuthSection onDirtyChange={setNetworkDirty} leaveRef={tabLeaveRef} />
           )}
           {activeTab === 'backup' && (
-            <AdminBackupSection />
+            <AdminBackupSection onBusyChange={setBackupBusy} leaveRef={tabLeaveRef} />
           )}
           {activeTab === 'import' && (
             <div style={{ display: 'grid', gap: 24 }}>

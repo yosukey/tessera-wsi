@@ -38,36 +38,99 @@ def _zone_name_or_none(name: str) -> Optional[str]:
     return name
 
 
-@functools.lru_cache(maxsize=1)
-def _host_tz_name() -> Optional[str]:
-    """IANA name of the host's zone from ``TZ`` / ``/etc/localtime`` /
-    ``/etc/timezone``, or None when none of them names one.
+def iana_name_or_none(name: str) -> Optional[str]:
+    """``name`` if it is an IANA zone this host knows, else None.
 
-    Cached for the life of the process: the host zone cannot change under a
-    running worker (a changed ``/etc/localtime`` reaches it only on restart,
-    like every other process on the box), and without the cache every
-    dashboard request re-read those files several times.
+    ``TZ`` may legally hold a POSIX rule ("JST-9") or a file path
+    (":/etc/localtime"), and zoneinfo symlinks can point into the
+    ``posix/`` / ``right/`` trees; none of those is a zone name the admin
+    pages (or a browser's Intl API) can use. The ``posix/`` / ``right/``
+    prefix is stripped so ``posix/Asia/Tokyo`` reports as ``Asia/Tokyo``.
     """
-    tz_env = _zone_name_or_none(os.environ.get("TZ", "").strip().lstrip(":"))
-    if tz_env:
-        return tz_env
+    name = name.strip()
+    for prefix in ("posix/", "right/"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+    if not name or name.startswith(("/", ".")):
+        return None
+    return _zone_name_or_none(name)
+
+
+_ZONEINFO_DIRS = ("/usr/share/zoneinfo/", "/usr/lib/zoneinfo/", "/usr/share/lib/zoneinfo/")
+
+
+def zone_from_zoneinfo_path(path: str) -> Optional[str]:
+    """The IANA name of a zoneinfo file ``path`` is, or links to, if any."""
+    candidates = [path]
     try:
-        link = os.readlink("/etc/localtime")
-        for prefix in ("/usr/share/zoneinfo/", "/usr/lib/zoneinfo/", "/usr/share/lib/zoneinfo/"):
-            if prefix in link:
-                cand = _zone_name_or_none(link.split(prefix, 1)[1])
-                if cand:
-                    return cand
+        candidates.insert(0, os.readlink(path))
     except OSError:
         pass
+    for target in candidates:
+        for prefix in _ZONEINFO_DIRS:
+            if prefix in target:
+                name = iana_name_or_none(target.split(prefix, 1)[1])
+                if name:
+                    return name
+    return None
+
+
+def host_iana_timezone() -> Optional[str]:
+    """The IANA name of the zone this process runs in, or None when it is
+    not recoverable. Uncached; see _host_tz_name for the cached form.
+
+    The one resolver behind both the analytics zone fallback here and the
+    System page's ``tz_name`` (routers/admin_system), so the two cannot
+    disagree about the host's zone.
+
+    Priority: TZ env var > /etc/localtime symlink > /etc/timezone, each used
+    only when it names a real IANA zone. /etc/timezone is checked last
+    because container images often ship it as 'Etc/UTC' even when the
+    actual runtime timezone differs.
+    """
+    # 1. TZ — when set, it, not /etc/localtime, is the zone the process runs
+    # in, so a value that names no IANA zone is "unknown", never a
+    # fall-through to /etc/localtime: TZ=JST-9 on a host whose localtime is
+    # UTC runs at +09:00. Reporting None lets analytics_tz() fall back to the
+    # process's actual current UTC offset (+09:00), where falling through
+    # would bucket every day nine hours off. A file path
+    # (":/usr/share/zoneinfo/Asia/Tokyo", "/etc/localtime") is resolved like
+    # /etc/localtime below.
+    tz_env = os.environ.get("TZ", "").strip().lstrip(":")
+    if tz_env:
+        name = iana_name_or_none(tz_env)
+        if name:
+            return name
+        if not tz_env.startswith("/"):
+            return None
+        name = zone_from_zoneinfo_path(tz_env)
+        if name or tz_env != "/etc/localtime":
+            return name
+        # TZ names /etc/localtime itself: the sources below describe it too.
+    # 2. /etc/localtime symlink — reliable on systemd-managed hosts.
+    name = zone_from_zoneinfo_path("/etc/localtime")
+    if name:
+        return name
+    # 3. /etc/timezone — may be stale in minimal container images.
     try:
         with open("/etc/timezone") as f:
-            cand = _zone_name_or_none(f.read().strip())
-            if cand:
-                return cand
-    except OSError:
+            name = iana_name_or_none(f.read())
+            if name:
+                return name
+    except Exception:
         pass
     return None
+
+
+@functools.lru_cache(maxsize=1)
+def _host_tz_name() -> Optional[str]:
+    """host_iana_timezone(), cached for the life of the process: the host
+    zone cannot change under a running worker (a changed ``/etc/localtime``
+    reaches it only on restart, like every other process on the box), and
+    without the cache every dashboard request re-read those files several
+    times.
+    """
+    return host_iana_timezone()
 
 
 def analytics_tz_name() -> Optional[str]:
@@ -147,12 +210,29 @@ def format_in_analytics_tz(dt: Optional[datetime], tz: tzinfo) -> str:
 # ---------------------------------------------------------------------------
 # Audit-history / error-log listings
 # ---------------------------------------------------------------------------
+# The calendar days a filter may name: the same bounds the analytics
+# dashboard's date parameters accept (routers/analytics._MIN_REQUEST_DATE /
+# _MAX_REQUEST_DATE). ``date`` itself spans 0001-01-01 .. 9999-12-31, but
+# :func:`day_range_filters` steps a day past ``until`` and converts each local
+# midnight to UTC, and at either end of that span the arithmetic overflows
+# (``date.max + timedelta(days=1)``, or 0001-01-01 00:00 in a zone east of
+# UTC) — an OverflowError FastAPI reported as a 500, or a 422 from the
+# conversion helper, rather than the caller's "invalid date". A year past
+# these bounds is a typo, not a real filter.
+MIN_FILTER_DAY = date(1900, 1, 1)
+MAX_FILTER_DAY = date(9998, 12, 31)
+
+
 def parse_day(value: str, error_code: str) -> date:
-    """A ``YYYY-MM-DD`` filter value; 400 with ``error_code`` otherwise."""
+    """A ``YYYY-MM-DD`` filter value within ``MIN_FILTER_DAY`` ..
+    ``MAX_FILTER_DAY``; 400 with ``error_code`` otherwise."""
     try:
-        return date.fromisoformat(value)
+        day = date.fromisoformat(value)
     except ValueError:
         raise api_error(400, error_code, value=value)
+    if not MIN_FILTER_DAY <= day <= MAX_FILTER_DAY:
+        raise api_error(400, error_code, value=value)
+    return day
 
 
 def day_range_filters(column, since: Optional[str], until: Optional[str], error_code: str) -> list:
@@ -180,7 +260,7 @@ def day_range_filters(column, since: Optional[str], until: Optional[str], error_
 
 
 def iter_newest_first(model, filters: list, limit: int, to_row: Callable, *,
-                      batch_size: int = 1000) -> Iterator[list]:
+                      batch_size: int = 1000, options: tuple = ()) -> Iterator[list]:
     """Rows of ``model`` matching ``filters``, newest id first, up to ``limit``,
     converted with ``to_row`` — read in id-keyset batches, each in its own
     short session.
@@ -193,12 +273,17 @@ def iter_newest_first(model, filters: list, limit: int, to_row: Callable, *,
     that keeps the pool from running dry. Batching by ``id < last`` releases
     both between batches and still returns one consistent ordering: rows
     written during the export have higher ids and are never picked up.
+
+    ``options`` are loader options applied to each batch's select — e.g. a
+    ``defer()`` of a large column ``to_row`` does not read.
     """
     remaining = limit
     before: Optional[int] = None
     while remaining > 0:
         n = min(batch_size, remaining)
         stmt = select(model).where(*filters)
+        if options:
+            stmt = stmt.options(*options)
         if before is not None:
             stmt = stmt.where(model.id < before)
         stmt = stmt.order_by(model.id.desc()).limit(n)

@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
-import { Button, FormField, Input, Panel } from '../components/ui'
+import { Button, FormField, Input, LinkButton, Panel } from '../components/ui'
 import LanguageSwitcher from '../components/LanguageSwitcher'
 import { useI18n } from '../lib/i18n'
 import { sanitizeNext } from '../lib/nextPath'
@@ -28,9 +28,15 @@ export default function Login() {
   const [attempt, setAttempt] = useState(0)
 
   useEffect(() => {
+    // Ignore the answer once this effect has been superseded (a retry, a
+    // changed ?next=, or unmount): a slow earlier probe settling after a
+    // newer one must not overwrite its result, flip stateFailed back on, or
+    // navigate away from a page the visitor already left.
+    let cancelled = false
     setStateFailed(false)
     getAuthState()
       .then(s => {
+        if (cancelled) return
         if (s.authenticated) {
           nav(next, { replace: true })
           return
@@ -39,7 +45,8 @@ export default function Login() {
         setCustomMessage(s.login_message || '')
         setCustomButtonLabel(s.login_button_label || '')
       })
-      .catch(() => setStateFailed(true))
+      .catch(() => { if (!cancelled) setStateFailed(true) })
+    return () => { cancelled = true }
   }, [nav, next, attempt])
 
   async function onSubmit(e: React.FormEvent) {
@@ -104,11 +111,15 @@ export default function Login() {
             <div style={{ fontSize: 'var(--font-size-sm)' }}>{customMessage || t('login.noneHint')}</div>
           )}
 
-          {mode === 'basic' && (
+          {/* Every mode-specific block below is gated on !stateFailed too: a
+              re-probe that fails leaves the previously fetched `mode` in
+              place, and without the guard the error + retry button would be
+              rendered alongside a stale sign-in form. */}
+          {!stateFailed && mode === 'basic' && (
             <div style={{ fontSize: 'var(--font-size-sm)' }}>{customMessage || t('login.basicHint')}</div>
           )}
 
-          {mode === 'ldap' && (
+          {!stateFailed && mode === 'ldap' && (
             <form onSubmit={onSubmit} style={{ display: 'grid', gap: 'var(--space-3)' }}>
               {customMessage && (
                 <div style={{ fontSize: 'var(--font-size-sm)', opacity: 0.8 }}>{customMessage}</div>
@@ -148,16 +159,24 @@ export default function Login() {
             </form>
           )}
 
-          {mode === 'google_oauth' && (
+          {!stateFailed && mode === 'google_oauth' && (
             <div style={{ display: 'grid', gap: 'var(--space-3)' }}>
               <div style={{ fontSize: 'var(--font-size-sm)', opacity: 0.8 }}>
                 {customMessage || t('login.googleHint')}
               </div>
-              <a href={next === '/' ? '/api/auth/oauth/start' : `/api/auth/oauth/start?next=${encodeURIComponent(next)}`} style={{ textDecoration: 'none' }}>
-                <Button type="button" variant="primary" fullWidth>
-                  {customButtonLabel || t('login.signInWithGoogle')}
-                </Button>
-              </a>
+              {/* A single link styled as a button, not a <button> nested in an
+                  <a> (invalid interactive nesting; Space on the focused
+                  button did nothing). reloadDocument makes it a full page
+                  load: the OAuth start URL is a server route, not an SPA one. */}
+              <LinkButton
+                to={next === '/' ? '/api/auth/oauth/start' : `/api/auth/oauth/start?next=${encodeURIComponent(next)}`}
+                reloadDocument
+                variant="primary"
+                fullWidth
+                style={{ textDecoration: 'none' }}
+              >
+                {customButtonLabel || t('login.signInWithGoogle')}
+              </LinkButton>
             </div>
           )}
         </Panel>

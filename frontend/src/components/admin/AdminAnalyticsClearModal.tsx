@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom'
 import { useDialogFocus } from '../../hooks/useDialogFocus'
 import type { AnalyticsClearScope } from '../../lib/api'
 import { useI18n } from '../../lib/i18n'
+import { FULL_VIEWPORT_FIXED } from '../../lib/viewportBox'
 
 type Props = {
   onCancel: () => void
@@ -136,8 +137,7 @@ export default function AdminAnalyticsClearModal({ onCancel, onSubmit, tzLabel =
       aria-describedby={phase === 'confirm' ? WARNING_ID : undefined}
       onClick={requestCancel}
       style={{
-        position: 'fixed',
-        inset: 0,
+        ...FULL_VIEWPORT_FIXED,
         background: 'rgba(0, 0, 0, 0.45)',
         zIndex: 'var(--z-modal, 1000)' as unknown as number,
         display: 'flex',

@@ -285,3 +285,36 @@ def test_open_file_response_reads_its_own_fd_and_closes_it(tmp_path: Path) -> No
     assert b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body") == b"archive bytes"
     with pytest.raises(OSError):
         os.fstat(fd)
+
+
+def test_open_file_response_never_sent_still_closes_its_fd(tmp_path: Path) -> None:
+    """A response the server never sends (client gone between the handler's
+    return and the send, another response substituted) does not leak its
+    descriptor: it is closed when the response is collected — once only, so
+    a sent response's number, possibly reused since, is never closed again."""
+    import gc
+
+    from wsi_app import dzi
+
+    p = tmp_path / "a.szi"
+    p.write_bytes(b"archive bytes")
+    fd = os.open(p, os.O_RDONLY)
+    response = dzi._OpenFileResponse(fd, os.fstat(fd), media_type="application/zip")
+    del response
+    gc.collect()
+    with pytest.raises(OSError):
+        os.fstat(fd)
+
+    # Closed once by the send; collecting it afterwards must leave alone the
+    # descriptor that has meanwhile taken the same number.
+    fd = os.open(p, os.O_RDONLY)
+    response = dzi._OpenFileResponse(fd, os.fstat(fd), media_type="application/zip")
+    response._close_fd()
+    # POSIX hands out the lowest free number, i.e. the one just closed.
+    reused = os.open(p, os.O_RDONLY)
+    try:
+        del response
+        gc.collect()
+        os.fstat(reused)  # still open
+    finally:
+        os.close(reused)

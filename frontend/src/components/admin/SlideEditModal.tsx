@@ -40,6 +40,7 @@ import OptionMultiSelect from './OptionMultiSelect'
 import { LockFieldset } from '../ui'
 import AdjustSliderRow from '../AdjustSliderRow'
 import SlideCredit from '../SlideCredit'
+import { fixedRight, FULL_VIEWPORT_FIXED } from '../../lib/viewportBox'
 import { CREDIT_TEXT_MAX_LEN, SLIDE_LICENSES, SOURCE_URL_MAX_LEN, licenseLabel, safeSourceUrl } from '../../lib/slideCredit'
 import {
   IMAGE_ADJUST_RANGES,
@@ -613,8 +614,7 @@ export default function SlideEditModal({ slide, metaOptions, customMetaKeys, glo
       aria-labelledby="slide-edit-title"
       onClick={requestClose}
       style={{
-        position: 'fixed',
-        inset: 0,
+        ...FULL_VIEWPORT_FIXED,
         background: 'rgba(0, 0, 0, 0.45)',
         zIndex: 'var(--z-modal, 1000)' as unknown as number,
         display: 'flex',
@@ -1124,8 +1124,7 @@ export default function SlideEditModal({ slide, metaOptions, customMetaKeys, glo
         aria-label={zoomedImage.label}
         onClick={(e) => { e.stopPropagation(); setZoomedImage(null) }}
         style={{
-          position: 'fixed',
-          inset: 0,
+          ...FULL_VIEWPORT_FIXED,
           background: 'rgba(0, 0, 0, 0.85)',
           zIndex: 'calc(var(--z-modal, 1000) + 10)' as unknown as number,
           display: 'flex',
@@ -1138,7 +1137,9 @@ export default function SlideEditModal({ slide, metaOptions, customMetaKeys, glo
         <button
           type="button"
           onClick={(e) => { e.stopPropagation(); setZoomedImage(null) }}
-          style={{ position: 'fixed', top: 12, right: 12, zIndex: 1 }}
+          // Fixed (not absolute) so it stays put while a large image scrolls
+          // the overlay; anchored to the measured viewport's right edge.
+          style={{ position: 'fixed', top: 12, right: fixedRight(12), zIndex: 1 }}
         >
           {t('adminDash.associatedImageZoomClose')}
         </button>

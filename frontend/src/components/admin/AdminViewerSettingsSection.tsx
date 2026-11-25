@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useState, type MutableRefObject } from 'react'
 import {
   INDEX_TOURS_PER_SLIDE_MAX,
   INDEX_TOURS_PER_SLIDE_MIN,
@@ -54,6 +54,12 @@ interface Props {
   // and no hint that those aren't what the server actually has.
   loadError: boolean
   onRetryLoad: () => void
+  // Passed through to AdminSeasonalBackgroundsSection, whose per-slot edits
+  // are local state (unlike `form`) and are lost when this tab unmounts: it
+  // reports them so the dashboard can confirm before leaving, and registers
+  // its navigation guard's exit in leaveRef (see AdminNetworkAuthSection).
+  onSeasonalDirtyChange?: (dirty: boolean) => void
+  leaveRef?: MutableRefObject<((go: () => void) => void) | null>
 }
 
 // Parse a numeric field's typed text into its clamped value and the text to
@@ -77,6 +83,7 @@ export default function AdminViewerSettingsSection({
   onSavedSiteTitle,
   onSavedOverlays,
   loadError, onRetryLoad,
+  onSeasonalDirtyChange, leaveRef,
 }: Props) {
   const { t } = useI18n()
   const { values: v, set, savedSnapshot, setSavedSnapshot } = form
@@ -720,7 +727,7 @@ export default function AdminViewerSettingsSection({
           </div>
         </LockFieldset>
 
-        <AdminSeasonalBackgroundsSection />
+        <AdminSeasonalBackgroundsSection onDirtyChange={onSeasonalDirtyChange} leaveRef={leaveRef} />
 
         <LockFieldset locked={notLoaded} style={{ display: 'grid', gap: 10 }}>
           {/* viewer — favicon + max digital zoom */}

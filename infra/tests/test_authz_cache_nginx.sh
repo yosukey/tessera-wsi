@@ -92,6 +92,7 @@ import http.server, re, threading
 from http.cookies import SimpleCookie
 from urllib.parse import urlsplit, parse_qs
 HITS = {}
+CONTENT = {}
 LAST_URI = {"v": ""}
 LOCK = threading.Lock()
 DZI = re.compile(r"/dzi/([A-Za-z0-9_-]{1,64})(?:_files/.*|\.dzi|\.szi)")
@@ -108,12 +109,25 @@ class H(http.server.BaseHTTPRequestHandler):
             return self.reply(str(HITS.get(c, 0)).encode())
         if u.path == "/__last_uri":
             return self.reply(LAST_URI["v"].encode())
+        if u.path == "/__content":
+            p = parse_qs(u.query).get("p", [""])[0]
+            return self.reply(str(CONTENT.get(p, 0)).encode())
+        # A Cloudflare Access assertion, as nginx forwards it (only from a
+        # trusted hop). "good*" stands for one the app verifies; anything else
+        # for one that fails. "good-carry" is an Access user the app also hands
+        # a parent-domain session cookie (WSI_SESSION_COOKIE_DOMAIN), on every
+        # response, as app_auth.maybe_carry_cf_session does until the browser
+        # sends it back.
+        jwt = self.headers.get("Cf-Access-Jwt-Assertion", "")
+        carry = jwt == "good-carry"
         if u.path == "/api/edge-authz":
             jar = SimpleCookie(self.headers.get("Cookie", ""))
             c = jar["wsi_session"].value if "wsi_session" in jar else ""
             orig = self.headers.get("X-Original-URI", "")
             opath = orig.split("?", 1)[0]
             with LOCK:
+                if jwt:
+                    HITS["jwt:" + jwt] = HITS.get("jwt:" + jwt, 0) + 1
                 HITS[c] = HITS.get(c, 0) + 1
                 HITS[c + " " + opath] = HITS.get(c + " " + opath, 0) + 1
                 LAST_URI["v"] = orig
@@ -130,16 +144,22 @@ class H(http.server.BaseHTTPRequestHandler):
             plain = self.headers.get("X-Forwarded-Proto", "") == "http"
             by_host = c == "" and host.startswith("192.168.")
             by_proto = c == "" and plain and self.headers.get("Cf-Connecting-IP", "") == "198.51.100.77"
-            status = 204 if (c == "good" or lan or by_host or by_proto) else 401
+            status = 204 if (c == "good" or jwt.startswith("good") or lan or by_host or by_proto) else 401
             if status == 204 and opath.startswith("/dzi/"):
                 m = DZI.fullmatch(opath)
                 if m is None or m.group(1) == "draft":
                     status = 403
             self.send_response(status)
+            if carry:
+                self.send_header("Set-Cookie", "wsi_session=carried; Path=/")
             self.send_header("Content-Length", "0")
             self.end_headers(); return
+        with LOCK:
+            CONTENT[u.path] = CONTENT.get(u.path, 0) + 1
         body = b"\xff\xd8\xff\xd9"
         self.send_response(200)
+        if carry:
+            self.send_header("Set-Cookie", "wsi_session=carried; Path=/")
         self.send_header("Content-Type", "image/jpeg")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers(); self.wfile.write(body)
@@ -171,7 +191,10 @@ fi
 real_geo() { awk -v v="$1" '$1 == "geo" && $2 == v { c = 1 } c { print } c && /^}/ { exit }' "${SITE_CONF}"; }
 # ... and who the client is: a trusted hop's Cf-Connecting-IP, else its address.
 CLIENT_MAPS="$(real_map '$wsi_cf_connecting_ip')
-$(real_map '$wsi_rl_key')"
+$(real_map '$wsi_rl_key')
+$(real_map '$wsi_cf_access_jwt')"
+grep -qE '[$]wsi_cf_access_jwt [{]' <<<"${CLIENT_MAPS}" \
+    || { echo "FAIL - could not extract \$wsi_cf_access_jwt from ${SITE_CONF}"; exit 1; }
 XFP_MAPS="$(real_geo '$cf_hop_trusted')
 $(real_map '$wsi_cf_edge_scheme')
 $(real_map '$wsi_cf_edge_scheme_trusted')
@@ -213,6 +236,7 @@ ${AUTHZ_ZONE}
     limit_req_zone \$binary_remote_addr zone=wsi_sync_ws:1m     rate=600r/m;
     limit_req_zone \$binary_remote_addr zone=wsi_slide_detail:1m rate=600r/m;
     limit_req_zone \$binary_remote_addr zone=wsi_page_reads:1m rate=600r/m;
+    limit_req_zone \$binary_remote_addr zone=wsi_branding:1m rate=600r/m;
     limit_req_zone \$binary_remote_addr zone=wsi_sync_peek:1m rate=600r/m;
     limit_req_zone \$binary_remote_addr zone=wsi_spa:1m         rate=600r/m;
     limit_req_zone \$wsi_dzi_uncached_key  zone=wsi_dzi_uncached:1m rate=600r/m;
@@ -221,7 +245,6 @@ ${AUTHZ_ZONE}
     map \$http_upgrade \$connection_upgrade { default upgrade; "" close; }
 ${XFP_MAPS}
 ${CLIENT_MAPS}
-    map \$remote_addr            \$wsi_cf_access_jwt      { default ""; }
     map \$http_authorization \$wsi_auth_nocache { default 1; "" ""; "~*^Basic\s" ""; }
     map \$http_authorization \$wsi_authz_nocache { default 1; "" ""; }
 ${DZI_MAPS}
@@ -404,6 +427,135 @@ code="$(curl -s -o /dev/null -w '%{http_code}' -m 5 "${BASE}/thumbs/dup.jpg")"
 code="$(curl -s -o /dev/null -w '%{http_code}' -m 5 -H 'Cookie: wsi_session=; wsi_session=good' "${BASE}/thumbs/dup.jpg")"
 [[ "$code" == "200" ]] && pass "...while the same duplicate header is served from its own verdict" \
                        || fail "repeat duplicate-cookie request returned $code, expected 200"
+
+# 6. Cloudflare Access (Path A): every request carries an assertion. It must
+#    neither keep the content out of the shared cache (under Access SSO every
+#    tile would be rendered for every viewer) nor let a cached tile or verdict
+#    reach a client the app would not admit. The client here is 127.0.0.1, the
+#    trusted hop cloudflared connects from, so the real $wsi_cf_access_jwt map
+#    passes the header on.
+jwt_get() {   # jwt_get JWT PATH [curl args...] -> "<status> <X-Cache-Status>"
+    local jwt="$1" path="$2"; shift 2
+    curl -s -o /dev/null -D - -m 5 ${jwt:+-H "Cf-Access-Jwt-Assertion: ${jwt}"} "$@" "${BASE}${path}" \
+        | awk 'NR == 1 { s = $2 } tolower($1) == "x-cache-status:" { c = $2 } END { gsub(/\r/, "", c); print s, c }'
+}
+content() { curl -s -m 5 "http://127.0.0.1:${UP_PORT}/__content?p=$1"; }
+CF_TILE="/dzi/cfslide_files/12/1_1.jpeg"
+
+# 6a. An Access user's tile is stored and served from the shared cache, and the
+#     verdict for its assertion is cached like a cookie's (one probe).
+r1="$(jwt_get good-A "${CF_TILE}?v=1")"; r2="$(jwt_get good-A "${CF_TILE}?v=1")"; r3="$(jwt_get good-A "${CF_TILE}?v=1")"
+if [[ "$r1" == "200 MISS" && "$r2" == "200 HIT" && "$r3" == "200 HIT" && "$(content "${CF_TILE}")" == "1" ]]; then
+    pass "Access user: tile rendered once, then served from the shared cache (${r1} / ${r2} / ${r3})"
+else
+    fail "Access user's tile: '${r1}' / '${r2}' / '${r3}', $(content "${CF_TILE}") render(s); expected MISS, HIT, HIT and 1 (does the assertion still bypass the cache?)"
+fi
+n="$(probes 'jwt:good-A')"
+[[ "$n" == "1" ]] && pass "Access user: 3 tile requests -> ${n} edge-authz probe (verdict cached per assertion)" \
+                  || fail "Access user made ${n} edge-authz probes for 3 tiles, expected 1"
+
+# 6b. The shared entry is shared both ways: a tile a cookie user had rendered is
+#     a HIT for an Access user (and another Access user reuses good-A's tile).
+CF_TILE2="/dzi/cfslide_files/12/2_2.jpeg"
+get_good "${CF_TILE2}?v=1" >/dev/null
+r="$(jwt_get good-B "${CF_TILE2}?v=1")"
+[[ "$r" == "200 HIT" && "$(content "${CF_TILE2}")" == "1" ]] \
+    && pass "a tile rendered for a cookie user is a HIT for an Access user" \
+    || fail "Access user after a cookie user: '${r}', $(content "${CF_TILE2}") render(s), expected '200 HIT' and 1"
+r="$(jwt_get good-B "${CF_TILE}?v=1")"
+[[ "$r" == "200 HIT" ]] && pass "...and another Access user reuses the first one's tile" \
+                        || fail "second Access user on a cached tile: '${r}', expected '200 HIT'"
+
+# 6c. The gate still runs before every HIT: a client with neither a cookie nor
+#     an assertion, at the same address, is refused the cached tile; so is one
+#     whose assertion the app rejects (every time: the denial is not cached),
+#     and an assertion from an untrusted hop is not passed on at all.
+r="$(jwt_get '' "${CF_TILE}?v=1")"
+[[ "${r%% *}" == "401" ]] && pass "anonymous client is refused the tile an Access user cached (401)" \
+                         || fail "anonymous client on a tile cached for an Access user: '${r}', expected 401"
+for i in 1 2 3; do
+    r="$(jwt_get bad-assertion "${CF_TILE}?v=1")"
+    [[ "${r%% *}" == "401" ]] || fail "rejected assertion request $i: '${r}', expected 401"
+done
+n="$(probes 'jwt:bad-assertion')"
+[[ "$n" == "3" ]] && pass "a rejected assertion is re-checked every time (3 probes) and refused" \
+                  || fail "rejected assertion made ${n} probes for 3 requests, expected 3 (401 cached?)"
+r="$(jwt_get good-A "${CF_TILE}?v=1" --interface 127.0.0.2)"
+[[ "${r%% *}" == "401" ]] && pass "an assertion from an untrusted hop is ignored (401)" \
+                         || fail "assertion from 127.0.0.2: '${r}', expected 401"
+
+# 6d. The verdict follows the assertion: an Access user's cached allow is not
+#     replayed for a draft slide (per-slide key) ...
+r="$(jwt_get good-A "/dzi/draft_files/1/0_0.jpeg?v=1")"
+[[ "${r%% *}" == "403" ]] && pass "Access user is refused a draft slide's tile (403)" \
+                         || fail "Access user on a draft tile: '${r}', expected 403"
+# ... and the stored key carries the assertion.
+sleep 0.5
+if grep -rqaE '^KEY: authz\|127\.0\.0\.1\|good-A\|.*\|dzi:cfslide$' "${WORK}/authz" 2>/dev/null; then
+    pass "authz cache key carries the assertion (authz|127.0.0.1|good-A|…|dzi:cfslide)"
+else
+    fail "no authz key with the assertion in ${WORK}/authz: $(grep -rhaE '^KEY: ' "${WORK}/authz" | tr '\n' ' ')"
+fi
+
+# 6e. A response that sets a cookie (the app's parent-domain session for an
+#     Access user) is passed to that user but never stored: neither its bytes
+#     nor its Set-Cookie can reach anyone else. Nor is its 204 verdict stored.
+CF_TILE3="/dzi/cfslide_files/12/3_3.jpeg"
+sc="$(curl -s -o /dev/null -D - -m 5 -H 'Cf-Access-Jwt-Assertion: good-carry' "${BASE}${CF_TILE3}?v=1" | grep -ci '^set-cookie:')"
+[[ "$sc" == "1" ]] && pass "the Access user gets the app's Set-Cookie" \
+                   || fail "Set-Cookie headers on the carry response: ${sc}, expected 1"
+hdrs="$(curl -s -o /dev/null -D - -m 5 -H 'Cf-Access-Jwt-Assertion: good-A' "${BASE}${CF_TILE3}?v=1")"
+if [[ "$(content "${CF_TILE3}")" == "2" ]] && ! grep -qi '^set-cookie:' <<<"${hdrs}"; then
+    pass "a response with Set-Cookie is not stored: the next user is rendered afresh, without the cookie"
+else
+    fail "after a Set-Cookie response: $(content "${CF_TILE3}") render(s) (expected 2), headers: $(tr -d '\r' <<<"${hdrs}" | tr '\n' ' ')"
+fi
+r="$(jwt_get good-A "${CF_TILE3}?v=1")"
+[[ "$r" == "200 HIT" ]] && pass "...whose own response is then cached as usual" \
+                        || fail "third request for the tile: '${r}', expected '200 HIT'"
+n="$(probes 'jwt:good-carry')"
+jwt_get good-carry "${CF_TILE3}?v=1" >/dev/null
+[[ "$(probes 'jwt:good-carry')" == "$((n + 1))" ]] \
+    && pass "an allow verdict that carries Set-Cookie is not cached" \
+    || fail "verdict with Set-Cookie was replayed from the cache"
+
+# 6f. The same for /thumbs/ (and, by the same lines, /assets/).
+r1="$(jwt_get good-A "/thumbs/cf.jpg?v=1")"; r2="$(jwt_get good-B "/thumbs/cf.jpg?v=1")"
+[[ "$r1" == "200 MISS" && "$r2" == "200 HIT" ]] \
+    && pass "Access users share cached thumbnails (${r1} / ${r2})" \
+    || fail "Access users on /thumbs/: '${r1}' / '${r2}', expected '200 MISS' / '200 HIT'"
+r="$(jwt_get '' "/thumbs/cf.jpg?v=1")"
+[[ "${r%% *}" == "401" ]] && pass "...and an anonymous client is refused it (401)" \
+                         || fail "anonymous client on a thumbnail cached for Access users: '${r}', expected 401"
+
+# 7. A realistically large Access assertion. Behind Cloudflare Access the
+#    browser sends the assertion twice -- once as Cf-Access-Jwt-Assertion and
+#    once inside the Cookie header as CF_Authorization (next to the session
+#    cookie) -- and the verdict key carries both. A real assertion is easily
+#    1.5-3 KB, so the key outgrows nginx's default proxy_buffer_size (4k),
+#    which also has to hold the cache file header the key is written into:
+#    nginx then logs "proxy_buffer_size ... is not enough for cache key" and
+#    stores nothing, so every tile of every Access user costs a live app
+#    request. The /_wsi_authz location must raise the buffer.
+BIG_JWT="good$(python3 -c 'import base64, os; print(base64.urlsafe_b64encode(os.urandom(1500)).decode().rstrip("="))')"
+BIG_SESSION="$(python3 -c 'import base64, os; print(base64.urlsafe_b64encode(os.urandom(150)).decode().rstrip("="))')"
+BIG_COOKIE="CF_Authorization=${BIG_JWT}; wsi_session=${BIG_SESSION}"
+big_codes=""
+for i in 1 2 3; do
+    big_codes+="$(curl -s -o /dev/null -w '%{http_code}' -m 5 -H "Cf-Access-Jwt-Assertion: ${BIG_JWT}" \
+        -b "${BIG_COOKIE}" "${BASE}/dzi/bigjwt_files/12/0_0.jpeg?v=1") "
+done
+[[ "${big_codes}" == "200 200 200 " ]] \
+    && pass "a ${#BIG_JWT}-byte assertion (header + CF_Authorization cookie) is admitted" \
+    || fail "large-assertion tile requests returned '${big_codes}', expected 200 x3"
+n="$(probes "jwt:${BIG_JWT}")"
+[[ "$n" == "1" ]] && pass "large assertion: 3 tile requests -> ${n} edge-authz probe (verdict cached)" \
+                  || fail "large assertion made ${n} edge-authz probes for 3 tiles, expected 1 (cache key too big for proxy_buffer_size?)"
+if grep -q 'is not enough for cache key' "${WORK}/error.log" 2>/dev/null; then
+    fail "nginx logged: $(grep -m1 'is not enough for cache key' "${WORK}/error.log")"
+else
+    pass "no 'proxy_buffer_size ... not enough for cache key' in the error log"
+fi
 
 printf -- '--------------------------------------------------------------\n'
 if [[ "$FAILED" -eq 0 ]]; then

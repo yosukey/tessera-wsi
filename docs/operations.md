@@ -184,13 +184,34 @@ the old release restarted, which applies it. `WSI_ALLOW_PENDING_RESTORE=1`
 skips the check. The start script also refuses a request made under another
 release than the one starting (`"stage": "version_changed"`).
 
-Run `update.sh` (and `sync-from.sh`) from **your own clone** (`cd ~/wsi && sudo
-bash infra/update.sh`), never from `/opt/wsi`: both run as root and source
-helpers from their own tree, so they refuse a tree the service user owns or
-could rewrite (anything inside `/opt/wsi`; the clone, its `infra/` or
-`infra/lib/` directory, the script or `infra/lib/wsi-common.sh` being
-world-writable; or any of them owned by an account that is neither root nor
-the user who ran `sudo`). An `origin` URL that is
+Run `install.sh`, `update.sh` and `sync-from.sh` from **your own clone**
+(`cd ~/wsi && sudo bash infra/update.sh`), never from `/opt/wsi`: all three run
+as root and source helpers from their own tree (and `install.sh` installs files
+from it into places root reads), so before reading anything from the tree they
+refuse one the service user owns or could rewrite: anything inside `/opt/wsi`,
+or a checked path that is world-writable or owned by an account that is
+neither root nor the user who ran `sudo`. `install.sh` and `update.sh` check
+the clone, its `infra/` directory, the script itself, `infra/wsi.env.example`,
+and the `infra/lib/`, `infra/systemd/` and `infra/nginx/` directories and
+every file in them (`update.sh` also checks `infra/install.sh`, so a tree that
+`install.sh` would refuse is refused before anything is stopped — as long as
+the files the release checkout rewrites come out owned the same way, which
+they do when you run it with plain `sudo`; a `GIT_AS_USER` other than the
+clone's owner can still make `install.sh` refuse later, and the update rolls
+back);
+`sync-from.sh` checks the clone, `infra/`, `infra/lib/` and the helpers it
+runs. A refused run changes nothing and names the path, e.g. on a fresh
+install:
+
+```
+Error: refusing to run infra/install.sh: /home/you/wsi/infra/nginx/wsi.conf is writable by every user.
+```
+
+(or `... is owned by <user>, neither root nor you`). Fix the permissions in
+your clone and run it again: `chmod o-w <path>` for a world-writable path
+(`chmod -R o-w ~/wsi` for the whole clone, as a lax umask or an archive
+extraction tends to leave many), and `sudo chown -R "$USER": ~/wsi` for files
+owned by another account. An `origin` URL that is
 `http://`, `git://` or `ftp://` gets a warning (from `update.sh`, and from
 `install.sh` when it checks out a release itself): a release fetched over it can be
 rewritten by anything on the path, and its `install.sh` runs as root. Use
@@ -2840,7 +2861,9 @@ gate (`NetworkSettings.ip_filter_*`, `main.ip_filter_middleware`):
 - Loopback (`127.0.0.1`, `::1`) is always allowed. A save whose rules would
   block your own current address asks first, and goes through only if you
   confirm (the dashboard evaluates the rules exactly as the server does, IPv4
-  and IPv6 addresses and CIDRs alike; should the server still find a lockout
+  and IPv6 addresses and CIDRs alike, an IPv4-mapped address or rule such as
+  `::ffff:192.0.2.7` or `::ffff:192.0.2.0/120` counting as the IPv4 one it
+  carries; should the server still find a lockout
   the dashboard missed — say your address changed since the page loaded — it
   asks again with the address the server saw). Declining saves nothing; put
   an allow rule for your address above the rule that blocks it instead.
@@ -4023,12 +4046,12 @@ generation `?v=` — never the session cookie; every request, HIT or MISS, is
 first authorized by an `auth_request` subrequest to `/api/edge-authz`, which
 checks app access and, for `/dzi/`, that the slide is still published, so a
 HIT cannot bypass either). Clearing the cache empties both zones, so it affects
-tiles, thumbnails and assets alike. Two kinds of request neither read nor fill
-the shared caches:
-one carrying a staff bearer (the dashboard's draft preview) and one carrying
-a Cloudflare Access assertion (Path A in
-[Ingress paths](#ingress-paths-a--b--c)) — so behind CF Access SSO every tile
-is rendered by the app. The `/api/edge-authz` verdicts themselves are
+tiles, thumbnails and assets alike. A request carrying a staff bearer (the
+dashboard's draft preview) neither reads nor fills the shared caches; one
+carrying a Cloudflare Access assertion (Path A in
+[Ingress paths](#ingress-paths-a--b--c)) shares them like any signed-in
+viewer's, since the edge check runs before every HIT. The `/api/edge-authz`
+probe is for nginx only (from outside, nginx answers it with 404); its verdicts themselves are
 kept in a separate, small `wsi_authz_cache` zone (`/var/cache/nginx/wsi_authz`,
 60 s per allowed client and slide, entries dropped after 2 minutes unused,
 denials never stored), so requests carrying made-up session cookies cannot

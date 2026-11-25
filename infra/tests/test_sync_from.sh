@@ -535,6 +535,28 @@ run_sync --rollback --yes
    && [[ "$(stat -c %a "$CASE/etc/wsi.env")" == "600" ]] \
     && pass "--rollback after --all puts the database and wsi.env back" || { fail "--rollback after --all (rc $RC)"; cat "$OUT"; }
 
+# wsi.env as a symlink into a config-managed directory: --all writes through
+# it, and --rollback puts the content back into the file it points to, with
+# that file's mode -- the link's own lstat mode is 0777, and a rename over the
+# link would turn it into a world-readable regular file holding the secrets.
+setup migration-envlink
+mkdir -p "$CASE/managed"
+mv "$CASE/etc/wsi.env" "$CASE/managed/wsi.env"
+ln -s "$CASE/managed/wsi.env" "$CASE/etc/wsi.env"
+run_sync --all --yes backup-src
+[[ "$RC" -eq 0 && -L "$CASE/etc/wsi.env" ]] && grep -q '^ANALYTICS_HASH_SALT=source-salt$' "$CASE/managed/wsi.env" \
+    && pass "--all through a symlinked wsi.env writes the file it points to" \
+    || { fail "--all through a symlinked wsi.env (rc $RC)"; cat "$OUT"; }
+run_sync --rollback --yes
+[[ "$RC" -eq 0 && -L "$CASE/etc/wsi.env" \
+   && "$(readlink "$CASE/etc/wsi.env")" == "$CASE/managed/wsi.env" \
+   && "$(stat -c %a "$CASE/managed/wsi.env")" == "600" \
+   && ! -e "$CASE/managed/wsi.env.sync-tmp" && ! -e "$CASE/etc/wsi.env.sync-tmp" ]] \
+   && grep -q '^ANALYTICS_HASH_SALT=backup-salt$' "$CASE/managed/wsi.env" \
+   && grep -q '^WSI_MFA_KEY=backup-mfa-key$' "$CASE/managed/wsi.env" \
+    && pass "--rollback after --all keeps a symlinked wsi.env a link, its target 0600 with the old secrets" \
+    || { fail "--rollback through a symlinked wsi.env (rc $RC): $(ls -l "$CASE/etc/wsi.env" "$CASE/managed/wsi.env" 2>&1)"; cat "$OUT"; }
+
 # Without access to the source's wsi.env the move still goes ahead, and says
 # how to copy the salt by hand.
 setup migration-nosecrets

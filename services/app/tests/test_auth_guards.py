@@ -1060,3 +1060,249 @@ def test_stale_basic_credential_does_not_lock_out_the_ip(
             assert codes == [401, 401, 401, 429]
     finally:
         _set_mode(db_session, "none")
+
+
+# --------------------------------------------------------------------------
+# Dot segments never ride an auth-bypass prefix
+# --------------------------------------------------------------------------
+def test_dot_segment_path_is_not_a_bypass():
+    """uvicorn hands the path over unresolved and nginx's ``proxy_pass``
+    without a URI forwards it verbatim, so "/api/auth/../../index.html"
+    reaches the app as typed. The "/api/auth/" prefix must not exempt it."""
+    assert _app_auth.is_bypass_path("/api/auth/state")
+    for path in (
+        "/api/auth/../../index.html",
+        "/api/auth/../../static-assets/index-abc.js",
+        "/api/auth/./../admin/slides",
+        "/api/auth/..",
+    ):
+        assert not _app_auth.is_bypass_path(path), path
+
+
+def test_basic_mode_gates_a_dot_segment_bypass_attempt(client, db_session):
+    """End to end: under basic mode the request is challenged instead of
+    being served from the build. (%2e%2e, because the test client resolves
+    literal dot segments before sending; uvicorn decodes both alike.)"""
+    _set_mode(db_session, "basic")
+    try:
+        r = client.get("/api/auth/%2e%2e/%2e%2e/index.html")
+        assert r.status_code == 401, r.text
+        # The genuine bypass path still bypasses.
+        assert client.get("/api/auth/state").status_code == 200
+    finally:
+        _set_mode(db_session, "none")
+
+
+# --------------------------------------------------------------------------
+# WSI_PUBLIC_BASE_URL on a non-standard port
+# --------------------------------------------------------------------------
+def test_oauth_redirect_uri_pins_a_base_url_with_a_port(monkeypatch):
+    """nginx forwards ``Host: $host`` without the port, so a base URL on
+    :8443 must still be recognised as the request's own host."""
+    public = "https://wsi.example.org:8443"
+    pinned = "https://wsi.example.org:8443/api/auth/oauth/callback"
+    assert _redirect_uri_for(monkeypatch, "wsi.example.org", public) == pinned
+    assert _redirect_uri_for(monkeypatch, "WSI.example.org.", public) == pinned
+    assert _redirect_uri_for(monkeypatch, "wsi.example.org:8443", public) == pinned
+    # A Host that names another port is another listener: derive from it.
+    assert (
+        _redirect_uri_for(monkeypatch, "wsi.example.org:9000", public)
+        == "https://wsi.example.org:9000/api/auth/oauth/callback"
+    )
+    # A port-less base URL means the scheme's default port.
+    assert (
+        _redirect_uri_for(monkeypatch, "wsi.example.org:443", "https://wsi.example.org")
+        == "https://wsi.example.org/api/auth/oauth/callback"
+    )
+    # Unparsable Host: no pin, and no 500.
+    assert _redirect_uri_for(monkeypatch, "[::1", public).endswith("/api/auth/oauth/callback")
+
+
+# --------------------------------------------------------------------------
+# POST /api/admin/register validation and audit
+# --------------------------------------------------------------------------
+@_contextlib.contextmanager
+def _no_admin_exists(db_session):
+    """Demote every admin for the duration (the register route only opens
+    while none exists), restoring them afterwards."""
+    ids = [u.id for u in db_session.query(User).filter(User.role == "admin")]
+    for u in db_session.query(User).filter(User.id.in_(ids)):
+        u.role = "manager"
+    db_session.commit()
+    try:
+        yield
+    finally:
+        db_session.expire_all()
+        for u in db_session.query(User).filter(User.id.in_(ids)):
+            u.role = "admin"
+        db_session.commit()
+
+
+def test_admin_register_refuses_control_characters(client):
+    with _override_app_settings(allow_admin_register=True):
+        r = client.post(
+            "/api/admin/register",
+            json={"username": "evil\x1b[2Jadmin", "password": "longenoughpw-1"},
+        )
+    assert r.status_code == 422, r.text
+
+
+def test_admin_register_name_clash_is_case_insensitive_and_creation_is_audited(
+    client, db_session, monkeypatch
+):
+    from wsi_app.routers import admin_auth as _admin_auth
+
+    events = []
+    monkeypatch.setattr(
+        _admin_auth, "audit", lambda actor, action, **kw: events.append((actor, action, kw))
+    )
+    db_session.add(User(username="CaseClash", password_hash=hash_password("x-pass-123"), role="manager"))
+    db_session.commit()
+    created = None
+    try:
+        with _override_app_settings(allow_admin_register=True), _no_admin_exists(db_session):
+            r = client.post(
+                "/api/admin/register",
+                json={"username": "caseclash", "password": "longenoughpw-1"},
+            )
+            assert r.status_code == 400, r.text
+            assert events == []
+
+            r = client.post(
+                "/api/admin/register",
+                json={"username": "fresh-first-admin", "password": "longenoughpw-1"},
+            )
+            assert r.status_code == 200, r.text
+            created = db_session.query(User).filter(User.username == "fresh-first-admin").one()
+            assert events == [(
+                None,
+                "user.create",
+                {
+                    "target": str(created.id),
+                    "target_username": "fresh-first-admin",
+                    "role": "admin",
+                    "via": "register",
+                },
+            )]
+    finally:
+        db_session.execute(
+            delete(User).where(User.username.in_(("CaseClash", "fresh-first-admin")))
+        )
+        db_session.commit()
+
+
+# --------------------------------------------------------------------------
+# PATCH /api/admin/me: a rename alone is bound to the re-authed generation
+# --------------------------------------------------------------------------
+def test_admin_rename_refused_when_the_account_changed_after_reauth(
+    client, db_session, admin_user, admin_headers, monkeypatch
+):
+    """A password change / sign-out-everywhere committing between the
+    re-auth and the write means the password just checked may be stale; the
+    rename must not ride on it (409), exactly like a password change."""
+    from wsi_app.db import SessionLocal
+    from wsi_app.routers import admin_auth as _admin_auth
+
+    real_verify = _admin_auth.verify_reauth_password
+
+    def verify_then_bump(request, user, password, **kw):
+        ok = real_verify(request, user, password, **kw)
+        other = SessionLocal()
+        try:
+            row = other.get(User, user.id)
+            row.token_version = int(row.token_version or 0) + 1
+            other.commit()
+        finally:
+            other.close()
+        return ok
+
+    monkeypatch.setattr(_admin_auth, "verify_reauth_password", verify_then_bump)
+    old_name = admin_user.username
+    r = client.patch(
+        "/api/admin/me",
+        json={"current_password": "x", "username": old_name + "-renamed"},
+        headers=admin_headers,
+    )
+    assert r.status_code == 409, r.text
+    db_session.expire_all()
+    assert db_session.get(User, admin_user.id).username == old_name
+
+
+def test_admin_rename_alone_still_works(client, db_session, admin_user, admin_headers):
+    r = client.patch(
+        "/api/admin/me",
+        json={"current_password": "x", "username": admin_user.username + "-r"},
+        headers=admin_headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["username"] == admin_user.username + "-r"
+
+
+# --------------------------------------------------------------------------
+# Re-auth throttle bucket: one per token, whatever the signature's spelling
+# --------------------------------------------------------------------------
+def test_reauth_throttle_key_ignores_signature_spelling(admin_user):
+    from types import SimpleNamespace
+
+    from wsi_app.routers.admin_auth import reauth_throttle_key
+
+    token = create_token(admin_user)
+    head, sig = token.rsplit(".", 1)
+
+    def key(tok):
+        return reauth_throttle_key(
+            SimpleNamespace(headers={"authorization": f"Bearer {tok}"}), admin_user
+        )
+
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    last = alphabet.index(sig[-1])
+    respelled = sig[:-1] + alphabet[last ^ 1]  # flips only an unused low bit
+    assert key(token) == key(token + "=") == key(f"{head}.{respelled}")
+    assert key(token) != key(create_token(admin_user, amr="recovery"))
+
+
+# --------------------------------------------------------------------------
+# LDAP "Test connection" reads the saved settings, not a stale snapshot
+# --------------------------------------------------------------------------
+def test_ldap_test_rereads_the_saved_settings(client, db_session, admin_headers, monkeypatch):
+    """Another worker saved the LDAP settings; this worker's snapshot still
+    holds the old ones until its refresh loop runs. The test must use what
+    is in the DB."""
+    row = db_session.get(AuthSettings, 1)
+    if row is None:
+        row = AuthSettings(id=1)
+        db_session.add(row)
+    saved_uri = row.ldap_server_uri
+    row.ldap_server_uri = ""
+    db_session.commit()
+    stale = _app_auth._AuthSnapshot(
+        ldap={"server_uri": "ldap://stale.example", "user_base_dn": "dc=example"}
+    )
+    monkeypatch.setattr(_app_auth, "_snapshot", stale)
+    try:
+        r = client.post("/api/admin/auth/ldap/test", data={}, headers=admin_headers)
+        assert r.status_code == 200, r.text
+        assert r.json()["stage"] == "config"
+        assert "URI" in r.json()["detail"]
+    finally:
+        row.ldap_server_uri = saved_uri
+        db_session.commit()
+
+
+def test_admin_login_max_failures_below_one_is_raised_to_one():
+    """0 is not "lockout off" (it already locked on the first failure, like
+    1); the setting is raised to 1 with a warning so the logged value is the
+    effective one."""
+    import os
+    import subprocess
+    import sys
+
+    env = {**os.environ, "ADMIN_LOGIN_MAX_FAILURES": "0"}
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "from wsi_app.config import settings; print(settings.admin_login_max_failures)"],
+        env=env, capture_output=True, text=True, check=True,
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    )
+    assert out.stdout.strip() == "1"
+    assert "ADMIN_LOGIN_MAX_FAILURES=0" in out.stderr

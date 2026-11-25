@@ -222,9 +222,32 @@ ADMIN_LOGIN_PATHS: frozenset = frozenset({
 })
 
 
+def has_dot_segment(path: str) -> bool:
+    """True if ``path`` has a ``.`` or ``..`` segment (``/api/auth/../x``).
+
+    Neither uvicorn nor Starlette resolves dot segments: ``request.url.path``
+    (and the ASGI ``scope["path"]``) is the percent-decoded request target as
+    the client sent it. nginx does not resolve them on the way through either:
+    ``proxy_pass http://wsi_app;`` (no URI part) forwards the original request
+    line, so ``/api/auth/../../index.html`` — or the ``%2e%2e`` spelling —
+    reaches the app verbatim, although nginx itself matched its locations on
+    the normalised ``/index.html``. A browser always resolves dot segments
+    before sending, so such a path only ever comes from a hand-made request.
+    """
+    return any(seg in (".", "..") for seg in path.split("/"))
+
+
 def is_bypass_path(path: str) -> bool:
     if path in BYPASS_EXACT:
         return True
+    # A prefix match on a path with dot segments says nothing about where the
+    # path ends up: "/api/auth/../../index.html" starts with "/api/auth/" but
+    # is the SPA shell once resolved (main._spa_handler resolves it on disk
+    # with realpath), which would serve the gated app to an unauthenticated
+    # client under basic mode. Such a path is never a bypass; the gate then
+    # judges it like any other request.
+    if has_dot_segment(path):
+        return False
     return any(path.startswith(p) for p in BYPASS_PREFIXES)
 
 
@@ -290,7 +313,10 @@ def breakglass_exempt(headers, client_host: str) -> bool:
     if _cf_access.is_via_cloudflare_tunnel(headers, client_host):
         return False
     from . import network as _network
-    if _network.forwarded_proto(headers) != "http":
+    # client_host: X-Forwarded-Proto counts only from the trusted hop; from
+    # any other peer it is the client's own claim and reads as "" (no
+    # exemption), like the forwarded-IP headers get_client_ip ignores.
+    if _network.forwarded_proto(headers, client_host=client_host) != "http":
         return False
     if not _ip_in(_network.get_client_ip(headers, client_host), BREAKGLASS_TRUSTED_NETWORKS):
         return False
@@ -303,10 +329,17 @@ _LAN_NETWORKS = tuple(ipaddress.ip_network(c) for c in _config.LAN_CIDRS)
 
 
 def _ip_in(value: str, networks) -> bool:
-    """True if ``value`` is an IP literal inside one of ``networks``."""
+    """True if ``value`` is an IP literal inside one of ``networks``.
+
+    An IPv4-mapped IPv6 address (``::ffff:192.168.1.5``, how a dual-stack
+    socket reports an IPv4 client) is compared as the IPv4 address it wraps
+    (``network.canonical_ip``); as IPv6 it would be in none of the IPv4 LAN /
+    break-glass ranges and the exemption would miss the client.
+    """
+    from . import network as _network
     try:
-        addr = ipaddress.ip_address(value)
-    except ValueError:
+        addr = _network.canonical_ip(value)
+    except (TypeError, ValueError):
         return False
     # ``addr in net`` returns False (no error) when versions differ.
     return any(addr in net for net in networks)
@@ -1108,8 +1141,14 @@ def verify_ldap(
                 # would fail every login.
                 attributes=[NO_ATTRIBUTES],
             ) and conn.entries:
-                user_dn = conn.entries[0].entry_dn
-                found = True
+                user_dn = conn.entries[0].entry_dn or ""
+                # An entry with an empty DN must not count as a match: the
+                # rebind below would then be a simple bind with an empty name
+                # and a non-empty password, which RFC 4513 §5.1.2 calls an
+                # "unauthenticated bind" — a server that still reports it as
+                # bound would admit ANY password. (test_ldap_settings refuses
+                # the same case as not_found.)
+                found = bool(user_dn)
         finally:
             try:
                 conn.unbind()

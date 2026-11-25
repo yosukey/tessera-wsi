@@ -186,6 +186,10 @@ _RANK_BETA = 2
 _RANK_RC = 3
 _RANK_FINAL = 4
 _RANK_POST = 5
+# Marks a numeric component past the third ("1.2.3.1"); see parse_version.
+# Above every rank, so a fourth component outranks whatever modifier the
+# three-component version carries: 1.2.3-rc1 < 1.2.3 < 1.2.3-5-gabc < 1.2.3.1.
+_EXTRA_COMPONENT = 6
 
 _PRERELEASE_RANKS = {
     "a": _RANK_ALPHA, "alpha": _RANK_ALPHA,
@@ -222,6 +226,9 @@ def parse_version(v: str) -> Optional[tuple]:
     * git-describe post-tag   ``"0.1.0-3-gabc1234"``→ ``(0, 1, 0, 5, 3)``
     * … past a prerelease     ``"0.1.0-rc1-3-gabc"``→ ``(0, 1, 0, 3, 1, 3)``
       (above rc1, below rc2 and the final release)
+    * Four or more components ``"1.2.3.1"``         → ``(1, 2, 3, 6, 1, 4, 0)``
+      (each component past the third is preceded by the _EXTRA_COMPONENT
+      marker; trailing zero components are dropped, so "1.2.3.0" == "1.2.3")
 
     None for anything without a numeric prefix ("unknown") and for a bare
     git hash, including one that happens to start with digits.
@@ -243,6 +250,22 @@ def parse_version(v: str) -> Optional[tuple]:
     # wrongly True and refusing to boot against the DB's own version.
     if len(nums) < 3:
         nums = nums + (0,) * (3 - len(nums))
+    # Components past the third. Appended as they are, they would collide with
+    # the rank pair, which sits at index 3 for a three-component version:
+    # "1.2.3" -> (1,2,3,FINAL,0) would rank ABOVE "1.2.3.1" -> (1,2,3,1,FINAL,0)
+    # since FINAL (4) > 1 — a newer four-component tag read as a downgrade and
+    # missed by the update check. Each extra component is therefore preceded
+    # by _EXTRA_COMPONENT, which outranks every rank, so a longer version sorts
+    # after its prefix whatever modifier follows. Trailing zeros past the third
+    # are dropped first ("1.2.3.0" is "1.2.3"), like the padding above makes
+    # "1.2" equal "1.2.0". Versions of three components or fewer keep their
+    # exact former tuples.
+    extra = nums[3:]
+    while extra and extra[-1] == 0:
+        extra = extra[:-1]
+    nums = nums[:3]
+    for n in extra:
+        nums = nums + (_EXTRA_COMPONENT, n)
     rest = s[m.end():]
     if not rest:
         return nums + (_RANK_FINAL, 0)

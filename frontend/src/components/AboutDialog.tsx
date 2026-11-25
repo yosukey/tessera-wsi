@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react'
 import { APP_INFO } from '../lib/appInfo'
+import { FULL_VIEWPORT_FIXED } from '../lib/viewportBox'
 import { useDialogFocus } from '../hooks/useDialogFocus'
 
 export default function AboutDialog({ onClose }: { onClose: () => void }) {
@@ -81,8 +82,9 @@ export default function AboutDialog({ onClose }: { onClose: () => void }) {
 }
 
 const overlayStyle: React.CSSProperties = {
-  position: 'fixed',
-  inset: 0,
+  // Full-viewport overlays anchor to the measured viewport, so they stay on
+  // screen while Chrome on iPad keeps a stale layout viewport (lib/viewportBox).
+  ...FULL_VIEWPORT_FIXED,
   background: 'rgba(0, 0, 0, 0.45)',
   zIndex: 'var(--z-modal, 1000)' as unknown as number,
   display: 'flex',

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 import threading
 from typing import Iterable, Iterator, Optional
 
@@ -21,7 +22,15 @@ from starlette.types import Receive, Scope, Send
 
 from .admin_helpers import api_error
 
-_CSV_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
+# A cell starting with one of these is read as a formula (or, for the control
+# characters, may be stripped and the rest read as one). LF joins TAB / CR:
+# csv.writer quotes a value holding it, and a quoted cell's leading newline is
+# no more harmless than a leading CR.
+_CSV_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r", "\n")
+# Leading whitespace a spreadsheet may trim before deciding whether the cell is
+# a formula (LibreOffice's "Trim spaces" import option, Excel's handling of
+# some pasted / imported text): " =1+1" must be defanged like "=1+1".
+_CSV_LEADING_SPACE = " \t\r\n"
 
 # Concurrent audit-history / error-log exports per worker. Each one in flight
 # costs a DB read per batch and a thread hop per chunk, so a few parallel
@@ -179,21 +188,69 @@ def resolve_export_limit(requested: Optional[int], retention_max_rows: int) -> i
     return cap
 
 
+# What a ';'-separator spreadsheet import starts a new cell (';') or a new
+# row (CR, LF, CRLF — CRLF first, so it counts as one break) at, whatever the
+# CSV quoting. Captured, so a split keeps the separators for the re-join.
+_CSV_PART_SEP = re.compile(r"(;|\r\n|\r|\n)")
+
+
+def _formula_like(part: str) -> bool:
+    return part.startswith(_CSV_FORMULA_LEAD) or part.lstrip(_CSV_LEADING_SPACE).startswith(
+        _CSV_FORMULA_LEAD
+    )
+
+
 def csv_safe(v):
     """Defang spreadsheet formula injection on a single cell value.
 
-    Fields such as `referrer_host`, `user_agent`, audit `details`, and (in
-    some auth flows) `user_email` are externally controlled. Excel /
-    LibreOffice / Numbers will evaluate a cell beginning with `=`, `+`,
-    `-`, `@`, TAB, or CR as a formula, which is enough for
+    Fields such as `referrer_host`, `user_agent`, `request_path`, audit
+    `details`, and (in some auth flows) `user_email` are externally
+    controlled. Excel / LibreOffice / Numbers will evaluate a cell beginning
+    with `=`, `+`, `-`, `@`, TAB, CR or LF as a formula, which is enough for
     `=HYPERLINK("…attacker…", "click")` style data exfiltration when an
-    admin opens the exported CSV. Prefix any such string with a leading
-    single quote so the cell is treated as text. Non-string values pass
-    through untouched.
+    admin opens the exported CSV. Such a string gets a leading single quote
+    so the cell is treated as text — also when only whitespace precedes the
+    formula character (" =1+1"), which a trimming import would otherwise
+    hand to the formula parser.
+
+    A second pass covers the ';'-separated parts of the value. A spreadsheet
+    in a locale whose list separator is ';' (most of continental Europe)
+    splits text on ';' when it opens a .csv, and csv.writer does not quote a
+    value for holding ';' — so "x;=HYPERLINK(…)" would land as two cells, the
+    second a live formula. Quoting does not help either: in a ';' locale the
+    commas between columns are not separators, so a quoted field that is not
+    the first column starts in the middle of a cell, its double quotes are
+    read as literal characters, and its ';' still splits the cell
+    ("lead,\"x,y;=1+2;\"" evaluates =1+2 in LibreOffice). So every part is
+    checked whatever the quoting, with the same rule as the whole value
+    (formula character first, or after leading whitespace, which a trimming
+    import strips). The cost is cosmetic: a crawler User-Agent such as
+    ``Mozilla/5.0 (compatible; Googlebot/2.1; +http://…)`` exports as
+    ``…Googlebot/2.1;' +http://…)``.
+
+    Line breaks split the same way. Such an import does not honour the CSV
+    double quotes, so a CR or LF inside a (quoted) field ends the spreadsheet
+    row, and the text after it starts a new row's first cell: an error-log
+    message "x\\n=HYPERLINK(…)" would become a live formula. So the parts
+    after every ';', CR, LF and CRLF are checked alike.
+
+    A value with no such part comes out unchanged. Idempotent (a defanged
+    part starts with the quote), so applying it twice — perf_export defangs its cells,
+    then the CSV writer runs every cell through here — changes nothing more.
+    Non-string values pass through untouched.
     """
-    if isinstance(v, str) and v.startswith(_CSV_FORMULA_LEAD):
-        return "'" + v
-    return v
+    if not isinstance(v, str):
+        return v
+    head = "'" + v if _formula_like(v) else v
+    pieces = _CSV_PART_SEP.split(head)
+    if len(pieces) == 1:
+        return head
+    # pieces alternates part, separator, part, …; the first part is the start
+    # of the value, already handled above.
+    for i in range(2, len(pieces), 2):
+        if _formula_like(pieces[i]):
+            pieces[i] = "'" + pieces[i]
+    return "".join(pieces)
 
 
 def _iter_csv(header: list[str], rows: Iterable[list]):

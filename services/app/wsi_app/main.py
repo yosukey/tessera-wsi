@@ -272,7 +272,15 @@ def _load_network_cache() -> None:
         # mDNS is disabled (or the NetworkSettings row is absent — e.g. just
         # after a restore). Running the disable path too ensures a host stops
         # advertising _http._tcp as soon as the setting is off.
-        _net.apply_mdns(bool(ns and ns.mdns_enabled))
+        #
+        # Not in the wsi-sync process (WSI_PROCESS_ROLE=sync): its sandbox
+        # grants no write access to /etc/avahi/services (wsi-sync.service),
+        # so the attempt could only fail, and the wsi-app workers already
+        # own the file. Every wsi-app worker still runs it at boot;
+        # apply_mdns writes by atomic rename, so concurrent workers converge
+        # on the same complete file.
+        if os.environ.get("WSI_PROCESS_ROLE", "") != "sync":
+            _net.apply_mdns(bool(ns and ns.mdns_enabled))
     finally:
         db.close()
 
@@ -1964,6 +1972,15 @@ def _spa_handler(static_dir: str):
         if scope_type != "http":
             return
         path = scope.get("path", "/")
+        # A path with "." / ".." segments is never one the SPA links to (a
+        # browser resolves them before sending; see app_auth.has_dot_segment),
+        # and resolving it here would let a prefix that means something to an
+        # earlier check ("/api/auth/../../index.html" is an auth-bypass path
+        # by prefix) land on any file of the build. Not Found, rather than a
+        # file or the shell.
+        if _app_auth.has_dot_segment(path):
+            await JSONResponse(status_code=404, content={"detail": "Not Found"})(scope, receive, send)
+            return
         rel_path = path.lstrip("/")
         # Serve an actual file from the static directory if it exists.
         if rel_path:

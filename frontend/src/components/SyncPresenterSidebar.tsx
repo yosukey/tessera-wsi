@@ -20,6 +20,7 @@ import { useCallback, useLayoutEffect, useEffect, useMemo, useRef, useState } fr
 import QRCode from 'qrcode'
 import { useI18n } from '../lib/i18n'
 import { copyTextToClipboard, triggerDownload } from '../lib/clipboard'
+import { csvCell } from '../lib/csvSafe'
 import { formatElapsed } from '../lib/elapsed'
 import { STORAGE_KEYS } from '../lib/storageKeys'
 import type { CreatedSyncSession } from '../lib/api'
@@ -146,15 +147,21 @@ export default function SyncPresenterSidebar({
         f.vh == null ? '' : String(f.vh),
       ]),
     ]
-    const csv = rows.map((row) => row.map(csvEscape).join(',')).join('\r\n')
+    // name / ua / hostname come from the followers themselves: every cell is
+    // defanged against formula injection the way the server's admin exports
+    // are (lib/csvSafe), then CSV-quoted.
+    const csv = rows.map((row) => row.map(csvCell).join(',')).join('\r\n')
     // UTF-8 BOM so Excel (notably on Japanese-locale Windows) decodes names as UTF-8.
     const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8' })
     const url = URL.createObjectURL(blob)
     triggerDownload(url, `wsi-sync-${session.session_id}.csv`)
     // Defer revoke so any browser that initiates the download asynchronously
     // after click() returns still has a valid blob URL. Synchronous revoke
-    // races the download in some browsers and silently produces empty files.
-    setTimeout(() => URL.revokeObjectURL(url), 0)
+    // races the download in some browsers and silently produces empty files,
+    // and a 0 ms timer is not enough either: Safari / iPadOS can start reading
+    // the blob after the next macrotask. One second matches the other blob
+    // downloads in the app (e.g. the MFA recovery codes, downloadAttachment).
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
   }, [sortedFollowers, session.session_id, pseudonymous])
 
   // -------------------------------------------------- collapsed strip ----
@@ -369,23 +376,6 @@ function summariseUserAgent(ua: string, unknownBrowser: string): string {
     /Linux/.exec(ua) ? 'Linux' :
     ''
   return os ? `${browser} / ${os}` : browser
-}
-
-function csvEscape(v: string): string {
-  // Defuse CSV-formula injection: a name / hostname starting with =, +, -,
-  // @, TAB, or CR is interpreted as a formula by Excel / Google Sheets
-  // when the exported file is opened. The TAB/CR cases are the OWASP CSV-
-  // injection cheat-sheet's "leading whitespace" entries — they're
-  // already stripped server-side by sanitize_name / _scrub_metadata for
-  // name/hostname/ua, but the ip field is forwarded verbatim from the
-  // proxy header, so this is still the right defensive layer to keep.
-  // Prepending a single quote forces the cell to render as text. Quote-
-  // wrap only when the cleaned value contains characters CSV would
-  // otherwise mis-parse.
-  let out = v
-  if (/^[=+\-@\t\r]/.test(out)) out = `'${out}`
-  if (/[,"\r\n]/.test(out)) return `"${out.replace(/"/g, '""')}"`
-  return out
 }
 
 function connStateLabel(s: ConnState, t: ReturnType<typeof useI18n>['t']): string {

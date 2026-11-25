@@ -4,6 +4,7 @@ import { useDialogFocus } from '../../hooks/useDialogFocus'
 import { useI18n } from '../../lib/i18n'
 import { META_DISPLAY_KEYS } from '../../lib/admin/validation'
 import { metaFieldLabel } from '../../lib/metaLabel'
+import { FULL_VIEWPORT_FIXED } from '../../lib/viewportBox'
 import { Button, LockFieldset, Select } from '../ui'
 import OptionMultiSelect from './OptionMultiSelect'
 
@@ -103,7 +104,7 @@ export default function BulkCategoryModal({ target, items, metaOptions, customMe
       aria-labelledby="bulk-category-title"
       onClick={onClose}
       style={{
-        position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)',
+        ...FULL_VIEWPORT_FIXED, background: 'rgba(0,0,0,0.45)',
         zIndex: 'var(--z-modal, 1000)' as unknown as number,
         display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
         padding: 20, overflowY: 'auto',

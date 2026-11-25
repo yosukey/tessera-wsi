@@ -645,6 +645,34 @@ describe('sign-out while a sent bundle waits for the server', () => {
     expect(sessionStorage.getItem(STORAGE_KEYS.importKeptStageId)).toBeNull()
   })
 
+  it('is not shown to (nor locks) the next account while it still waits', async () => {
+    // Signed out and back in (another admin) before the server answered: the
+    // module-level upload still exists, but belongs to the old sign-in.
+    let answerUpload: ((v: { job_id: string }) => void) | undefined
+    let sent: (() => void) | undefined
+    api.adminStageSlideImport.mockImplementation(
+      (_f: File, onProgress: (pct: number) => void, opts: { onSent?: () => void }) => {
+        sent = opts.onSent
+        onProgress(100)
+        return new Promise((resolve) => { answerUpload = resolve })
+      },
+    )
+    const first = mount()
+    pickFile(first.container)
+    await waitFor(() => expect(answerUpload).toBeDefined())
+    sent!()
+    first.unmount()
+    clearAdminSession()
+
+    mount()
+    expect(await screen.findByRole('button', { name: /Choose/ })).toBeTruthy()
+    expect(screen.queryByText(/Uploading…/)).toBeNull()
+    expect((screen.getByRole('button', { name: /Choose/ }) as HTMLButtonElement).disabled).toBe(false)
+    answerUpload!({ job_id: STAGE_JOB })
+    await new Promise((r) => setTimeout(r, 0))
+    expect(api.pollTransferJob).not.toHaveBeenCalled()
+  })
+
   it('still remembers the job when the admin did not sign out', async () => {
     let answerUpload: ((v: { job_id: string }) => void) | undefined
     api.adminStageSlideImport.mockImplementation(

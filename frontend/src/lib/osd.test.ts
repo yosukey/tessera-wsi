@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import OpenSeadragon from 'openseadragon'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { attachNoFlipKey, attachOpenFailed, loadTileSource, osdMaxTilesPerFrame } from './osd'
+import { applyStepTransition, attachNoFlipKey, attachOpenFailed, loadTileSource, osdMaxTilesPerFrame } from './osd'
 import { dziTileUrl } from './tileUrl'
 
 // What GET /dzi/{public_id}.dzi returns (OpenSlide's DeepZoomGenerator).
@@ -168,5 +168,79 @@ describe('attachNoFlipKey', () => {
     } finally {
       done()
     }
+  })
+})
+
+describe("applyStepTransition 'smooth_zoom'", () => {
+  // A minimal stand-in viewer: OSD's real viewport needs an opened image to
+  // animate, and the case under test is precisely "OSD animates nothing", so
+  // no 'animation-finish' is ever raised unless the test fires it.
+  function fakeViewer() {
+    const handlers = new Map<string, Set<(...a: unknown[]) => void>>()
+    const springs = {
+      centerSpringX: { animationTime: 1.2 },
+      centerSpringY: { animationTime: 1.2 },
+      zoomSpring: { animationTime: 1.2 },
+    }
+    const fitBounds = vi.fn()
+    const viewer = {
+      viewport: {
+        ...springs,
+        getBounds: () => new OpenSeadragon.Rect(0, 0, 1, 1),
+        setRotation: vi.fn(),
+        fitBounds,
+      },
+      addHandler: (n: string, h: (...a: unknown[]) => void) => {
+        if (!handlers.has(n)) handlers.set(n, new Set())
+        handlers.get(n)!.add(h)
+      },
+      removeHandler: (n: string, h: (...a: unknown[]) => void) => { handlers.get(n)?.delete(h) },
+      addOnceHandler: () => {},
+    }
+    const fire = (n: string) => { for (const h of [...(handlers.get(n) ?? [])]) h() }
+    const count = (n: string) => handlers.get(n)?.size ?? 0
+    return { viewer: viewer as unknown as OpenSeadragon.Viewer, fitBounds, springs, fire, count }
+  }
+  const target = () => new OpenSeadragon.Rect(0.2, 0.2, 0.1, 0.1)
+
+  afterEach(() => { vi.useRealTimers() })
+
+  it('still pushes into the target when the pull-back animates nothing', () => {
+    vi.useFakeTimers()
+    const { viewer, fitBounds, springs, count } = fakeViewer()
+    const bounds = target()
+    applyStepTransition(viewer, bounds, 0, 'smooth_zoom', 2)
+    expect(fitBounds).toHaveBeenCalledTimes(1) // the overview
+    expect(springs.zoomSpring.animationTime).toBe(1)
+    vi.advanceTimersByTime(1100)
+    expect(fitBounds).toHaveBeenCalledTimes(2)
+    expect(fitBounds.mock.calls[1][0]).toBe(bounds)
+    // Phase 2 animates nothing either: its own fallback restores the springs
+    // and drops the finish handler.
+    vi.advanceTimersByTime(1100)
+    expect(springs.zoomSpring.animationTime).toBe(1.2)
+    expect(count('animation-finish')).toBe(0)
+  })
+
+  it('pushes in exactly once when the pull-back finishes normally', () => {
+    vi.useFakeTimers()
+    const { viewer, fitBounds, springs, fire, count } = fakeViewer()
+    applyStepTransition(viewer, target(), 0, 'smooth_zoom', 2)
+    fire('animation-finish')
+    expect(fitBounds).toHaveBeenCalledTimes(2)
+    vi.advanceTimersByTime(5000)
+    expect(fitBounds).toHaveBeenCalledTimes(2)
+    expect(springs.zoomSpring.animationTime).toBe(1.2)
+    expect(count('animation-finish')).toBe(0)
+  })
+
+  it('a superseding transition cancels the pending push-in', () => {
+    vi.useFakeTimers()
+    const { viewer, fitBounds } = fakeViewer()
+    applyStepTransition(viewer, target(), 0, 'smooth_zoom', 2)
+    applyStepTransition(viewer, target(), 0, 'none')
+    const calls = fitBounds.mock.calls.length
+    vi.advanceTimersByTime(5000)
+    expect(fitBounds).toHaveBeenCalledTimes(calls)
   })
 })

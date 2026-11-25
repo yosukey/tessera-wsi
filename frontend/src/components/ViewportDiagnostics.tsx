@@ -4,7 +4,9 @@ import { APP_INFO } from '../lib/appInfo'
 import { safeSessionGetItem, safeSessionRemoveItem, safeSessionSetItem } from '../lib/safeStorage'
 import { STORAGE_KEYS } from '../lib/storageKeys'
 import { TOUR_EDITOR_STACK_QUERY, TOUR_VIEWER_STACK_QUERY } from '../lib/tourEditorLayout'
-import { matchesViewportQuery, measureViewportBox, VIEWPORT_STALE_CLASS } from '../lib/viewportBox'
+import {
+  fixedBottom, matchesViewportQuery, measureViewportBox, VIEWPORT_CLIP_X_CLASS, VIEWPORT_STALE_CLASS,
+} from '../lib/viewportBox'
 
 // `?vpdebug=1` turns the panel on for this tab (it survives in-app navigation
 // and reloads), `?vpdebug=0` turns it off. Nothing is shown otherwise.
@@ -48,7 +50,7 @@ export function viewportSnapshot(): string[] {
     (() => {
       const box = measureViewportBox()
       const fix = de.classList.contains(VIEWPORT_STALE_CLASS)
-      return `stale layout viewport ${box.stale ? 'YES' : 'no'}  fix ${fix ? `ON ${de.style.getPropertyValue('--vp-width')}x${de.style.getPropertyValue('--vp-height')}` : 'off'}`
+      return `stale layout viewport ${box.stale ? 'YES' : 'no'}  fix ${fix ? `ON ${de.style.getPropertyValue('--vp-width')}x${de.style.getPropertyValue('--vp-height')}${de.classList.contains(VIEWPORT_CLIP_X_CLASS) ? ' clip-x' : ''}` : 'off'}`
         + `\nmedia(measured) ${QUERIES.map(([name, q]) => `${name}=${matchesViewportQuery(q, box.width, box.height) ? 1 : 0}`).join(' ')}`
     })(),
   ]
@@ -117,8 +119,10 @@ export default function ViewportDiagnostics() {
       aria-hidden="true"
       data-testid="viewport-diagnostics"
       style={{
-        position: 'fixed', left: 4, bottom: 4, zIndex: 2147483647,
-        maxWidth: 'min(440px, calc(100% - 8px))', maxHeight: '60%', overflow: 'hidden',
+        // bottom: anchored to the measured viewport, so the panel stays on
+        // screen while the layout viewport is stale — the case it reports.
+        position: 'fixed', left: 4, bottom: fixedBottom(4), zIndex: 2147483647,
+        maxWidth: 'min(440px, calc(var(--vp-width, 100%) - 8px))', maxHeight: 'calc(var(--vp-height, 100%) * 0.6)', overflow: 'hidden',
         padding: 6, borderRadius: 6, background: 'rgba(0, 0, 0, 0.78)', color: '#fff',
         font: '10px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace',
         whiteSpace: 'pre-wrap', wordBreak: 'break-all', pointerEvents: 'none',

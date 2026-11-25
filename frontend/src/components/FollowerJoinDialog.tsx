@@ -9,6 +9,7 @@ import { useDialogFocus } from '../hooks/useDialogFocus'
 import { useI18n } from '../lib/i18n'
 import { safeGetItem, safeRemoveItem, safeSetItem } from '../lib/safeStorage'
 import { STORAGE_KEYS } from '../lib/storageKeys'
+import { FULL_VIEWPORT_FIXED } from '../lib/viewportBox'
 import { ClearButton } from './ui'
 
 const NAME_STORAGE_KEY = STORAGE_KEYS.syncDisplayName
@@ -183,8 +184,9 @@ export default function FollowerJoinDialog({
 // ---------- styles ------------------------------------------------------
 
 const overlayStyle: React.CSSProperties = {
-  position: 'fixed',
-  inset: 0,
+  // Full-viewport overlays anchor to the measured viewport, so they stay on
+  // screen while Chrome on iPad keeps a stale layout viewport (lib/viewportBox).
+  ...FULL_VIEWPORT_FIXED,
   background: 'rgba(0, 0, 0, 0.55)',
   zIndex: 100,
   display: 'flex',

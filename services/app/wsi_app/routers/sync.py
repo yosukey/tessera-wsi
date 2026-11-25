@@ -35,6 +35,7 @@ import collections
 import concurrent.futures
 import json
 import logging
+import math
 import secrets
 import time
 from typing import Deque, Dict, List, Optional, Set
@@ -59,9 +60,9 @@ from .. import login_throttle as _login_throttle
 from .. import network as _net
 from .. import sync_room as _sync_room_module
 from ..admin_helpers import api_error, audit
-from ..auth import STAFF_ROLES, require_staff
+from ..auth import STAFF_ROLES, get_current_user, require_staff
 from ..config import settings, env_bool, env_int, env_int_min, env_float
-from ..db import SessionLocal, get_db
+from ..db import SessionLocal
 from ..models import Slide, User
 from ..sync_room import (
     PresenterConn,
@@ -79,16 +80,40 @@ router = APIRouter()
 _log = logging.getLogger("wsi_app.sync")
 
 
+def _env_positive_float(name: str, default: float) -> float:
+    """``env_float`` for a timer, timeout or rate that must be a positive,
+    finite number: an unparsable value still fails the import naming the
+    variable, but zero, a negative number, ``nan`` or ``inf`` (all of which
+    ``float()`` accepts) falls back to ``default`` with a warning.
+
+    None of these has an "off" meaning. A ping / reauth interval of 0 turns
+    its ``wait_for(stop.wait(), timeout=...)`` loop into a busy spin that
+    starves every room on the worker; a NaN timeout raises out of
+    ``wait_for`` on the first iteration (killing keepalive or reauth for the
+    socket — reauth being the only revocation between connect and the
+    token's expiry), an infinite one never fires, and a non-positive rate or
+    burst drops every inbound frame. Falling back keeps a typo in the env file
+    from taking live sync down (or failing it open) silently."""
+    value = env_float(name, default)
+    if not math.isfinite(value) or value <= 0:
+        _log.warning(
+            "%s=%r must be a positive number; using the default (%s).",
+            name, value, default,
+        )
+        return float(default)
+    return value
+
+
 # Tunables (overridable via env for ops experiments).
-HELLO_TIMEOUT_SECONDS = env_float("WSI_SYNC_HELLO_TIMEOUT_SEC", 5)
+HELLO_TIMEOUT_SECONDS = _env_positive_float("WSI_SYNC_HELLO_TIMEOUT_SEC", 5)
 # Keepalive. The server sends a ping every PING_INTERVAL_SECONDS, and closes a
 # connection that has produced no inbound frame for PING_TIMEOUT_SECONDS —
 # the only way to notice a peer that vanished without a TCP FIN (sleeping
 # laptop, dead Wi-Fi), which would otherwise hold its room slot until the
 # session ages out. Keep the timeout a comfortable multiple of the interval so
 # one dropped ping never evicts a healthy client.
-PING_INTERVAL_SECONDS = env_float("WSI_SYNC_PING_INTERVAL_SEC", 15)
-PING_TIMEOUT_SECONDS = env_float("WSI_SYNC_PING_TIMEOUT_SEC", 30)
+PING_INTERVAL_SECONDS = _env_positive_float("WSI_SYNC_PING_INTERVAL_SEC", 15)
+PING_TIMEOUT_SECONDS = _env_positive_float("WSI_SYNC_PING_TIMEOUT_SEC", 30)
 # Hard backstop on the recv loop's ``ws.receive()``. The keepalive closes the
 # socket on PING_TIMEOUT_SECONDS of silence, but that close is routed through
 # the _WsBridge writer task; if the writer already died on a send timeout (a
@@ -101,7 +126,7 @@ PING_TIMEOUT_SECONDS = env_float("WSI_SYNC_PING_TIMEOUT_SEC", 30)
 # handler detach.
 # Kept above PING_TIMEOUT_SECONDS so the graceful keepalive close is always the
 # preferred path and this only catches the un-closable-socket tail.
-WS_RECV_IDLE_TIMEOUT_SECONDS = env_float("WSI_SYNC_WS_RECV_IDLE_TIMEOUT_SEC", 45)
+WS_RECV_IDLE_TIMEOUT_SECONDS = _env_positive_float("WSI_SYNC_WS_RECV_IDLE_TIMEOUT_SEC", 45)
 # Require every follower to supply a display name before joining. Off by
 # default: a follower that sends no name (or no hello frame at all) joins as
 # anonymous. Turning it on both surfaces the requirement to the join dialog
@@ -115,7 +140,7 @@ REQUIRE_NAME = env_bool("WSI_SYNC_REQUIRE_NAME", False)
 # address a new IP rule denies — cannot keep driving a long WebSocket session
 # past the next interval. The handshake check alone only binds policy at
 # connect time.
-PRESENTER_REAUTH_INTERVAL_SECONDS = env_float("WSI_SYNC_PRESENTER_REAUTH_SEC", 60)
+PRESENTER_REAUTH_INTERVAL_SECONDS = _env_positive_float("WSI_SYNC_PRESENTER_REAUTH_SEC", 60)
 # How many *consecutive* failed reauth checks (the DB lookup itself raising)
 # before the reauth loop fails closed and drops the presenter with 4401. A
 # single transient hiccup (SQLite write-lock storm, momentary I/O error) is
@@ -135,7 +160,7 @@ PRESENTER_REAUTH_MAX_FAILURES = env_int("WSI_SYNC_PRESENTER_REAUTH_MAX_FAILURES"
 # main._settings_refresh_loop), so a revocation reaches an open socket within
 # roughly this interval plus that refresh, without restarting wsi-sync. Its
 # consecutive-failure backstop is PRESENTER_REAUTH_MAX_FAILURES.
-VIEWER_REAUTH_INTERVAL_SECONDS = env_float("WSI_SYNC_VIEWER_REAUTH_SEC", 60)
+VIEWER_REAUTH_INTERVAL_SECONDS = _env_positive_float("WSI_SYNC_VIEWER_REAUTH_SEC", 60)
 
 # Reverse-DNS lookup for follower IPs is opt-in; on-LAN PTRs are often
 # missing or misleading and the lookup is blocking.
@@ -149,8 +174,12 @@ REVERSE_DNS_TIMEOUT = 0.5
 # resolver those threads stack up and would otherwise starve the default
 # pool that backup extraction, DZI handle open, and other run_in_threadpool
 # callers share. Capping it at a small size confines the damage.
+# At least one worker: ThreadPoolExecutor(max_workers=0) raises ValueError,
+# and this runs at import time, so WSI_SYNC_REVERSE_DNS_WORKERS=0 (a natural
+# guess for "off"; ENABLE_REVERSE_DNS is the switch) would crash-loop both
+# wsi-app and wsi-sync.
 _RDNS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=env_int("WSI_SYNC_REVERSE_DNS_WORKERS", 4),
+    max_workers=env_int_min("WSI_SYNC_REVERSE_DNS_WORKERS", 4, 1),
     thread_name_prefix="wsi-rdns",
 )
 
@@ -208,7 +237,7 @@ MAX_OUTBOUND_QUEUE = env_int("WSI_SYNC_OUTBOUND_QUEUE_MAX", 512)
 # Hard ceiling on a single ``ws.send_json``. A frozen peer can otherwise leave
 # a send awaiting socket drain indefinitely; bound it so the writer task gives
 # up and tears the connection down instead of pinning the slot forever.
-WS_SEND_TIMEOUT_SECONDS = env_float("WSI_SYNC_WS_SEND_TIMEOUT_SEC", 10)
+WS_SEND_TIMEOUT_SECONDS = _env_positive_float("WSI_SYNC_WS_SEND_TIMEOUT_SEC", 10)
 
 # Per-connection inbound-frame rate limit (token bucket). Without it a single
 # hostile follower can spam frames — e.g. visibility toggles — fast enough to
@@ -225,8 +254,8 @@ WS_SEND_TIMEOUT_SECONDS = env_float("WSI_SYNC_WS_SEND_TIMEOUT_SEC", 10)
 # sustained against a 60/s refill. Keep that headroom in mind if the
 # client-side rates are ever raised: a steady state at or above the refill rate would drain the burst reserve
 # over a long session and start silently coalescing real frames.
-INBOUND_FRAME_RATE = env_float("WSI_SYNC_INBOUND_FRAME_RATE", 60)
-INBOUND_FRAME_BURST = env_float("WSI_SYNC_INBOUND_FRAME_BURST", 120)
+INBOUND_FRAME_RATE = _env_positive_float("WSI_SYNC_INBOUND_FRAME_RATE", 60)
+INBOUND_FRAME_BURST = _env_positive_float("WSI_SYNC_INBOUND_FRAME_BURST", 120)
 # A peer that keeps hammering an empty bucket is not a slow client, it is a
 # flood: dropping its frames still costs a recv + task wakeup each, which at
 # tens of thousands of frames/s measurably slowed unrelated rooms. More than
@@ -234,7 +263,7 @@ INBOUND_FRAME_BURST = env_float("WSI_SYNC_INBOUND_FRAME_BURST", 120)
 # window closes the connection with 1008 (policy violation). Legitimate
 # traffic never goes over the limit, so it never accumulates here.
 INBOUND_OVERLIMIT_MAX = env_int("WSI_SYNC_INBOUND_OVERLIMIT_MAX", 200)
-INBOUND_OVERLIMIT_WINDOW_SECONDS = env_float("WSI_SYNC_INBOUND_OVERLIMIT_WINDOW_SEC", 10)
+INBOUND_OVERLIMIT_WINDOW_SECONDS = _env_positive_float("WSI_SYNC_INBOUND_OVERLIMIT_WINDOW_SEC", 10)
 CLOSE_POLICY_VIOLATION = 1008
 
 # How long a slide the presenter was refused (unpublished) stays refused
@@ -661,19 +690,56 @@ def _peek(
 
 # ------------------------------------------------------------ REST endpoints
 
+def _resolve_staff_request(request: Request) -> User:
+    """``require_staff`` resolved in a session of the worker thread's own.
+
+    Runs ``auth.get_current_user`` + ``auth.require_staff`` themselves — not
+    a copy of their checks — so the token decode, user existence, is_active,
+    token_version revocation and the staff-role gate, and their 401 "Missing
+    token" / 401 "Invalid token" / 403 "Forbidden" answers, are exactly the
+    ones every other staff endpoint gives. Only the session differs: one
+    opened and closed here, in the thread, instead of the request's
+    ``Depends(get_db)`` one (see the note above _get_slide). The user's
+    column attributes are loaded before the session closes, so the detached
+    row still reads ``id`` / ``username`` / ``role`` for the audit records.
+    """
+    db = SessionLocal()
+    try:
+        return require_staff(get_current_user(request, db))
+    finally:
+        db.close()
+
+
+async def require_staff_off_loop(request: Request) -> User:
+    """Staff gate for the async sync endpoints, holding no pooled connection.
+
+    ``Depends(require_staff)`` reaches ``get_db`` through
+    ``get_current_user``, and a ``get_db`` session is a generator dependency
+    torn down only once the response is sent: its pooled connection would
+    stay checked out across the endpoint's awaits — the RoomManager's
+    create/supersede/end and the audit hop — so a burst of presenters
+    starting sessions, or a slow room teardown, could pin the whole pool.
+    (FastAPI already runs the plain ``def`` dependencies in its threadpool;
+    the problem is only how long their session lives.) Resolving the user in
+    a short-lived session inside ``asyncio.to_thread`` returns the
+    connection before the endpoint body starts.
+    """
+    return await asyncio.to_thread(_resolve_staff_request, request)
+
+
 @router.post("/api/admin/sync/sessions", response_model=SessionCreateOut)
 async def create_sync_session(
     body: SessionCreateIn,
     request: Request,
-    presenter: User = Depends(require_staff),
-    db: Session = Depends(get_db),
+    presenter: User = Depends(require_staff_off_loop),
 ):
     # Run the SQLite read off the event loop. This handler is ``async`` (it must
     # await the RoomManager), so a synchronous ``db.get`` here would block every
     # other room's broadcast/recv on this single worker while SQLite waits out a
     # write-lock storm (``busy_timeout``). The peek / list endpoints offload
-    # their reads the same way.
-    slide = await asyncio.to_thread(db.get, Slide, body.slide_id)
+    # their reads the same way — each in a session of its own (see
+    # _get_slide for why not the request's ``get_db`` one).
+    slide = await asyncio.to_thread(_get_slide, body.slide_id)
     if not slide:
         raise api_error(404, "sync.apiErr.slideNotFound")
     # Block live sync on unpublished (draft/private) slides. Without this gate
@@ -725,7 +791,7 @@ async def create_sync_session(
 @router.delete("/api/admin/sync/sessions/{sid}")
 async def end_sync_session(
     sid: str,
-    presenter: User = Depends(require_staff),
+    presenter: User = Depends(require_staff_off_loop),
     client_id: Optional[str] = None,
 ):
     # No owner-ID check: per the role-permission matrix any staff user may
@@ -766,12 +832,12 @@ async def end_sync_session(
 # the other's id.
 
 @router.get("/api/sync/sessions/{sid}", response_model=SessionPeekOut)
-async def peek_sync_session(sid: str, db: Session = Depends(get_db)):
+async def peek_sync_session(sid: str):
     room = manager.get(sid)
     if not room:
         raise HTTPException(status_code=404, detail="Session not found")
     slide_id = room.slide_id
-    slide = await asyncio.to_thread(db.get, Slide, slide_id)
+    slide = await asyncio.to_thread(_get_slide, slide_id)
     if not _peek_visible(slide):
         raise HTTPException(status_code=404, detail="Session not found")
     return _peek(slide, slide_id, sid)
@@ -780,8 +846,7 @@ async def peek_sync_session(sid: str, db: Session = Depends(get_db)):
 @router.get("/api/admin/sync/sessions", response_model=SessionListOut)
 async def list_owned_sync_sessions(
     request: Request,
-    presenter: User = Depends(require_staff),
-    db: Session = Depends(get_db),
+    presenter: User = Depends(require_staff_off_loop),
 ):
     # Owner-scoped list backing the presenter's "resume" affordance: after a
     # presenter leaves (reload / tab close / network drop) the room survives
@@ -795,7 +860,7 @@ async def list_owned_sync_sessions(
     # reuses the same canonical share link as create instead of reconstructing
     # it from the browser origin.
     entries = manager.list_owned(presenter.id)
-    slides = await asyncio.to_thread(_load_slides, db, [e.slide_id for e in entries])
+    slides = await asyncio.to_thread(_load_slides, [e.slide_id for e in entries])
     out: List[SessionPeekOut] = []
     for entry in entries:
         peek = _peek(slides.get(entry.slide_id), entry.slide_id, entry.session_id, request)
@@ -804,15 +869,45 @@ async def list_owned_sync_sessions(
     return SessionListOut(sessions=out)
 
 
-def _load_slides(db: Session, slide_ids: List[int]) -> Dict[int, Slide]:
-    """The rows of ``slide_ids`` that exist, by id (for a to_thread hop)."""
+# The DB reads these async endpoints hand to ``asyncio.to_thread`` open a
+# short session of their own inside the worker thread rather than using the
+# request's ``Depends(get_db)`` one. A client that disconnects cancels the
+# awaiting coroutine, but ``to_thread`` cannot stop the thread: ``get_db``'s
+# teardown would then ``close()`` the session on another thread while the
+# worker is still mid-query on it — a Session is not thread-safe, and the
+# connection could go back to the pool in use. A session born and closed in
+# the worker thread has no second owner. The staff gate of these endpoints
+# is resolved the same way (require_staff_off_loop), so no request-scoped
+# session — and no pooled connection — is held while create / end await the
+# RoomManager and the audit hop. The rows are read whole before the session
+# closes, so their column attributes stay readable on the detached
+# instances.
+
+def _get_slide(slide_id: int) -> Optional[Slide]:
+    """The row of ``slide_id``, or None (for a to_thread hop)."""
+    db = SessionLocal()
+    try:
+        return db.get(Slide, slide_id)
+    finally:
+        db.close()
+
+
+def _slides_by_id(db: Session, slide_ids: List[int]) -> Dict[int, Slide]:
     return {sid: s for sid in set(slide_ids) if (s := db.get(Slide, sid)) is not None}
+
+
+def _load_slides(slide_ids: List[int]) -> Dict[int, Slide]:
+    """The rows of ``slide_ids`` that exist, by id (for a to_thread hop)."""
+    db = SessionLocal()
+    try:
+        return _slides_by_id(db, slide_ids)
+    finally:
+        db.close()
 
 
 @router.get("/api/admin/sync/sessions/all", response_model=AdminSessionListOut)
 async def list_all_sync_sessions(
-    presenter: User = Depends(require_staff),
-    db: Session = Depends(get_db),
+    presenter: User = Depends(require_staff_off_loop),
 ):
     """Every active live-sync session, for the staff management surface.
 
@@ -839,11 +934,17 @@ async def list_all_sync_sessions(
     owner_ids = {e.owner_user_id for e in entries}
 
     def _load() -> tuple:
-        owners = {
-            u.id: u
-            for u in (db.query(User).filter(User.id.in_(owner_ids)).all() if owner_ids else [])
-        }
-        return owners, _load_slides(db, [e.slide_id for e in entries])
+        # A session of its own, opened and closed in the worker thread (see
+        # _get_slide).
+        db = SessionLocal()
+        try:
+            owners = {
+                u.id: u
+                for u in (db.query(User).filter(User.id.in_(owner_ids)).all() if owner_ids else [])
+            }
+            return owners, _slides_by_id(db, [e.slide_id for e in entries])
+        finally:
+            db.close()
 
     owners, slides = await asyncio.to_thread(_load)
     out: List[AdminSessionOut] = []

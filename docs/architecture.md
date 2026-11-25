@@ -719,7 +719,7 @@ map $arg_v $wsi_dzi_unversioned { "" 1; default ""; }
 
 # infra/nginx/wsi-locations.conf — /_wsi_authz
 proxy_set_header X-Original-URI $request_uri;
-proxy_cache_key "authz|$wsi_rl_key|$wsi_xfp|$host|$http_x_forwarded_for|$http_cookie|$wsi_authz_object";   # everything the verdict depends on: client, scheme, forwarded chain, the whole Cookie header, the slide
+proxy_cache_key "authz|$wsi_rl_key|$wsi_cf_access_jwt|$wsi_xfp|$host|$http_x_forwarded_for|$http_cookie|$wsi_authz_object";   # everything the verdict depends on: client, CF Access assertion, scheme, forwarded chain, the whole Cookie header, the slide
 proxy_cache_valid 200 204 60s;           # allow verdicts only; 401/403 never stored
 
 # infra/nginx/wsi-locations.conf — /dzi/ (per-location)
@@ -742,8 +742,8 @@ add_header Cache-Control $wsi_dzi_tile_cache_control always;
 # its generation), "no-cache" otherwise, whatever Cache-Control a cached
 # entry holds. The app sends no-cache on everything; the nested .dzi / .szi
 # locations pass that through (proxy_pass_header Cache-Control).
-proxy_no_cache    $wsi_auth_nocache $wsi_cf_access_jwt $wsi_dzi_unversioned;   # keep admin/CF/unversioned out
-proxy_cache_bypass $wsi_auth_nocache $wsi_cf_access_jwt $wsi_dzi_unversioned;
+proxy_no_cache    $wsi_auth_nocache $wsi_dzi_unversioned;   # keep staff-Bearer/unversioned out (a CF Access assertion shares the cache: auth_request gates every HIT)
+proxy_cache_bypass $wsi_auth_nocache $wsi_dzi_unversioned;
 # $wsi_auth_nocache (map in wsi.conf) is set for any Authorization header
 # except HTTP Basic: a staff Bearer unlocks drafts and must never be shared,
 # while app-access Basic only reaches published content. A successful Basic
@@ -797,10 +797,11 @@ endpoints also cap each `/64`, on top of the per-address limit.
 | `wsi_sync_ws` | 600 req/min/IP | 400 | The live-sync WebSocket handshakes, `/api/sync/ws/` and `/api/sync/discovery` |
 | `wsi_slide_detail` | 600 req/min/IP | 200 | `GET /api/slides/<public_id>` (the slide detail read); the rest of `/api/slides/` stays in `wsi_api` |
 | `wsi_page_reads` | 600 req/min/IP | 400 | `GET /api/tours/<public_id>` (the tour read), `GET /api/auth/state` and `GET /api/viewer/settings` (the two small reads every public page makes first); the rest of `/api/tours/` and the analytics beacons stay in `wsi_api` |
+| `wsi_branding` | 600 req/min/IP | 600 | The branding images every page shows once set: `GET /api/viewer/logo`, `/api/viewer/header-default-background` and `/api/viewer/seasonal-background/<1-5>` |
 | `wsi_sync_peek` | 600 req/min/IP | 200 | `GET /api/sync/sessions/<sid>` only (the live-sync session peek); the rest of `/api/sync/` stays in `wsi_api` |
 | `wsi_spa` | 600 req/min/IP | 100 | `location /` — the SPA fallback: index, JS/CSS bundles, fonts, and any non-`/api/`, non-`/dzi/`, non-`/thumbs/`, non-`/assets/` path |
 | `wsi_dzi_uncached` | 600 req/min/IP | 400, of which the first 100 undelayed (`delay=100`) | `/dzi/` requests **without** `?v=` only (tiles, `.dzi`, `.szi`); the key is empty — not counted — for every versioned request |
-| `wsi_dzi_authed` | 3000 req/min/IP | 600 (`nodelay`) | `/dzi/` requests carrying an `Authorization` header other than HTTP Basic (a staff Bearer, or a junk one): they bypass the shared cache both ways, so nginx cannot tell a staff preview from a request that makes the app render a tile every time; students carry no such header and are not counted, nor are requests with a Cloudflare Access JWT |
+| `wsi_dzi_authed` | 3000 req/min/IP | 600 (`nodelay`) | `/dzi/`, `/thumbs/` and `/assets/` requests carrying an `Authorization` header other than HTTP Basic (a staff Bearer, or a junk one): they bypass the shared cache both ways, so nginx cannot tell a staff preview from a request that makes the app render a tile every time; students carry no such header and are not counted, nor are requests with a Cloudflare Access JWT |
 
 A public page load fires several `wsi_api` requests at once (slide list,
 facets, tours, viewer settings, auth state, analytics beacon), so the zone is
@@ -904,7 +905,7 @@ location of its own. The security headers (and why the cached
 |-------|------|-------|---------|
 | Nginx | Disk HTTP cache (tiles) | Server-wide | `wsi_dzi_cache`, 50 GB; `/dzi/` tiles (30-day TTL, keyed by tile generation `?v=`), **shared across all authenticated users** |
 | Nginx | Disk HTTP cache (thumbnails / assets) | Server-wide | `wsi_static_cache`, no `max_size` (bounded by its 32 MB `keys_zone`); `/thumbs/` (60 s TTL) and `/assets/` (1h TTL), both revalidated, **shared across all authenticated users** |
-| Nginx | authz verdict cache | Server-wide | `/api/edge-authz` allow verdicts, 60 s per client (IP + session cookie) and, for `/dzi/`, per slide |
+| Nginx | authz verdict cache | Server-wide | `/api/edge-authz` allow verdicts, 60 s per client (IP + cookies + Cloudflare Access assertion) and, for `/dzi/`, per slide |
 | Application | Python LRU | Per worker process | Holds DeepZoomGenerator for default 8 slides (tunable via `DZI_CACHE_SIZE`) |
 | Application | slide resolve cache | Per worker process | `public_id → (id, is_published, wsi_generation)` for the `/dzi/` routes and the edge authz check; flushed across workers by a sentinel on publish / delete / replace (see `operations.md` → "Slide-metadata resolve cache") |
 | OS | Page cache | Server-wide | Kernel buffers WSI files in memory |

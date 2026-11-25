@@ -74,9 +74,20 @@ def test_meta_keys_match_the_app():
     "v1.2.3", "1.2.3", "v0.1", "0.1.0-rc1", "0.1.0-rc.2", "0.1.0a2", "0.1.0b1",
     "0.1.0-3-gabc1234", "0.1.0-rc1-3-gabc1234", "unknown", "abc1234", "1234abc",
     "v2.0.0-pre", "10.0.0", " v3.4.5 ",
+    "1.2.3.1", "1.2.3.0", "1.2.3.1-rc1", "1.2.3.0.1", "1.2.3.0.0", "v1.2.3.1-4-gabc1234",
 ])
 def test_parse_version_matches_app_meta(v):
     assert rdb.parse_version(v) == app_meta.parse_version(v)
+
+
+def test_parse_version_orders_four_component_versions():
+    """The replica tool's copy orders past-third components like the app."""
+    pv = rdb.parse_version
+    assert pv("1.2.3.0") == pv("1.2.3")
+    assert pv("1.2.3.0.0") == pv("1.2.3")
+    assert pv("1.2.3-rc1") < pv("1.2.3") < pv("1.2.3-5-gabc1234") < pv("1.2.3.1")
+    assert pv("1.2.3.1-rc1") < pv("1.2.3.1") < pv("1.2.3.2") < pv("1.2.4")
+    assert pv("1.2.3") < pv("1.2.3.0.1") < pv("1.2.3.1")
 
 
 def test_public_id_rule_matches_the_app():
@@ -837,3 +848,17 @@ def test_the_helpers_public_id_check_refuses_a_trailing_newline():
     assert rdb.PUBLIC_ID_RE.match("abc")
     assert rdb.PUBLIC_ID_RE.match("abc\n") is None
     assert rdb.PUBLIC_ID_RE.match("a" * 32 + "\n") is None
+
+
+def test_bump_generations_moves_a_null_generation_too(tmp_path):
+    """A database the helper did not create (an older or hand-repaired copy)
+    may hold a NULL generation; SQLite's MAX() would keep it NULL."""
+    path = tmp_path / "loose.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE slides (id INTEGER PRIMARY KEY, wsi_generation INTEGER)")
+    conn.execute("INSERT INTO slides VALUES (1, NULL), (2, 7)")
+    conn.commit()
+    conn.close()
+    run_helper("bump-generations", path)
+    for _sid, gen in rows(path, "SELECT id, wsi_generation FROM slides"):
+        assert gen is not None and gen > 1_600_000_000_000

@@ -23,6 +23,20 @@ function Gated() {
   )
 }
 
+// A page that, like IndexPage / TourViewerPage, calls the returned recheck
+// whenever one of its own requests is answered 401.
+const recheckRef: { current: (() => void) | null } = { current: null }
+function Rechecking() {
+  recheckRef.current = useAuthGate()
+  return <div data-testid="page">index</div>
+}
+
+function deferred<T>() {
+  let resolve!: (v: T) => void
+  const promise = new Promise<T>((r) => { resolve = r })
+  return { promise, resolve }
+}
+
 function Where() {
   const l = useLocation()
   return <div data-testid="where">{l.pathname + l.search}</div>
@@ -33,6 +47,7 @@ function renderAt(url: string) {
     <MemoryRouter initialEntries={[url]}>
       <Routes>
         <Route path="/viewer/:id" element={<Gated />} />
+        <Route path="/index" element={<Rechecking />} />
         <Route path="*" element={<Where />} />
       </Routes>
     </MemoryRouter>,
@@ -49,6 +64,7 @@ afterEach(() => {
   cleanup()
   sessionStorage.clear()
   vi.clearAllMocks()
+  recheckRef.current = null
 })
 
 describe('useAuthGate', () => {
@@ -96,5 +112,59 @@ describe('useAuthGate', () => {
     await new Promise((r) => setTimeout(r, 0))
     expect(screen.getByTestId('page')).toBeTruthy()
     expect(api.getAuthState).toHaveBeenCalledTimes(1)
+  })
+
+  describe('recheck on a 401', () => {
+    it('shares the probe already in flight instead of sending another', async () => {
+      // The mount probe plus three concurrent page fetches all answered 401:
+      // one /api/auth/state request answers them all.
+      const d = deferred<{ mode: string; authenticated: boolean; app_session: boolean }>()
+      api.getAuthState.mockReturnValue(d.promise)
+      renderAt('/index')
+      expect(api.getAuthState).toHaveBeenCalledTimes(1)
+      recheckRef.current!()
+      recheckRef.current!()
+      recheckRef.current!()
+      expect(api.getAuthState).toHaveBeenCalledTimes(1)
+      d.resolve({ mode: 'ldap', authenticated: false, app_session: false })
+      await waitFor(() => expect(screen.getByTestId('where').textContent).toMatch(/^\/login\?next=/))
+      expect(api.getAuthState).toHaveBeenCalledTimes(1)
+    })
+
+    it('does not probe again once the redirect has started', async () => {
+      api.getAuthState.mockResolvedValue({ mode: 'ldap', authenticated: false, app_session: false })
+      renderAt('/index')
+      await waitFor(() => expect(screen.getByTestId('where').textContent).toMatch(/^\/login\?next=/))
+      // A late 401 from a request the page had in flight, delivered through
+      // the recheck it captured before it unmounted.
+      recheckRef.current!()
+      await new Promise((r) => setTimeout(r, 0))
+      expect(api.getAuthState).toHaveBeenCalledTimes(1)
+    })
+
+    it('does not probe from a page that has unmounted', async () => {
+      api.getAuthState.mockResolvedValue({ mode: 'ldap', authenticated: true, app_session: true })
+      const { unmount } = renderAt('/index')
+      await waitFor(() => expect(api.getAuthState).toHaveBeenCalledTimes(1))
+      await new Promise((r) => setTimeout(r, 0))
+      const recheck = recheckRef.current!
+      unmount()
+      recheck()
+      expect(api.getAuthState).toHaveBeenCalledTimes(1)
+    })
+
+    it('probes again for a 401 that arrives after the last probe answered', async () => {
+      // The session was valid at mount and expired later: the next 401 must
+      // still be able to send the visitor to sign in.
+      api.getAuthState.mockResolvedValueOnce({ mode: 'ldap', authenticated: true, app_session: true })
+      api.getAuthState.mockResolvedValueOnce({ mode: 'ldap', authenticated: false, app_session: false })
+      renderAt('/index')
+      await waitFor(() => expect(api.getAuthState).toHaveBeenCalledTimes(1))
+      await new Promise((r) => setTimeout(r, 0))
+      expect(screen.getByTestId('page')).toBeTruthy()
+      recheckRef.current!()
+      expect(api.getAuthState).toHaveBeenCalledTimes(2)
+      await waitFor(() => expect(screen.getByTestId('where').textContent).toMatch(/^\/login\?next=/))
+    })
   })
 })

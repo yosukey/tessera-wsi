@@ -104,4 +104,46 @@ describe('AdminSeasonalBackgroundsSection', () => {
     expect(label.closest('fieldset')!.disabled).toBe(false)
     expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull()
   })
+
+  it('reports unsaved edits up, guards reload, and clears on save / unmount', async () => {
+    // The slots' edits are local state, lost when the Settings tab unmounts:
+    // the dashboard is told so it can confirm before switching tabs.
+    api.adminListSeasonalBackgrounds.mockResolvedValue([SLOT1])
+    api.adminUpdateSeasonalBackground.mockImplementation(async (_slot: number, body: Partial<SeasonalBackground>) => ({ ...SLOT1, ...body }))
+    const onDirtyChange = vi.fn()
+    const { unmount } = render(
+      <I18nProvider><AdminSeasonalBackgroundsSection onDirtyChange={onDirtyChange} /></I18nProvider>,
+    )
+    const label = await screen.findByDisplayValue('Spring') as HTMLInputElement
+    expect(onDirtyChange).toHaveBeenLastCalledWith(false)
+
+    fireEvent.change(label, { target: { value: 'Summer' } })
+    await waitFor(() => expect(onDirtyChange).toHaveBeenLastCalledWith(true))
+    const ev = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(ev)
+    expect(ev.defaultPrevented).toBe(true)
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'Save' })[0])
+    await waitFor(() => expect(onDirtyChange).toHaveBeenLastCalledWith(false))
+    const ev2 = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(ev2)
+    expect(ev2.defaultPrevented).toBe(false)
+
+    fireEvent.change(label, { target: { value: 'Autumn' } })
+    await waitFor(() => expect(onDirtyChange).toHaveBeenLastCalledWith(true))
+    unmount()
+    expect(onDirtyChange).toHaveBeenLastCalledWith(false)
+  })
+
+  it('registers its navigation-guard exit in leaveRef while mounted', async () => {
+    api.adminListSeasonalBackgrounds.mockResolvedValue([SLOT1])
+    const leaveRef: { current: ((go: () => void) => void) | null } = { current: null }
+    const { unmount } = render(
+      <I18nProvider><AdminSeasonalBackgroundsSection leaveRef={leaveRef} /></I18nProvider>,
+    )
+    await screen.findByDisplayValue('Spring')
+    expect(typeof leaveRef.current).toBe('function')
+    unmount()
+    expect(leaveRef.current).toBeNull()
+  })
 })

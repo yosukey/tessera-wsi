@@ -746,8 +746,13 @@ class _SziHandle:
         return rng.choice(ref[1])
 
     def render(self, key) -> tuple[float, float, int]:
+        from . import szi_utils as su
+
         t0 = time.perf_counter()
-        data = self.zf.read(key)
+        # The same capped, stored-only read the thumbnail builder makes: a
+        # plain zf.read would let a crafted member (compress_size far above
+        # file_size) allocate up to 1 GiB per sample.
+        data = su._read_member_capped(self.zf, key, su._MAX_DZI_TILE_BYTES, what="tile")
         return (time.perf_counter() - t0) * 1000.0, 0.0, len(data)
 
     @staticmethod
@@ -904,7 +909,16 @@ def _epoch(dt: Optional[datetime]) -> Optional[float]:
 
 def server_run_overlap(db: Session, start: float, end: float, exclude_id: Optional[int] = None) -> bool:
     """Whether a server benchmark ran at any moment of [start, end] (epoch
-    seconds): a browser test taken meanwhile measured a loaded server."""
+    seconds): a browser test taken meanwhile measured a loaded server.
+
+    A run's end is capped at ``created_at + _ORPHAN_AGE_SECONDS``: no run can
+    still be working past that (MAX_RUN_SECONDS plus the join grace, with
+    room to spare — reap_orphans treats an older 'running' row as dead for
+    the same reason). Without the cap, a row orphaned by a worker that died
+    mid-run would read as running "until now" for as long as nothing reaped
+    it, flagging every browser test since as overlapping; and once reaped,
+    its finished_at is the reap time, not the moment the worker died, which
+    would flag the browser test whose recording did the reaping."""
     rows = db.execute(
         select(PerfRun.id, PerfRun.state, PerfRun.created_at, PerfRun.finished_at)
         .where(PerfRun.kind == "server").order_by(PerfRun.id.desc()).limit(_MAX_STORED_RUNS + 1)
@@ -916,6 +930,7 @@ def server_run_overlap(db: Session, start: float, end: float, exclude_id: Option
         ended = time.time() if r.state == "running" else _epoch(r.finished_at)
         if began is None or ended is None:
             continue
+        ended = min(ended, began + _ORPHAN_AGE_SECONDS)
         if began <= end and ended >= start:
             return True
     return False
@@ -1381,19 +1396,26 @@ def _measure_scaling(handles: list, params: BenchParams, seed: int,
         stuck = [t for t in threads if t.is_alive()]
         elapsed = time.perf_counter() - t0
         busy, iowait = clock.split(cpu0, clock.snap())
-        # Read under the lock: a stuck thread may still append on its way out.
+        # One snapshot of everything the workers write, taken under their
+        # lock: a stuck thread may still append (or count an error) on its
+        # way out, and reading the lists and counters bare would let the
+        # step's tile count, latencies and error count each describe a
+        # different moment — or sort a list while it grows.
         with lock:
             step_keys = list(keys)
+            step_latencies = list(latencies)
+            step_errors = errors[0]
+            step_skipped = skipped[0]
         fresh = set(step_keys) - seen
         seen.update(step_keys)
         results.append({
             "concurrency": n,
-            "tiles": len(latencies),
-            "errors": errors[0],
-            "skipped": skipped[0],
+            "tiles": len(step_latencies),
+            "errors": step_errors,
+            "skipped": step_skipped,
             "seconds": round(elapsed, 2),
-            "tiles_per_s": round(len(latencies) / elapsed, 1) if elapsed > 0 else None,
-            "latency_ms": stats_ms(latencies),
+            "tiles_per_s": round(len(step_latencies) / elapsed, 1) if elapsed > 0 else None,
+            "latency_ms": stats_ms(step_latencies),
             "cpu_busy_pct": busy,
             "iowait_pct": iowait,
             # Renders of a tile new to this run (see the docstring); the rest

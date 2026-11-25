@@ -88,26 +88,34 @@ expect "lib/wsi-common.sh is sourced from REPO_DIR" "yes" \
 expect "nothing is sourced from \$APP_HOME" "" "$(grep -E '^(\.|source)[[:space:]].*APP_HOME' <<<"$CODE" || true)"
 
 # ---- 2. REPO_DIR guard -----------------------------------------------------
+# The guard is the first thing install.sh runs after setting REPO_DIR -- before
+# lib/wsi-common.sh is sourced -- and is the same block as update.sh's
+# (test_root_guard.sh exercises its ownership / world-writable checks on all
+# three scripts). Here: the APP_HOME containment, on the extracted block.
 GUARD_SRC="$(awk '
-    /^_repo_real="/                    { grabbing = 1 }
+    /^_guard_refuse\(\) \{/              { grabbing = 1 }
     grabbing                           { print }
-    grabbing && /^unset _repo_real /   { exit }
+    grabbing && /^unset _guard_repo_real / { exit }
 ' "$INSTALL_SH")"
-if [[ "$GUARD_SRC" != *'_app_real'* ]]; then
+if [[ "$GUARD_SRC" != *'_guard_repo_real'* ]]; then
     echo "FAILED: could not extract the REPO_DIR guard from $INSTALL_SH"
     exit 1
 fi
+expect "guard: runs before lib/wsi-common.sh is sourced" "yes" \
+       "$(awk '/^_guard_refuse\(\) \{/ { g = NR } /^\. "\$WSI_COMMON_SH"$/ { s = NR } END { print (g && s && g < s) ? "yes" : "no" }' "$INSTALL_SH")"
 TMP_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TMP_ROOT"' EXIT
-mkdir -p "$TMP_ROOT/opt/wsi/src" "$TMP_ROOT/opt/wsi-other" "$TMP_ROOT/home/clone"
+for d in "$TMP_ROOT/opt/wsi/src" "$TMP_ROOT/opt/wsi-other" "$TMP_ROOT/home/clone"; do
+    mkdir -p "$d/infra/lib" "$d/infra/systemd" "$d/infra/nginx"
+    : > "$d/infra/wsi.env.example"
+done
+chmod -R go-w "$TMP_ROOT"
 ln -s "$TMP_ROOT/opt/wsi/src" "$TMP_ROOT/home/link-into-app"
 guard_dies() {
     # guard_dies REPO_DIR -> "died" / "ok"
     # shellcheck disable=SC2034  # read by the eval'd guard
-    local REPO_DIR="$1" APP_HOME="$TMP_ROOT/opt/wsi" died=0
-    die() { died=1; }
-    eval "$GUARD_SRC"
-    [[ "$died" -eq 1 ]] && echo died || echo ok
+    ( REPO_DIR="$1" APP_HOME="$TMP_ROOT/opt/wsi"; eval "$GUARD_SRC" ) >/dev/null 2>&1 \
+        && echo ok || echo died
 }
 expect "guard: separate clone is accepted"              ok   "$(guard_dies "$TMP_ROOT/home/clone")"
 expect "guard: sibling with a common prefix is accepted" ok  "$(guard_dies "$TMP_ROOT/opt/wsi-other")"

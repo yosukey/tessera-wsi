@@ -13,7 +13,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import delete, func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 
 from ..admin_helpers import audit
 from ..admin_reports import (
@@ -132,9 +132,6 @@ def admin_logs(
         snapshot_id = db.execute(select(func.max(ErrorLog.id))).scalar_one() or 0
     in_snapshot = [*filters, ErrorLog.id <= snapshot_id]
 
-    total = db.execute(
-        select(func.count()).select_from(ErrorLog).where(*in_snapshot)
-    ).scalar_one()
     # Rows matching the filters written after the snapshot, so the UI can
     # offer to reload instead of silently showing a stale first page.
     newer = db.execute(
@@ -153,6 +150,14 @@ def admin_logs(
             .group_by(ErrorLog.level)
         ).all()
     }
+    # The total is read off the level counts rather than counted again: they
+    # cover exactly the snapshot's rows under every other filter, and the level
+    # filter is an exact match on that same column, so a second count would
+    # only repeat the scan — the costly one when a search runs LIKE over every
+    # traceback in the table.
+    total = (
+        level_counts.get(level.upper(), 0) if level else sum(level_counts.values())
+    )
     # The traceback (up to 16 KB a row) stays out of the listing: it is shown
     # on demand, from /api/admin/logs/{id}.
     rows = db.execute(
@@ -291,12 +296,16 @@ def admin_logs_export_csv(
     else:
         span = "all"
     fname = f"error-logs-{span}.csv"
+    # Without tracebacks the column is not read at all (up to 16 KB a row,
+    # most of each row's bytes); _to_row never touches it then.
+    options = () if include_traceback else (defer(ErrorLog.traceback),)
     claim_export_slot()
     # Read in short keyset batches (see iter_newest_first) and stream, so
     # neither the rows nor the rendered CSV are ever all held at once, and no
     # read transaction stays open for the length of the download.
     return slot_csv_response(
-        fname, _CSV_HEADER, iter_newest_first(ErrorLog, filters, effective_limit, _to_row),
+        fname, _CSV_HEADER,
+        iter_newest_first(ErrorLog, filters, effective_limit, _to_row, options=options),
         auth_db=db,
     )
 

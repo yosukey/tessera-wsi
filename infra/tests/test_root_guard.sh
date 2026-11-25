@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# update.sh and sync-from.sh run as root and source / execute files from their
-# own tree, so they must refuse a tree the service user (or anyone else) could
-# have rewritten -- above all the deployed copy under /opt/wsi, as install.sh,
-# set-workers.sh and set-cache-size.sh do -- and update.sh must make that
-# check before it sources lib/wsi-common.sh.
+# install.sh, update.sh and sync-from.sh run as root and source / execute (or
+# install into root-consumed places) files from their own tree, so they must
+# refuse a tree the service user (or anyone else) could have rewritten -- above
+# all the deployed copy under /opt/wsi, as set-workers.sh and set-cache-size.sh
+# do -- and must make that check before they source lib/wsi-common.sh.
 #
 # Run: bash infra/tests/test_root_guard.sh   (the ownership case needs root;
 # CI runs this file under sudo)
@@ -22,10 +22,14 @@ trap 'rm -rf "$TMP"' EXIT
 
 # A scratch "checkout": just the scripts and the lib the guard looks at.
 make_tree() {  # make_tree DIR
-    mkdir -p "$1/infra/lib" "$1/infra/systemd" "$1/Makefile.d"
-    cp "$REPO/infra/update.sh" "$REPO/infra/sync-from.sh" "$REPO/infra/install.sh" "$1/infra/"
+    mkdir -p "$1/infra/lib" "$1/infra/systemd" "$1/infra/nginx" "$1/Makefile.d"
+    cp "$REPO/infra/update.sh" "$REPO/infra/sync-from.sh" "$REPO/infra/install.sh" \
+       "$REPO/infra/wsi.env.example" "$1/infra/"
     cp "$REPO/infra/lib/"*.sh "$REPO/infra/lib/"*.py "$1/infra/lib/"
-    chmod 755 "$1" "$1/infra" "$1/infra/lib"
+    # (install.sh installs these as root, so its guard covers them too)
+    cp "$REPO/infra/systemd/"* "$1/infra/systemd/"
+    cp "$REPO/infra/nginx/"* "$1/infra/nginx/"
+    chmod 755 "$1" "$1/infra" "$1/infra/lib" "$1/infra/systemd" "$1/infra/nginx"
 }
 
 run() {  # run SCRIPT_PATH [ENV=VAL ...] : prints the combined output
@@ -33,7 +37,7 @@ run() {  # run SCRIPT_PATH [ENV=VAL ...] : prints the combined output
     ( cd / && env "$@" bash "$script" 2>&1 </dev/null ) | head -20
 }
 
-for name in update.sh sync-from.sh; do
+for name in update.sh sync-from.sh install.sh; do
     # 1. Inside the deployed copy: refused, before anything else is read.
     make_tree "$TMP/opt-wsi"
     out="$(run "$TMP/opt-wsi/infra/$name" APP_HOME="$TMP/opt-wsi")"
@@ -83,13 +87,45 @@ for name in update.sh sync-from.sh; do
 
     # 3c. Every file root goes on to run, and the script itself, is checked: a
     #     world-writable one is refused even when the rest of the tree is fine.
-    other=install.sh; [[ "$name" == sync-from.sh ]] && other=lib/replica_db.py
-    for victim in "$name" "$other"; do
+    case "$name" in
+        # install.sh and lib/nginx_tls_carry.py (the TLS-settings check it runs
+        # before stopping anything) -- and everything install.sh's own guard
+        # checks: update.sh only reaches install.sh after the snapshot, with
+        # the services stopped, so a file only install.sh refused would cost
+        # a rollback and downtime instead of a refusal up front.
+        update.sh)    others=(install.sh lib/nginx_tls_carry.py lib/wsi-common.sh
+                              systemd/wsi-restart.service systemd/wsi-cache-stat.sh
+                              nginx/wsi.conf nginx/wsi-tls.conf wsi.env.example) ;;
+        # replica_db.py, and lib/envfile_set.py, which its set-env imports as root
+        sync-from.sh) others=(lib/replica_db.py lib/envfile_set.py) ;;
+        # what it sources / runs, and what it installs into root-consumed places
+        install.sh)   others=(lib/wsi-common.sh lib/nginx_tls_carry.py
+                              systemd/wsi-restart.service systemd/wsi-cache-stat.sh
+                              nginx/wsi.conf nginx/wsi-tls.conf wsi.env.example) ;;
+    esac
+    for victim in "$name" "${others[@]}"; do
         make_tree "$TMP/w-$name-${victim//\//_}"
         chmod 666 "$TMP/w-$name-${victim//\//_}/infra/$victim"
         out="$(run "$TMP/w-$name-${victim//\//_}/infra/$name" APP_HOME="$TMP/not-this")"
+        # (by $name's own guard: a later install.sh refusing it is too late --
+        #  update.sh has stopped the services by then)
         expect "$name: a world-writable $victim is refused" "yes" \
-            "$(grep -q "$victim is writable by every user" <<<"$out" && echo yes)"
+            "$(grep -q "refusing to run [^ ]*/infra/$name: .*$victim is writable by every user" <<<"$out" && echo yes)"
+    done
+
+    # 3d. ... and so is a world-writable directory root reads from (a new
+    #     file could be dropped into it). update.sh checks the same ones as
+    #     install.sh, for the reason above.
+    case "$name" in
+        update.sh|install.sh) dirs=(lib systemd nginx) ;;
+        sync-from.sh)         dirs=(lib) ;;
+    esac
+    for victim in "${dirs[@]}"; do
+        make_tree "$TMP/d-$name-$victim"
+        chmod 777 "$TMP/d-$name-$victim/infra/$victim"
+        out="$(run "$TMP/d-$name-$victim/infra/$name" APP_HOME="$TMP/not-this")"
+        expect "$name: a world-writable infra/$victim/ is refused" "yes" \
+            "$(grep -q "refusing to run [^ ]*/infra/$name: .*/infra/$victim is writable by every user" <<<"$out" && echo yes)"
     done
 
     # 4. A proper clone passes the guard (it then fails later for its own
@@ -100,16 +136,37 @@ for name in update.sh sync-from.sh; do
         "$(grep -q "refusing to run" <<<"$out" && echo yes || echo no)"
 done
 
+# 4b. update.sh's guard checks every path install.sh's does (it cannot source
+#     a shared list: nothing may be read from the tree before it is checked,
+#     so each script carries its own copy). Compared entry by entry, so a
+#     path added to install.sh's list alone fails here.
+guard_paths() {  # guard_paths SCRIPT : the _guard_paths entries, one per line
+    awk '/^_guard_paths=\(/ {on=1} on {print} on && /\)$/ {exit}' "$1" \
+        | grep -oE '"[$]REPO_DIR[^"]*"(/[*])?'
+}
+missing="$(comm -23 <(guard_paths "$REPO/infra/install.sh" | sort -u) \
+                    <(guard_paths "$REPO/infra/update.sh" | sort -u) | tr '\n' ' ')"
+expect "install.sh's guard list is not empty" "yes" \
+    "$([[ -n "$(guard_paths "$REPO/infra/install.sh")" ]] && echo yes)"
+expect "update.sh's guard checks every path install.sh's does" "" "${missing}"
+
 # 5. The deployed copy is refused even when APP_HOME is not set: /opt/wsi is
 #    built in. The guard block is lifted out of each script and run with that
 #    path moved into the scratch tree -- the test fails if the literal is gone.
-for name in update.sh sync-from.sh; do
+for name in update.sh sync-from.sh install.sh; do
     block="$(awk '/^_guard_refuse\(\) \{/ {on=1} on {print} /^unset _guard_repo_real/ {exit}' "$REPO/infra/$name")"
     expect "$name: the guard block has /opt/wsi built in" "1" "$(grep -c 'for _guard_home in /opt/wsi ' <<<"$block")"
     mkdir -p "$TMP/builtin-$name/opt-wsi/infra" "$TMP/builtin-$name/clone/infra"
     for tree in opt-wsi clone; do
-        for f in lib/wsi-common.sh lib/replica_db.py install.sh; do mkdir -p "$TMP/builtin-$name/$tree/infra/lib"; cp "$REPO/infra/$f" "$TMP/builtin-$name/$tree/infra/$f"; done
-        chmod 755 "$TMP/builtin-$name" "$TMP/builtin-$name/$tree" "$TMP/builtin-$name/$tree/infra" "$TMP/builtin-$name/$tree/infra/lib"
+        for f in lib/wsi-common.sh lib/replica_db.py lib/envfile_set.py lib/nginx_tls_carry.py \
+                 install.sh wsi.env.example; do
+            mkdir -p "$TMP/builtin-$name/$tree/infra/lib" "$TMP/builtin-$name/$tree/infra/systemd" \
+                     "$TMP/builtin-$name/$tree/infra/nginx"
+            cp "$REPO/infra/$f" "$TMP/builtin-$name/$tree/infra/$f"
+        done
+        chmod 755 "$TMP/builtin-$name" "$TMP/builtin-$name/$tree" "$TMP/builtin-$name/$tree/infra" \
+                  "$TMP/builtin-$name/$tree/infra/lib" "$TMP/builtin-$name/$tree/infra/systemd" \
+                  "$TMP/builtin-$name/$tree/infra/nginx"
         {
             echo 'set -Eeuo pipefail'
             echo "REPO_DIR=\"$TMP/builtin-$name/$tree\""
@@ -127,7 +184,7 @@ done
 
 printf -- '--------------------------------------------------------------\n'
 if [[ "$fails" -eq 0 ]]; then
-    printf 'PASS - update.sh and sync-from.sh refuse a tree the service user could have rewritten\n'
+    printf 'PASS - install.sh, update.sh and sync-from.sh refuse a tree the service user could have rewritten\n'
 else
     exit 1
 fi

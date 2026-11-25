@@ -92,14 +92,22 @@ then
     exit 1
 fi
 
-# Stub systemctl: logs every call. SYNC_ACTIVE=1 makes wsi-sync report active;
-# APP_OK=1 makes `restart wsi-app` succeed and consume restore.request (what
-# start-wsi-app.sh does), APP_OK=0 makes it fail and report is-failed.
+# Stub systemctl: logs every call. SYNC_ACTIVE=1 makes wsi-sync report active
+# (SYNC_STATE, when set, is the exact state it reports instead, e.g.
+# activating); APP_OK=1 makes `restart wsi-app` succeed and consume
+# restore.request (what start-wsi-app.sh does), APP_OK=0 makes it fail and
+# report is-failed. `is-active` exits 0 for active / reloading / refreshing
+# only, as the real one does.
 cat > "${WORK}/systemctl" <<SH
 #!/bin/sh
 echo "\$*" >> "${WORK}/calls.log"
+sync_state="\${SYNC_STATE:-}"
+[ -n "\$sync_state" ] || { [ "\${SYNC_ACTIVE:-0}" = 1 ] && sync_state=active || sync_state=inactive; }
 case "\$1 \$2" in
-    "is-active --quiet") [ "\${SYNC_ACTIVE:-0}" = 1 ] ;;
+    "is-active --quiet") case "\$sync_state" in active|reloading|refreshing) exit 0 ;; *) exit 3 ;; esac ;;
+    "is-active wsi-sync.service")
+        echo "\$sync_state"
+        case "\$sync_state" in active|reloading|refreshing) exit 0 ;; *) exit 3 ;; esac ;;
     "is-failed --quiet") [ "\${APP_OK:-1}" = 0 ] ;;
     "restart wsi-app.service")
         if [ "\${APP_OK:-1}" = 1 ]; then rm -f "${WORK}/run/restore.request"; exit 0; fi
@@ -115,10 +123,10 @@ run() {
     rm -f "${WORK}/calls.log" "${WORK}/run/restore.request"
     : > "${WORK}/calls.log"
     [[ "$req" == 1 ]] && : > "${WORK}/run/restore.request"
-    SYNC_ACTIVE="$sync" APP_OK="$app" timeout 30 sh "${WORK}/exec.sh"
+    SYNC_ACTIVE="$sync" APP_OK="$app" SYNC_STATE="${SYNC_STATE:-}" timeout 30 sh "${WORK}/exec.sh"
     local rc=$?
     local got want
-    got="$(grep -v -- '--quiet' "${WORK}/calls.log" | paste -sd ';' -)"
+    got="$(grep -v -e '--quiet' -e '^is-active ' "${WORK}/calls.log" | paste -sd ';' -)"
     want="$(printf '%s\n' "$@" | paste -sd ';' -)"
     if [[ "$got" == "$want" && "$rc" == "$want_rc" ]]; then
         printf 'ok   - %s\n' "$name"
@@ -135,6 +143,13 @@ run "restore apply with sync already stopped does not start it" 1 0 1 0 \
     "stop wsi-sync.service" "restart wsi-app.service"
 run "restore apply where wsi-app fails still brings sync back, keeps rc" 1 1 0 1 \
     "stop wsi-sync.service" "restart wsi-app.service" "start wsi-sync.service"
+# wsi-sync still starting, or between a crash and Restart=on-failure's restart:
+# `activating`, which `is-active` does not count as active. The stop cancels
+# that start, so it must be started again afterwards, not left down.
+SYNC_STATE=activating run "restore apply with sync activating (auto-restart) brings it back" 1 0 1 0 \
+    "stop wsi-sync.service" "restart wsi-app.service" "start wsi-sync.service"
+SYNC_STATE=failed run "restore apply with sync failed does not start it" 1 0 1 0 \
+    "stop wsi-sync.service" "restart wsi-app.service"
 
 # The wait loop must hold wsi-sync back until the swap is done, i.e. until
 # start-wsi-app.sh removes restore.request — not merely until restart returns.

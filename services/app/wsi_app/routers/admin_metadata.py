@@ -271,9 +271,6 @@ def admin_delete_metadata_option(
     # backend with empty `key`/`value` and silently no-op.
     k = (key or "").strip()
     v = (value or "").strip()
-    opt = db.execute(
-        select(MetadataOption).where(MetadataOption.key == k, MetadataOption.value == v)
-    ).scalar_one_or_none()
     # The dashboard's confirmation dialog warns "this value will be removed
     # from the N slide(s) that use it". Honour that contract by also deleting
     # matching slide_attributes rows — otherwise the slides keep the value as
@@ -308,9 +305,16 @@ def admin_delete_metadata_option(
         db.rollback()
         return _changed_since_confirmation(slides_affected, tours_affected)
     _bump_tour_revisions(db, removed_tour_ids)
-    options_removed = 1 if opt is not None else 0
-    if opt is not None:
-        db.delete(opt)
+    # The master row goes by (key, value) in this same write transaction, not
+    # by an ORM instance loaded before it began: a rename landing in between
+    # updates that row in place (same id), so deleting the loaded instance by
+    # its primary key would remove the option under its new name; and a
+    # concurrent delete of it would make the flush match no row and raise
+    # StaleDataError (a 500). A statement keyed on the value removes exactly
+    # what is still called that, and 0 rows is just "already gone".
+    options_removed = db.execute(
+        delete(MetadataOption).where(MetadataOption.key == k, MetadataOption.value == v)
+    ).rowcount or 0
     # Commit unconditionally: even a DELETE that matched nothing has opened a
     # write transaction, and audit() persists on another connection — left
     # open, that insert waits out busy_timeout and the audit row is lost.

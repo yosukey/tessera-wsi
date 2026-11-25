@@ -28,7 +28,10 @@ The database is ``--db``, else ``DATABASE_URL`` from the environment, else
 the one /etc/wsi/wsi.env names (``WSI_ENV_FILE`` overrides that path; the
 file is root-only, hence sudo), else /var/lib/wsi/wsi.db; the path used is
 printed. Run as root, the tool switches to the database file's owner before
-opening it, so SQLite's -wal / -shm files keep their owner.
+opening it, so SQLite's -wal / -shm files keep their owner; it refuses a
+database path that is a symlink, or whose file and directory belong to
+different users, and, when root owns both, one under a directory that is not
+root's or is writable by others (see ``_become_owner``).
 
 The services may keep running. Standard library only: it touches nothing but
 the ``users`` and ``audit_logs`` tables, through ``sqlite3``.
@@ -41,6 +44,7 @@ import os
 import pwd
 import re
 import sqlite3
+import stat
 import sys
 
 DEFAULT_DB = "/var/lib/wsi/wsi.db"
@@ -113,26 +117,145 @@ def _service_user_owns_this_script(db_owner: int) -> bool:
 
 
 def _become_owner(db_path: str) -> None:
-    """Run as root, switch to the database file's owner: a root-owned -wal /
-    -shm left behind would lock the service out of its own database."""
+    """Run as root, switch to the database's owner before anything opens it:
+    a root-owned -wal / -shm left behind would lock the service out of its own
+    database, and root must not act inside a directory the service user can
+    write.
+
+    The service user owns both the database and the directory it sits in
+    (/var/lib/wsi), so it can put anything at that name between any check
+    made here and SQLite's open: a symlink to a root-owned file, or a
+    root-owned file of its own choosing. So the decision is made from what
+    cannot be faked from inside that directory:
+
+    - ``lstat``, never ``stat``: a symlink planted there is refused outright
+      rather than followed (a ``stat`` would report the root-owned target and
+      keep root);
+    - the directory's owner as well as the file's: a root-owned file in a
+      directory someone else owns is still theirs to swap, and SQLite creates
+      its sidecar files in that directory;
+    - when either belongs to someone other than root, the switch to that user
+      is unconditional, and only after it does SQLite open the path, so
+      whatever is there by then is opened with no more rights than the
+      service already has.
+
+    Root stays root only when root owns both and every directory above them
+    is root's and not writable by anyone else (_refuse_unsafe_ancestors),
+    i.e. nobody else could have planted anything."""
     if os.geteuid() != 0:
         return
-    st = os.stat(db_path)
-    if st.st_uid == 0:
+    directory = os.path.dirname(os.path.abspath(db_path))
+    try:
+        st = os.lstat(db_path)
+        dir_st = os.stat(directory)
+    except OSError as exc:
+        raise _Unreadable(f"cannot inspect {db_path} ({exc.strerror})") from None
+    if stat.S_ISLNK(st.st_mode):
+        raise _Unreadable(
+            f"refusing to run as root on {db_path}: it is a symbolic link; "
+            "pass the database's real path with --db"
+        )
+    if not stat.S_ISREG(st.st_mode):
+        raise _Unreadable(f"refusing to run as root on {db_path}: not a regular file")
+    owners = {st.st_uid, dir_st.st_uid} - {0}
+    if not owners:
+        # Root keeps its rights here, so the rest of the path must be root's
+        # too: see _refuse_unsafe_ancestors.
+        _refuse_unsafe_ancestors(directory)
         return
-    if _service_user_owns_this_script(st.st_uid):
+    if len(owners) > 1 or st.st_uid == 0:
+        # Two different non-root owners, or a root-owned database in a
+        # directory another user owns: no single identity both can open the
+        # file and is the only one able to swap it. Refuse rather than guess.
+        raise _Unreadable(
+            f"refusing to run as root: {db_path} and its directory {directory} "
+            "do not belong to the same user; run the tool as the database's owner "
+            "(sudo -u <user> python3 -I ...)"
+        )
+    uid = owners.pop()
+    # The group the service runs with: the database file's own group when it
+    # is the owner's file (as installed), else that user's primary group.
+    try:
+        pw = pwd.getpwuid(uid)
+    except KeyError:
+        pw = None
+    gid = st.st_gid if st.st_uid == uid else (pw.pw_gid if pw else dir_st.st_gid)
+    if _service_user_owns_this_script(uid):
         raise _Unreadable(
             "refusing to run as root from a copy the service user owns "
             f"({os.path.abspath(__file__)}); run it from your own clone of the repository"
         )
-    try:
+    if pw is not None:
         # The owner's own supplementary groups, as the service has them: the
         # database's directory may be reachable only through one.
-        os.initgroups(pwd.getpwuid(st.st_uid).pw_name, st.st_gid)
-    except KeyError:
+        os.initgroups(pw.pw_name, gid)
+    else:
         os.setgroups([])
-    os.setgid(st.st_gid)
-    os.setuid(st.st_uid)
+    os.setgid(gid)
+    os.setuid(uid)
+
+
+def _ancestor_chain(path: str) -> list:
+    """``path`` and every directory above it, up to and including ``/``."""
+    chain = []
+    while True:
+        chain.append(path)
+        parent = os.path.dirname(path)
+        if parent == path:
+            return chain
+        path = parent
+
+
+def _refuse_unsafe_ancestors(directory: str) -> None:
+    """Refuse (``_Unreadable``) unless nobody but root can change what the
+    path to ``directory`` leads to.
+
+    Called when root stays root because root owns both the database and its
+    directory. That decision only holds if the directories above are root's
+    as well: whoever owns, or may write to, any ancestor can rename the
+    root-owned directory aside and put one of their own — holding a database
+    of their choosing, or a symlink — at the same path, between the check in
+    _become_owner and SQLite's open (and SQLite then creates its -wal / -shm
+    there as root). So every directory from ``directory`` up to ``/`` must be
+    owned by root and must not be writable by group or others, unless it
+    has the sticky bit (``/tmp``: others may create entries there but not
+    rename or remove root's).
+
+    Both the path as given and its symlink-resolved form are checked: a
+    symlink along the way is followed on every open, so the directories it
+    leads to matter as much as the ones it sits in. A symlink itself is
+    skipped (its own mode means nothing; replacing it is a write to its
+    parent, which is in the chain).
+
+    The documented layout never gets here: /var/lib/wsi belongs to the
+    service user, so the tool switches to that user instead of staying root.
+    """
+    abspath = os.path.abspath(directory)
+    seen = set()
+    for chain in (_ancestor_chain(abspath), _ancestor_chain(os.path.realpath(abspath))):
+        for path in chain:
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                st = os.lstat(path)
+            except OSError as exc:
+                raise _Unreadable(f"cannot inspect {path} ({exc.strerror})") from None
+            if stat.S_ISLNK(st.st_mode):
+                continue
+            if st.st_uid != 0:
+                raise _Unreadable(
+                    f"refusing to run as root on a database under {path}: that "
+                    "directory is not owned by root, so its owner could swap the "
+                    "database's path; run the tool as that user, or move the "
+                    "database to a root-owned location"
+                )
+            if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not st.st_mode & stat.S_ISVTX:
+                raise _Unreadable(
+                    f"refusing to run as root on a database under {path}: that "
+                    "directory is writable by group or others (without the sticky "
+                    "bit), so they could swap the database's path"
+                )
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set:

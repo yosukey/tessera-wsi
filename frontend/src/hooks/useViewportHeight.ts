@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { visibleViewportSize } from '../lib/viewportBox'
 
 // After a viewport change, when to measure again (ms): iPadOS browsers can
 // fire `orientationchange` and even the first `resize` while the viewport
@@ -35,7 +36,11 @@ export function useViewportHeight(): string {
   const [height, setHeight] = useState<string>('100dvh')
   useEffect(() => {
     const measure = () => {
-      const h = window.visualViewport?.height ?? window.innerHeight
+      // At page scale 1: during a pinch zoom (e.g. a trackpad pinch on a
+      // desktop) visualViewport.height is the zoomed-in region, height /
+      // scale, and the layout would shrink with every zoom step while the
+      // zoom magnifies it, leaving a blank band once zoomed back out.
+      const h = visibleViewportSize().height
       if (h > 0) setHeight(`${Math.round(h)}px`)
     }
     let timers: number[] = []

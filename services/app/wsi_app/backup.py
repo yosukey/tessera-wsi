@@ -1468,6 +1468,9 @@ class _BoundedTarInfo(tarfile.TarInfo):
 
 
 _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+# Skippable frames: magic 0x184D2A50..0x184D2A5F (little-endian), a 4-byte
+# frame size, then that many bytes the decoder ignores.
+_ZSTD_SKIPPABLE_MAGIC = 0x184D2A50
 _GZIP_MAGIC = b"\x1f\x8b"
 
 
@@ -1502,25 +1505,48 @@ def _archive_format(path: str) -> Optional[str]:
 
 
 class _ZstdFrameTracker:
-    """Passes the compressed bytes of a zstd archive through, following the
+    """Passes the compressed bytes of a zstd archive through, following each
     frame's block structure (headers only; payloads are skipped by count),
-    so :attr:`complete` says whether the last block and the checksum were
-    read.
+    so :attr:`complete` says whether the input read so far ends on a frame
+    boundary — every frame begun has had its last block and checksum read.
 
     python-zstandard's stream_reader ends the decompressed stream silently
     when its input runs out mid-frame, so a truncated .tar.zst (a partial
     copy, an interrupted transfer) would read as a shorter but valid
     stream: tarfile ends the archive quietly at a member boundary, the
     frame's checksum is never reached, and staging would go on without the
-    trailing members. See :class:`_ZstdTruncationCheck`."""
+    trailing members. See :class:`_ZstdTruncationCheck`.
+
+    The writer here emits one frame, but a .tar.zst made elsewhere may hold
+    several — ``pzstd``, or files concatenated — and skippable frames (magic
+    ``0x184D2A5?``, which pzstd writes before each data frame). Every frame
+    is followed: were the check to stop at the end of the first, or at a
+    leading skippable frame, a cut inside any later frame would again read
+    as a clean, shorter archive. Only bytes that are no frame at all end the
+    tracking; the codec refuses those itself.
+
+    What this cannot see is a cut that lands exactly on a frame boundary.
+    The input then ends with every frame begun read to its checksum, so
+    :attr:`complete` is True, yet the frames after the cut are gone — for a
+    multi-frame archive, possibly with the tar end-of-archive blocks they
+    held, and tarfile ends such a stream quietly at the last whole member
+    (it does not require the end-of-archive marker). That archive reads as a
+    clean, shorter one. A single-frame archive (what the writer here
+    produces) has no such boundary short of its end, so for it every cut is
+    caught; for multi-frame archives made elsewhere only cuts inside a frame
+    are."""
 
     def __init__(self, inner) -> None:
         self._inner = inner
-        self._state = "header"  # "header" (magic + descriptor) / "block" / "done"
+        # "magic" (a frame's first 4 bytes) / "fhd" (the frame header
+        # descriptor) / "skiplen" (a skippable frame's size) / "block" /
+        # "done"
+        self._state = "magic"
         self._buf = bytearray()
         self._skip = 0
         self._then = ""
         self._checksum = False
+        # No frame read yet: an empty input is not a complete archive.
         self.complete = False
 
     def read(self, n: int = -1) -> bytes:
@@ -1528,6 +1554,8 @@ class _ZstdFrameTracker:
         if data and self._state != "done":
             self._feed(data)
         return data
+
+    _WANT = {"magic": 4, "fhd": 1, "skiplen": 4, "block": 3}
 
     def _feed(self, data: bytes) -> None:
         i, n = 0, len(data)
@@ -1539,19 +1567,31 @@ class _ZstdFrameTracker:
                 if not self._skip:
                     self._enter(self._then)
                 continue
-            want = 5 if self._state == "header" else 3
+            if self._state == "magic":
+                # A frame (or a skippable frame) begins: the input no longer
+                # ends on a boundary until it is read to its end.
+                self.complete = False
+            want = self._WANT[self._state]
             chunk = data[i:i + want - len(self._buf)]
             self._buf += chunk
             i += len(chunk)
             if len(self._buf) < want:
                 continue
             head, self._buf = bytes(self._buf), bytearray()
-            if self._state == "header":
-                if head[:4] != _ZSTD_MAGIC:
-                    # Not a frame this can follow: leave it to the codec.
+            if self._state == "magic":
+                if head == _ZSTD_MAGIC:
+                    self._state = "fhd"
+                elif int.from_bytes(head, "little") & 0xFFFFFFF0 == _ZSTD_SKIPPABLE_MAGIC:
+                    self._state = "skiplen"
+                else:
+                    # Not a frame this can follow: leave it to the codec
+                    # (which refuses bytes that are no frame).
                     self._state, self.complete = "done", True
                     return
-                fhd = head[4]
+            elif self._state == "skiplen":
+                self._skip_then(int.from_bytes(head, "little"), "boundary")
+            elif self._state == "fhd":
+                fhd = head[0]
                 single = fhd >> 5 & 1
                 self._checksum = bool(fhd >> 2 & 1)
                 rest = ((0 if single else 1)               # window descriptor
@@ -1575,7 +1615,10 @@ class _ZstdFrameTracker:
                 self._checksum = False
                 self._skip_then(4, "end")
                 return
-            self._state, self.complete = "done", True
+            state = "boundary"
+        if state == "boundary":
+            # A frame ended: complete unless another one starts.
+            self._state, self.complete = "magic", True
             return
         self._state = state
 
@@ -1624,7 +1667,11 @@ def _open_archive_reader(path: str, expected_sha256: Optional[str] = None):
         if fmt == "tar.zst":
             dctx = _zstd.ZstdDecompressor()
             frame = _ZstdFrameTracker(src)
-            stream = dctx.stream_reader(frame, closefd=False)
+            # read_across_frames: a multi-frame archive (see
+            # _ZstdFrameTracker) decodes to its end, not to the end of its
+            # first frame — which the tracker would see as a boundary and
+            # take for the end of a whole archive.
+            stream = dctx.stream_reader(frame, closefd=False, read_across_frames=True)
             try:
                 with tarfile.open(
                     fileobj=_ZstdTruncationCheck(stream, frame), mode="r|",
@@ -2512,16 +2559,25 @@ def create_backup(
                     os.remove(tmp_archive)
                 except FileNotFoundError:
                     pass
-            # A cancel can stop the tar stream mid-member, and closing a
-            # stream cut there may itself complain. The archive is being
-            # discarded either way; let the BackupCancelled propagate rather
-            # than be replaced by a close error that would record the job as
-            # failed.
-            if close_errors and not cancelled_mid_write:
+            # A failed write (or a cancel) can stop the tar stream
+            # mid-member, and closing a stream cut there may itself complain
+            # — and when the write failed because the volume is full, the
+            # flush in close() hits the same ENOSPC. The archive is being
+            # discarded either way; let the original exception propagate (a
+            # BackupCancelled, an ENOSPC the job reports as a space problem,
+            # a coded error) rather than be replaced by a generic close
+            # error. The close failures are only logged then.
+            if close_errors:
                 detail = ", ".join(f"{n}={exc!r}" for n, exc in close_errors)
-                raise RuntimeError(
-                    f"backup archive close failed: {detail}"
-                ) from close_errors[0][1]
+                if not write_failed:
+                    raise RuntimeError(
+                        f"backup archive close failed: {detail}"
+                    ) from close_errors[0][1]
+                if not cancelled_mid_write:
+                    _logger.warning(
+                        "backup archive close also failed after a write error: %s",
+                        detail,
+                    )
 
     # Integrity sanity-check: full-scope archives must carry every WSI
     # file their DB snapshot references. Without this check, a slide
@@ -4400,17 +4456,7 @@ def request_apply(stage_id: str, scope: str, requested_by: str) -> None:
     # stage to be whole and the renames to stay on one mount.
     _assert_stage_complete(stage_dir)
     _assert_stage_on_data_volume(stage_dir)
-    # The boot promotes wsi.db alone; a -wal / -journal beside it would hold
-    # writes (the schema upgrade, a reset's wipe) that never reached wsi.db
-    # and are deleted with the stage.
-    staged_db = os.path.join(stage_dir, DB_ENTRY)
-    for suffix in _restore_apply.DB_SIBLING_SUFFIXES:
-        if os.path.lexists(staged_db + suffix):
-            raise RuntimeError(
-                f"the staged {DB_ENTRY} has a {DB_ENTRY}{suffix} beside it, so "
-                "writes made to it may not be in the file the apply would "
-                "promote; stage the archive again"
-            )
+    _assert_staged_db_alone(stage_dir)
     payload = {
         "stage_id": stage_id,
         "stage_dir": stage_dir,
@@ -4481,6 +4527,25 @@ def read_apply_result() -> Optional[dict]:
     return data
 
 
+def _assert_staged_db_alone(stage_dir: str) -> None:
+    """Refuse a stage whose ``wsi.db`` has a ``-wal`` / ``-shm`` /
+    ``-journal`` beside it.
+
+    The apply promotes wsi.db alone; a -wal / -journal beside it would hold
+    writes (the schema upgrade, a reset's wipe) that never reached wsi.db and
+    are deleted with the stage. Checked by both apply paths — the boot-time
+    one (request_apply) and the dev in-process one (inprocess_apply) — so
+    the two cannot disagree on what a promotable stage is."""
+    staged_db = os.path.join(stage_dir, DB_ENTRY)
+    for suffix in _restore_apply.DB_SIBLING_SUFFIXES:
+        if os.path.lexists(staged_db + suffix):
+            raise RuntimeError(
+                f"the staged {DB_ENTRY} has a {DB_ENTRY}{suffix} beside it, so "
+                "writes made to it may not be in the file the apply would "
+                "promote; stage the archive again"
+            )
+
+
 def inprocess_apply(stage_id: str, scope: str, engine) -> None:
     """Dev-only: swap files in the running process. Production uses
     request_apply + service restart instead.
@@ -4529,6 +4594,7 @@ def inprocess_apply(stage_id: str, scope: str, engine) -> None:
         )
     _assert_stage_complete(stage_dir)
     _assert_stage_on_data_volume(stage_dir)
+    _assert_staged_db_alone(stage_dir)
 
     # 1. Hold back every new connection of this process for the swap
     #    (db.db_swap_gate): a request thread connecting while the live DB path

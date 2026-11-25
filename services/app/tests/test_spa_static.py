@@ -101,3 +101,21 @@ def test_api_prefixes_still_404(site):
     _, _, client = site
     for path in ("/api/nope", "/dzi/x.dzi", "/thumbs/x", "/assets/x"):
         assert client.get(path).status_code == 404, path
+
+
+def test_dot_segment_paths_are_not_served(site):
+    """uvicorn passes dot segments through unresolved (and nginx forwards
+    them verbatim), so "/api/auth/../../index.html" would resolve on disk to
+    the shell while carrying an auth-bypass prefix. Such a path gets a 404,
+    never a file or the shell. (%2e: the test client resolves literal dot
+    segments before sending.)"""
+    _, _, client = site
+    for path in (
+        "/api/auth/%2e%2e/%2e%2e/index.html",
+        "/api/auth/%2e%2e/%2e%2e/static-assets/index-aaaa1111.js",
+        "/%2e/index.html",
+        "/viewer/%2e%2e/favicon.svg",
+    ):
+        r = client.get(path)
+        assert r.status_code == 404, path
+        assert "<title>" not in r.text and "static.rel.1" not in r.text, path

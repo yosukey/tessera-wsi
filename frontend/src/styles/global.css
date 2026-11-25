@@ -32,8 +32,15 @@ body {
    rotation, so `100%` here, vw / vh and media queries all read the old
    orientation's size (see lib/viewportBox). The app is sized to the screen
    instead, and the stale extra width can't be scrolled into. Nothing changes
-   while the two agree. */
-html.vp-stale {
+   while the two agree.
+   The extra width only exists when the stale layout viewport is wider than
+   the screen, so `overflow-x: hidden` is limited to that direction
+   (vp-stale-clip-x); the other way round the app is wider than <html> and
+   must not be clipped to it.
+   `position: fixed` boxes are placed against the browser's viewport rather
+   than #root, so they are anchored with lib/viewportBox's
+   FULL_VIEWPORT_FIXED / fixedRight / fixedBottom instead. */
+html.vp-stale-clip-x {
   overflow-x: hidden;
 }
 html.vp-stale #root {

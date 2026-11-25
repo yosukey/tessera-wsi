@@ -893,3 +893,25 @@ def test_auth_mode_ldap_breaking_a_working_config_is_refused(client, admin_heade
         assert get_or_create_singleton(db, AuthSettings).ldap_server_uri == "ldaps://ldap.example.org"
     finally:
         db.close()
+
+
+def test_ip_rule_count_is_capped(client, admin_headers):
+    """Every request walks the rule list, so its length is bounded on save."""
+    too_many = [
+        {"ip": f"10.{i // 256}.{i % 256}.1", "action": "allow"}
+        for i in range(_net.MAX_IP_RULES + 1)
+    ]
+    r = client.patch(
+        "/api/admin/network/settings",
+        data={"ip_rules": json.dumps(too_many)},
+        headers=admin_headers,
+    )
+    assert r.status_code == 422, r.text
+    assert str(_net.MAX_IP_RULES) in r.json()["detail"]
+
+    r = client.patch(
+        "/api/admin/network/settings",
+        data={"ip_rules": json.dumps(too_many[:-1])},
+        headers=admin_headers,
+    )
+    assert r.status_code == 200, r.text

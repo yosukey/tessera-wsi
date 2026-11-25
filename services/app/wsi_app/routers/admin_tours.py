@@ -905,17 +905,25 @@ def admin_delete_tour(
 def _do_delete_tour(db: Session, tour_id: int) -> bool:
     """Delete the tour row and its asset directory; False when there is no
     such tour. Shared by the single and the bulk delete."""
-    t = db.get(Tour, tour_id)
-    if not t:
-        return False
-    # Capture the public_id before the row is gone — the asset dir is keyed by it.
-    tour_public_id = t.public_id or ""
     # Row delete + directory removal are one critical section against asset
     # uploads (tour_asset_lock): an upload that passed its existence check
     # earlier would otherwise recreate the directory after its removal,
     # leaving publicly served files for a tour that no longer exists. The
     # upload re-checks the row inside the same lock.
     with tour_asset_lock(tour_id):
+        # Look the row up only now, inside the lock, and from the database
+        # (populate_existing: a plain get answers from the session's identity
+        # map when the tour was loaded earlier in this request). A row read
+        # before the lock may already have been deleted by a concurrent
+        # delete of the same tour, which holds this lock while it commits:
+        # deleting that stale instance again matches no row, yet would be
+        # reported (and audited) as a second successful delete instead of
+        # the 404 / ``not_found`` it is.
+        t = db.get(Tour, tour_id, populate_existing=True)
+        if not t:
+            return False
+        # Capture the public_id before the row is gone — the asset dir is keyed by it.
+        tour_public_id = t.public_id or ""
         db.delete(t)
         db.commit()
         # Mirror admin_delete_slide: drop the on-disk asset directory after the

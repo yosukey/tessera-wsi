@@ -566,6 +566,26 @@ def test_logs_invalid_date_is_400(client, admin_headers):
     assert r.status_code == 400
 
 
+@pytest.mark.parametrize("params", [
+    {"until": "9999-12-31"}, {"since": "0001-01-01"},
+    {"since": "1899-12-31"}, {"until": "9999-01-01"},
+])
+def test_logs_invalid_date_out_of_range_is_400(client, admin_headers, params):
+    """A day at the edge of ``date``'s span overflows the local-midnight / UTC
+    arithmetic; it is the caller's bad date (400), not a 422 / 500."""
+    r = client.get("/api/admin/logs", params=params, headers=admin_headers)
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"]["code"] == "adminLogs.invalidDate"
+
+
+def test_logs_invalid_date_bounds_are_accepted(client, admin_headers):
+    r = client.get(
+        "/api/admin/logs", params={"since": "1900-01-01", "until": "9998-12-31"},
+        headers=admin_headers,
+    )
+    assert r.status_code == 200, r.text
+
+
 def test_logs_pagination_newest_first(client, admin_headers, db_session):
     for i in range(5):
         _seed(db_session, f"fpg.{i}")
@@ -962,6 +982,47 @@ def test_logs_export_csv_can_leave_tracebacks_out(client, admin_headers, db_sess
     assert "secret-ish frame text" in with_tb
     assert "secret-ish frame text" not in without
     assert without.splitlines()[0] == with_tb.splitlines()[0]
+
+
+def test_logs_export_without_tracebacks_does_not_read_them(client, admin_headers, db_session):
+    """Leaving the column out of the file also leaves it out of the query:
+    the tracebacks (up to 16 KB a row) are most of the table's bytes."""
+    from sqlalchemy import event
+
+    from wsi_app.db import engine
+
+    _seed_full(db_session, "fcsvnotb.a", traceback="Traceback: frame")
+    statements = []
+
+    def _capture(conn, cursor, statement, *a):
+        if "FROM error_logs" in statement:
+            statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        body = client.get("/api/admin/logs/export.csv",
+                          params={"logger": "fcsvnotb.", "include_traceback": "false"},
+                          headers=admin_headers).text
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture)
+    assert "fcsvnotb.a" in body
+    assert statements
+    assert not any("error_logs.traceback" in st for st in statements), statements
+
+
+def test_logs_total_matches_the_level_counts(client, admin_headers, db_session):
+    """The total is taken from the level counts (one scan, not two); with and
+    without a level filter it is still the count of the rows listed."""
+    for lvl in ("ERROR", "ERROR", "WARNING"):
+        _seed_full(db_session, "ftotal.a", level=lvl)
+    r = client.get("/api/admin/logs", params={"logger": "ftotal.a"}, headers=admin_headers).json()
+    assert r["total"] == 3 and r["level_counts"] == {"ERROR": 2, "WARNING": 1}
+    r = client.get("/api/admin/logs", params={"logger": "ftotal.a", "level": "warning"},
+                   headers=admin_headers).json()
+    assert r["total"] == 1 and len(r["items"]) == 1
+    r = client.get("/api/admin/logs", params={"logger": "ftotal.a", "level": "CRITICAL"},
+                   headers=admin_headers).json()
+    assert r["total"] == 0 and r["items"] == []
 
 
 def test_iter_newest_first_reads_in_keyset_batches(db_session):

@@ -16,6 +16,18 @@
               transform var(--duration-fast) var(--ease-out);
   user-select: none;
 }
+/* LinkButton renders these classes on an <a>, which the global link rules in
+   styles/global.css also style: `a:hover` (specificity 0,1,1) turns the text
+   brand green and underlines it. That outranks a bare variant class (0,1,0),
+   so a primary link button's label went brand green on its darker green
+   hover background - nearly unreadable - and the outlined variants' labels
+   went green too. Every variant's :hover rule below therefore sets its text
+   color itself (0,3,0 outranks the global rule), and this rule takes the
+   underline back off. Focus and visited need nothing: the global stylesheet
+   has no a:focus / a:visited color, and the variant class outranks plain `a`. */
+.root:hover {
+  text-decoration: none;
+}
 .root:disabled, .root[aria-disabled="true"] {
   opacity: 0.5;
   cursor: not-allowed;
@@ -36,6 +48,7 @@
 }
 .primary:hover:not(:disabled) {
   background: var(--color-brand-700);
+  color: var(--color-text-on-brand);
   border-color: var(--color-brand-700);
 }
 .primary:active:not(:disabled) { transform: translateY(1px); }
@@ -48,6 +61,7 @@
 }
 .secondary:hover:not(:disabled) {
   background: var(--color-surface-muted);
+  color: var(--color-text);
   border-color: var(--color-border-strong);
 }
 
@@ -70,6 +84,7 @@
 }
 .danger:hover:not(:disabled) {
   background: var(--color-danger-bg);
+  color: var(--color-danger-fg);
   border-color: var(--color-danger-500);
 }
 

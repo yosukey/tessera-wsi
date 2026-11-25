@@ -572,6 +572,32 @@ def _load_slides_for_export(db: Session, slide_ids: List[int]) -> List[Slide]:
     return ordered
 
 
+def _check_exportable_tours(s: Slide) -> None:
+    """Refuse a slide holding a tour with a malformed public_id.
+
+    _serialize_tour writes each tour's public_id into slides.json as is, and
+    the importer refuses the whole bundle over one malformed tour token
+    (importInvalid "malformed or unsafe tour public_id") — while
+    _exported_tour_pids merely skips that tour's attachments, so without this
+    check the export "succeeded" with a bundle no system would take. Refuse
+    it, naming slide and tour, so the admin can fix (or delete) that one tour.
+
+    Run once in the preflight and again on the re-read under the slide's
+    lock, since a tour can be added (or restored in) while a long export
+    writes earlier slides."""
+    for t in s.tours:
+        if not valid_public_id(t.public_id):
+            raise SlideTransferError(
+                f"slide {s.public_id} has a tour {t.id} with a malformed public_id "
+                f"{t.public_id!r}; cannot export",
+                code="exportInvalidTourPublicId",
+                params={
+                    "slide": (s.title or "")[:200] or str(s.id),
+                    "tour": (t.title or "")[:200] or str(t.id),
+                },
+            )
+
+
 def export_slides(
     slide_ids: List[int],
     note: str = "",
@@ -612,25 +638,7 @@ def export_slides(
                     code="exportInvalidPublicId",
                     params={"slide": (s.title or "")[:200] or str(s.id)},
                 )
-            # The same holds for each of the slide's tours: _serialize_tour
-            # writes its public_id into slides.json as is, and the importer
-            # refuses the whole bundle over one malformed tour token
-            # (importInvalid "malformed or unsafe tour public_id") — while
-            # _exported_tour_pids merely skips that tour's attachments, so
-            # without this check the export "succeeded" with a bundle no
-            # system would take. Refuse it here, naming slide and tour, so
-            # the admin can fix (or delete) that one tour.
-            for t in s.tours:
-                if not valid_public_id(t.public_id):
-                    raise SlideTransferError(
-                        f"slide {s.public_id} has a tour {t.id} with a malformed public_id "
-                        f"{t.public_id!r}; cannot export",
-                        code="exportInvalidTourPublicId",
-                        params={
-                            "slide": (s.title or "")[:200] or str(s.id),
-                            "tour": (t.title or "")[:200] or str(t.id),
-                        },
-                    )
+            _check_exportable_tours(s)
             if not s.wsi_filename or not os.path.isfile(_slide_wsi_path(s)):
                 raise SlideTransferError(
                     f"slide {s.public_id} has no WSI file on disk; cannot export",
@@ -729,6 +737,18 @@ def export_slides(
                     # may since have replaced the file (new wsi_filename, new
                     # size/dimensions) or deleted the slide. Re-read it under
                     # the lock before resolving the path or serialising.
+                    #
+                    # refresh() re-runs the eager loaders the row was loaded
+                    # with (_load_slides_for_export's selectinload chain) with
+                    # populate_existing semantics, so tours, steps, pins,
+                    # shapes and attributes already in the identity map are
+                    # overwritten from the database too, tours added since
+                    # appear and deleted ones drop out: the doc serialised
+                    # below is the current state, the same state whose tour
+                    # attachments are archived right after.
+                    # (test_export_rereads_tours_edited_during_the_export pins
+                    # that.) A tour that appeared meanwhile has not been
+                    # through the preflight yet, so its token is checked here.
                     pid = s.public_id
                     try:
                         db.refresh(s)
@@ -737,6 +757,7 @@ def export_slides(
                             f"slide {pid} was deleted during the export",
                             code="exportUnknownSlide",
                         ) from exc
+                    _check_exportable_tours(s)
                     if not s.wsi_filename:
                         raise SlideTransferError(
                             f"slide {s.public_id} has no WSI file on disk; cannot export",
@@ -804,9 +825,21 @@ def export_slides(
                     os.remove(tmp_path)
                 except FileNotFoundError:
                     pass
+            # After a failed write the archive is discarded anyway, and a
+            # close of a stream cut mid-member (or a flush into the volume
+            # that just ran out of space) can fail too: let the original
+            # exception — a coded SlideTransferError, an ENOSPC — propagate
+            # instead of a generic close error, and only log the close
+            # failures (mirrors create_backup).
             if close_errors:
                 detail = ", ".join(f"{n}={exc!r}" for n, exc in close_errors)
-                raise RuntimeError(f"export archive close failed: {detail}") from close_errors[0][1]
+                if not write_failed:
+                    raise RuntimeError(
+                        f"export archive close failed: {detail}"
+                    ) from close_errors[0][1]
+                _logger.warning(
+                    "export archive close also failed after a write error: %s", detail
+                )
 
         # fsync then atomically publish; reclaim the .tmp on any failure.
         try:
@@ -834,7 +867,11 @@ def export_slides(
             created_at=created_at,
             archive_format=archive_format,
             slide_count=len(slides),
-            tour_count=tour_count,
+            # What slides.json actually holds: the per-slide re-read can see
+            # tours added or deleted since the preflight. (manifest.json was
+            # already streamed with the preflight count; it is informational
+            # only — the import counts the tours in slides.json.)
+            tour_count=sum(len(d.get("tours") or []) for d in slide_docs),
             note=note or "",
             slides=[
                 {
@@ -1406,6 +1443,65 @@ def _wsi_copy_needed(stage_dir: str) -> bool:
     return not _same_filesystem(stage_dir, _data_volume_path())
 
 
+def _tour_asset_volume_path() -> str:
+    """The nearest existing directory on the way to ``assets/tours`` (where
+    imported attachments land; _import_tour_assets creates the missing
+    levels), for free-space checks."""
+    path = os.path.abspath(os.path.join(settings.data_dir, "assets", "tours"))
+    while not os.path.isdir(path):
+        parent = os.path.dirname(path)
+        if parent == path:  # reached the root without finding a directory
+            break
+        path = parent
+    return path
+
+
+def _plan_data_space(wsi_bytes: int, asset_bytes: int) -> Optional[dict]:
+    """The shortfall (``as_params``) of the copies an apply will make, or
+    None when they fit or the free space is unknown.
+
+    The apply checks each copy as it goes: a WSI against
+    ``disk_space.reserve_for(its size)`` (_check_wsi_copy_space), a tour
+    attachment against ``max(reserve_for(its size),
+    TOUR_ASSET_MIN_FREE_BYTES)`` (_import_tour_assets). The plan checks the
+    total against the same rule applied to the total: reserve_for grows
+    with its argument, so a copy made after everything before it was
+    written still finds its own size plus its own reserve free — a plan
+    that fits never has the apply refuse a slide it counted, short of
+    something else writing meanwhile. Notably, a stage whose WSIs are
+    hard-linked (nothing to copy for them) is still checked for its
+    attachments and the operator's floor.
+
+    WSIs and attachments on one volume (the usual case: both under the data
+    dir) are checked together; on two volumes, each against its own. One
+    measurement per volume, so the figures reported are the ones that
+    decided (a second statvfs could report a free figure that disagreed with
+    the verdict).
+    """
+    def _reserve(nbytes: int, with_assets: bool) -> int:
+        r = _disk_space.reserve_for(nbytes)
+        if with_assets:
+            r = max(r, settings.tour_asset_min_free_bytes)
+        return r
+
+    wsi_path = _data_volume_path()
+    asset_path = _tour_asset_volume_path()
+    checks = []
+    if wsi_bytes and asset_bytes and _same_filesystem(wsi_path, asset_path):
+        total = wsi_bytes + asset_bytes
+        checks.append((wsi_path, total, _reserve(total, True)))
+    else:
+        if wsi_bytes:
+            checks.append((wsi_path, wsi_bytes, _reserve(wsi_bytes, False)))
+        if asset_bytes:
+            checks.append((asset_path, asset_bytes, _reserve(asset_bytes, True)))
+    for path, nbytes, reserve in checks:
+        short = _disk_space.check(path, nbytes, reserve=reserve)
+        if short is not None:
+            return short.as_params()
+    return None
+
+
 def plan_import(stage_id: str, manifest: dict, slides_doc: dict, db: Session) -> dict:
     """Compute the additive-import preflight: version guard + per-slide conflicts.
 
@@ -1444,6 +1540,7 @@ def plan_import(stage_id: str, manifest: dict, slides_doc: dict, db: Session) ->
     failed_earlier = 0
     retryable_assets = 0
     wsi_bytes_to_copy = 0
+    asset_bytes_to_copy = 0
     for sd in slides:
         raw_basename = sd.get("wsi_original_basename") or ""
         norm = safe_filename(raw_basename).casefold()
@@ -1456,12 +1553,20 @@ def plan_import(stage_id: str, manifest: dict, slides_doc: dict, db: Session) ->
             content_errors.append({"tour": "", "step": 0, "detail": ext_error})
         tours = sd.get("tours") or []
         assets_over_limit = 0
+        slide_asset_bytes = 0
         for t in tours:
             src_assets = _staged_assets_dir(stage_dir, t["public_id"])
             if src_assets:
-                assets_over_limit += _preview_tour_asset_skips(src_assets)
+                over, accepted = _preview_tour_asset_skips(src_assets)
+                assets_over_limit += over
+                slide_asset_bytes += accepted
         rec = records.get(public_id)
         apply_status = _effective_status(db, rec) if rec is not None else None
+        if apply_status != "imported":
+            # Attachments are always copied (never hard-linked), whatever
+            # the WSI placement; an imported slide's are not copied again
+            # by an apply.
+            asset_bytes_to_copy += slide_asset_bytes
         if apply_status == "imported":
             already_imported += 1
             retryable_assets += _retryable_asset_count(rec)
@@ -1506,20 +1611,11 @@ def plan_import(stage_id: str, manifest: dict, slides_doc: dict, db: Session) ->
         })
 
     # The WSI files of the slides still to import are copied onto the data
-    # volume when it is not the stage's (hard-linked otherwise): say up front
-    # when they will not all fit — with the reserve each copy must leave free
-    # (_check_wsi_copy_space) — rather than only as per-slide failures.
-    # One measurement, so the figures reported are the ones that decided
-    # (a second statvfs could report a free figure that disagreed with the
-    # verdict). The per-slide check reserves for each
-    # slide's own size and the plan for the total — both
-    # disk_space.reserve_for, so a plan that fits never refuses a slide
-    # that the plan counted, short of something else writing meanwhile.
-    data_space = None
-    if wsi_bytes_to_copy:
-        short = _disk_space.check(_data_volume_path(), wsi_bytes_to_copy)
-        if short is not None:
-            data_space = short.as_params()
+    # volume when it is not the stage's (hard-linked otherwise), and their
+    # tour attachments are always copied: say up front when they will not
+    # all fit — with the reserve each copy must leave free — rather than only
+    # as per-slide failures (see _plan_data_space).
+    data_space = _plan_data_space(wsi_bytes_to_copy, asset_bytes_to_copy)
 
     return {
         "stage_id": stage_id,
@@ -1532,7 +1628,8 @@ def plan_import(stage_id: str, manifest: dict, slides_doc: dict, db: Session) ->
         # slides.json keys this build does not know (a newer exporter's
         # fields): they cannot be imported.
         "unknown_fields": _unknown_bundle_fields(slides),
-        # Set when the data volume cannot take the WSI files still to copy.
+        # Set when the data volume cannot take the WSI files and tour
+        # attachments still to copy.
         "data_space": data_space,
         # True once an apply has run against this stage (it was kept because
         # something is left to retry).
@@ -2027,10 +2124,13 @@ def _asset_limit_reason(entry, *, count: int, total: int) -> tuple[Optional[str]
     return None, size
 
 
-def _preview_tour_asset_skips(src_dir: str) -> int:
-    """How many of a staged tour's assets the limits alone will refuse — the
-    preflight's cheap estimate (no content decoding, so it is a lower bound
-    on what :func:`_import_tour_assets` will skip)."""
+def _preview_tour_asset_skips(src_dir: str) -> tuple[int, int]:
+    """How many of a staged tour's assets the limits alone will refuse, and
+    the bytes of the ones they let through — the preflight's cheap estimate.
+    No content decoding, so the count is a lower bound on what
+    :func:`_import_tour_assets` will skip, and the bytes an upper bound on
+    what it will copy (into an empty tour directory, as a fresh import's
+    is)."""
     count = total = skipped = 0
     for entry in _tour_asset_entries(src_dir):
         reason, size = _asset_limit_reason(entry, count=count, total=total)
@@ -2039,7 +2139,7 @@ def _preview_tour_asset_skips(src_dir: str) -> int:
             continue
         count += 1
         total += size
-    return skipped
+    return skipped, total
 
 
 # Attachment skip reasons a retry of the same stage can overcome: each is one
@@ -2148,6 +2248,25 @@ def _import_tour_assets(
             count += 1
             total += size
             continue
+        # Same instance-wide floor an upload is held to
+        # (admin_tours._enforce_tour_asset_free_space), measured per file as
+        # the pass goes so what this pass has copied so far counts: the
+        # per-tour caps bound one tour, but a bundle carries many tours, and
+        # without this a large import could fill the data volume one
+        # attachment at a time. The reserve is the shared disk_space rule or
+        # the operator's TOUR_ASSET_MIN_FREE_BYTES, whichever is larger —
+        # unlike an upload, an import is not exempt when that setting is 0,
+        # as the slide's own WSI copy is not (_check_wsi_copy_space). Raised,
+        # not skipped: it is the volume that is out of room, not the file,
+        # so the slide fails with importNoSpace (its copies rolled back) and
+        # a retry of the stage picks it up once space is freed.
+        reserve = max(_disk_space.reserve_for(size), settings.tour_asset_min_free_bytes)
+        short = _disk_space.check(dst_dir, size, reserve=reserve)
+        if short is not None:
+            raise SlideTransferError(
+                f"{short.message('data volume')} (tour attachment {name})",
+                code="importNoSpace",
+            )
         dst = os.path.join(dst_dir, name)
         # Through a hidden temp + rename: on a retry the tour is live, and a
         # viewer must never be served a half-copied image. The temp follows
@@ -3326,9 +3445,27 @@ def retry_import_assets(
                 if tid is not None and src:
                     got: list = []
                     with tour_asset_lock(tid):
-                        again = _import_tour_assets(
-                            src, tour_asset_dir(new), only=retry_names, copied=got,
-                        )
+                        # tour_ids was read before this lock: a tour deleted
+                        # in between (_do_delete_tour drops the row and its
+                        # asset directory under this same lock) must not get
+                        # that directory back — the copy below would recreate
+                        # it and leave its files served publicly for a tour
+                        # with no row. Re-check inside the lock, as the
+                        # upload endpoint does; a SELECT outside a write
+                        # transaction reads the current state, not a
+                        # snapshot from before the lock. A tour gone by now is
+                        # treated like one already gone when tour_ids was
+                        # read: its retryable skips are dropped below (again
+                        # stays empty), the permanent ones kept.
+                        alive = db.execute(
+                            select(Tour.id).where(
+                                Tour.id == tid, Tour.slide_id == rec["slide_id"],
+                            )
+                        ).first() is not None
+                        if alive:
+                            again = _import_tour_assets(
+                                src, tour_asset_dir(new), only=retry_names, copied=got,
+                            )
                     copied.extend(
                         {"public_id": src_pid, "tour": titles.get(old) or new, "name": n}
                         for n in got

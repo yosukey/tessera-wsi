@@ -17,6 +17,7 @@ import { metaFieldLabel } from '../../lib/metaLabel'
 import { logger } from '../../lib/logger'
 import { useInFlight } from '../../hooks/useInFlight'
 import { Button, LockFieldset } from '../ui'
+import { FULL_VIEWPORT_FIXED } from '../../lib/viewportBox'
 import ConflictBanner from './ConflictBanner'
 import OptionMultiSelect from './OptionMultiSelect'
 
@@ -157,7 +158,7 @@ export default function TourMetadataModal({ tour, slideAttributes, onSaved, onCo
       aria-labelledby="tour-metadata-title"
       onClick={close}
       style={{
-        position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)',
+        ...FULL_VIEWPORT_FIXED, background: 'rgba(0,0,0,0.45)',
         zIndex: 'var(--z-modal, 1000)' as unknown as number,
         display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
         padding: 20, overflowY: 'auto',

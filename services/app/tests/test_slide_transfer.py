@@ -3733,3 +3733,396 @@ def test_token_download_is_audited_against_the_minting_admin(
     assert len(records) == 1, records
     assert records[0]["actor_id"] == admin_user.id
     assert records[0]["via_token"] is True
+
+
+# ---------------------------------------------------------------------------
+# Export re-read under the slide lock, close errors after a failed write,
+# attachment free space, and the retry vs a concurrent tour delete
+# ---------------------------------------------------------------------------
+
+def _edit_once_under_the_slide_lock(monkeypatch, edit):
+    """Run ``edit`` (in its own session) the first time export_slides takes a
+    slide's lock — i.e. after the preflight read every row, before the slide
+    is re-read and serialised: an edit made while a long export was busy
+    with earlier slides."""
+    from wsi_app.db import SessionLocal
+
+    real = _st.slide_mutation_lock
+    done = []
+
+    @contextlib.contextmanager
+    def _lock(slide_id):
+        with real(slide_id):
+            if not done:
+                done.append(slide_id)
+                other = SessionLocal()
+                try:
+                    edit(other)
+                    other.commit()
+                finally:
+                    other.close()
+            yield
+
+    monkeypatch.setattr(_st, "slide_mutation_lock", _lock)
+
+
+def test_export_rereads_tours_edited_during_the_export(db_session, attach_wsi, monkeypatch):
+    """slides.json describes the slide as it is when its lock is taken — tour,
+    step and pin edits made after the preflight load included, and a tour
+    added meanwhile — the same state whose attachments are archived; the
+    record's tour_count is what the bundle holds."""
+    src, tour, _basename = _build_source(db_session, attach_wsi)
+    new_pid = []
+
+    def _edit(other):
+        t = other.get(Tour, tour.id)
+        t.title = "Renamed"
+        st = other.query(Step).filter_by(tour_id=tour.id).one()
+        st.label = "edited step"
+        other.query(StepPin).filter_by(step_id=st.id).one().label = "edited pin"
+        added = Tour(slide_id=src.id, title="Added", description="")
+        other.add(added)
+        other.flush()
+        new_pid.append(added.public_id)
+
+    _edit_once_under_the_slide_lock(monkeypatch, _edit)
+    record = _st.export_slides([src.id])
+    try:
+        doc = None
+        with _backup._open_archive_reader(record.path) as tar:
+            # A streaming reader: take slides.json (the last member) in order.
+            for m in tar:
+                if m.name == _st.SLIDES_DOC_NAME:
+                    doc = json.load(tar.extractfile(m))
+        tours = {t["public_id"]: t for t in doc["slides"][0]["tours"]}
+        assert set(tours) == {tour.public_id, new_pid[0]}
+        assert tours[tour.public_id]["title"] == "Renamed"
+        [step] = tours[tour.public_id]["steps"]
+        assert step["label"] == "edited step"
+        assert [p["label"] for p in step["pins"]] == ["edited pin"]
+        assert record.tour_count == 2
+    finally:
+        _st.delete_export(record.id)
+
+
+def test_export_refuses_a_malformed_tour_added_during_the_export(db_session, attach_wsi, monkeypatch):
+    """The tour-token check the preflight runs is repeated on the re-read: a
+    tour that appeared after the preflight would otherwise land in a bundle
+    the import refuses as a whole."""
+    src, _tour, _basename = _build_source(db_session, attach_wsi)
+    added = []
+
+    def _edit(other):
+        t = Tour(slide_id=src.id, title="Bad", description="")
+        other.add(t)
+        other.flush()
+        t.public_id = "../escape"
+        added.append(t.id)
+
+    _edit_once_under_the_slide_lock(monkeypatch, _edit)
+    try:
+        with pytest.raises(_st.SlideTransferError) as ei:
+            _st.export_slides([src.id])
+        assert ei.value.code == "exportInvalidTourPublicId"
+    finally:
+        db_session.query(Tour).filter(Tour.id.in_(added)).delete(synchronize_session=False)
+        db_session.commit()
+
+
+def test_export_close_error_after_a_failed_write_keeps_the_original_error(
+    db_session, attach_wsi, monkeypatch,
+):
+    """A write that fails (here: a coded SlideTransferError, as an ENOSPC
+    would be) can leave a stream that also fails to close; the job must
+    report the original error, not a generic close failure, and still drop
+    the partial archive."""
+    src, _tour, _basename = _build_source(db_session, attach_wsi)
+    real_open = _backup._open_archive_writer
+    tmp_paths = []
+
+    def _open(path):
+        raw, tar, counter, compressor = real_open(path)
+        tmp_paths.append(path)
+        real_close = tar.close
+
+        def _close():
+            real_close()
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        tar.close = _close
+        return raw, tar, counter, compressor
+
+    def _fail(*a, **k):
+        raise _st.SlideTransferError("simulated", code="exportWsiMissing")
+
+    monkeypatch.setattr(_backup, "_open_archive_writer", _open)
+    monkeypatch.setattr(_backup, "_add_pinned_file", _fail)
+    with pytest.raises(_st.SlideTransferError) as ei:
+        _st.export_slides([src.id])
+    assert ei.value.code == "exportWsiMissing"
+    assert tmp_paths and not os.path.exists(tmp_paths[0])
+
+
+def test_export_close_error_after_a_clean_write_still_fails(db_session, attach_wsi, monkeypatch):
+    """Without a write error, a close failure is what makes the archive bad:
+    it still fails the export (a truncated archive is never published)."""
+    src, _tour, _basename = _build_source(db_session, attach_wsi)
+    real_open = _backup._open_archive_writer
+
+    def _open(path):
+        raw, tar, counter, compressor = real_open(path)
+        real_close = tar.close
+
+        def _close():
+            real_close()
+            raise OSError(errno.EIO, "I/O error")
+
+        tar.close = _close
+        return raw, tar, counter, compressor
+
+    monkeypatch.setattr(_backup, "_open_archive_writer", _open)
+    with pytest.raises(RuntimeError, match="export archive close failed"):
+        _st.export_slides([src.id])
+
+
+def test_import_tour_assets_refuse_a_full_data_volume(tmp_path, monkeypatch):
+    """Attachments are held to the free-space floor an upload is: a volume
+    without room for the file plus the reserve refuses with importNoSpace
+    before anything is written, rather than filling the volume up."""
+    from wsi_app import disk_space
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.png").write_bytes(_png_bytes())
+    dst = tmp_path / "dst"
+    monkeypatch.setattr(disk_space, "free_bytes", lambda path: 1024)
+    with pytest.raises(_st.SlideTransferError) as ei:
+        _st._import_tour_assets(str(src), str(dst))
+    assert ei.value.code == "importNoSpace"
+    assert os.listdir(dst) == []
+    # A dry run (the plan / state recovery) writes nothing and checks nothing.
+    assert _st._import_tour_assets(str(src), str(dst), dry_run=True) == []
+
+
+def test_plan_predicts_the_attachment_space_check_of_the_apply(db_session, monkeypatch):
+    """The plan's data_space covers the tour attachments too, with the
+    reserve the apply holds each one to (reserve_for, or
+    TOUR_ASSET_MIN_FREE_BYTES when larger) — even when the WSIs are
+    hard-linked and need no space, which used to skip the check entirely:
+    a plan that fits must not be followed by every slide with attachments
+    failing with importNoSpace."""
+    from wsi_app import disk_space
+
+    _patch_wsi_readers(monkeypatch)
+    # Hard-linked WSIs: nothing to copy for them.
+    monkeypatch.setattr(_st, "_same_filesystem", lambda a, b: True)
+    floor = disk_space.RESERVE_MIN_BYTES + 4096  # the operator floor wins
+    saved_floor = settings.tour_asset_min_free_bytes
+    object.__setattr__(settings, "tour_asset_min_free_bytes", floor)
+    # A volume whose free space goes down as attachments are copied onto it.
+    free = {"n": 0}
+    monkeypatch.setattr(disk_space, "free_bytes", lambda path: free["n"])
+    real_copyfile = _st.shutil.copyfile
+
+    def _copyfile(src, dst, *a, **kw):
+        out = real_copyfile(src, dst, *a, **kw)
+        if f"{os.sep}assets{os.sep}tours{os.sep}" in str(dst):
+            free["n"] -= os.path.getsize(src)
+        return out
+
+    monkeypatch.setattr(_st.shutil, "copyfile", _copyfile)
+    t = _tok()
+    tour_pid = f"ps{t}"
+    png = _png_bytes()
+    stage_id = _stage_bundle(
+        [_slide_doc(f"ps{t}", f"ps-{t}.svs", [{"public_id": tour_pid, "title": "S", "steps": []}])],
+        assets={tour_pid: {"a.png": png, "b.png": png}},
+    )
+    try:
+        _dir, manifest, doc = _st._read_stage(stage_id)
+        need = 2 * len(png)
+        # One byte short of both attachments plus the floor: the plan says
+        # so...
+        free["n"] = need + floor - 1
+        plan = _st.plan_import(stage_id, manifest, doc, db_session)
+        assert plan["data_space"] == {
+            "needed_bytes": need, "free_bytes": need + floor - 1, "reserve_bytes": floor,
+        }, plan["data_space"]
+        # ...and the apply indeed refuses the slide at its second attachment.
+        result = _st.apply_import(stage_id, {})
+        assert [f["code"] for f in result["failed"]] == ["importNoSpace"], result
+        # Room for both copies and the floor after them: the plan fits, and
+        # the apply (a retry of the stage) copies every attachment.
+        free["n"] = need + floor
+        assert _st.plan_import(stage_id, manifest, doc, db_session)["data_space"] is None
+        result = _st.apply_import(stage_id, {})
+        assert not result["failed"], result
+        assert len(result["imported"]) == 1, result
+        assert result["retry"] == {"failed_slides": 0, "skipped_assets": 0}
+    finally:
+        object.__setattr__(settings, "tour_asset_min_free_bytes", saved_floor)
+        _st.cleanup_import_stage(stage_id)
+
+
+def test_attachment_retry_skips_a_tour_deleted_before_its_lock(db_session, monkeypatch, asset_settings):
+    """The retry reads the import's tours before taking each tour's
+    tour_asset_lock; a tour deleted in between (row and asset directory gone
+    under that lock) must not get its directory back, served publicly with
+    no row behind it. Its retryable skips are dropped like those of a tour
+    already gone."""
+    from wsi_app.routers import admin_tours
+
+    _patch_wsi_readers(monkeypatch)
+    t = _tok()
+    tour_pid = f"dt{t}"
+    asset_settings(tour_asset_max_files=1)
+    stage_id = _stage_bundle(
+        [_slide_doc(f"d{t}", f"del-{t}.svs", [{"public_id": tour_pid, "title": "Del", "steps": []}])],
+        assets={tour_pid: {"a.png": _png_bytes(), "b.png": _png_bytes()}},
+    )
+    try:
+        first = _st.apply_import(stage_id, {})
+        assert first["retry"] == {"failed_slides": 0, "skipped_assets": 1}
+        tour = db_session.query(Tour).filter_by(slide_id=first["imported"][0]["slide_id"]).one()
+        tid, new_pid = tour.id, tour.public_id
+        asset_settings(tour_asset_max_files=200)
+
+        real_lock = _st.tour_asset_lock
+
+        @contextlib.contextmanager
+        def _lock(tour_id):
+            # The delete lands right before the retry gets the lock.
+            from wsi_app.db import SessionLocal
+            other = SessionLocal()
+            try:
+                assert admin_tours._do_delete_tour(other, tour_id)
+            finally:
+                other.close()
+            with real_lock(tour_id):
+                yield
+
+        monkeypatch.setattr(_st, "tour_asset_lock", _lock)
+        done = _st.retry_import_assets(stage_id)
+        assert done["copied_count"] == 0 and done["still_skipped_count"] == 0
+        assert not os.path.exists(tour_asset_dir(new_pid))
+        assert db_session.query(Tour).filter_by(id=tid).first() is None
+        assert done["stage_kept"] is False
+    finally:
+        _st.cleanup_import_stage(stage_id)
+
+
+# ---------------------------------------------------------------------------
+# The job slot is released however a request fails after claiming it
+# ---------------------------------------------------------------------------
+
+def _release_all_slots():
+    for j in list(_jobs.store._iter_disk_jobs()):
+        if j.state in ("pending", "running"):
+            _jobs.store.update(j.id, state="failed", error="test cleanup")
+    _jobs.store.prune_terminal(max_age_seconds=0)
+
+
+def _drop_unhandled_error_logs():
+    """Delete the ``wsi_app.unhandled`` ErrorLog rows a simulated 500 left.
+
+    The tests below drive a request into an unhandled exception on purpose;
+    the error-log capture persists it to the shared test database, which
+    would make later tests that count ``wsi_app.unhandled`` rows (e.g.
+    test_error_logs) depend on test order.
+    """
+    from sqlalchemy import delete as sa_delete
+
+    from wsi_app.db import SessionLocal
+    from wsi_app.models import ErrorLog
+
+    with SessionLocal() as db:
+        db.execute(sa_delete(ErrorLog).where(ErrorLog.logger == "wsi_app.unhandled"))
+        db.commit()
+
+
+@pytest.fixture
+def running_write_fails(monkeypatch):
+    """Make the ``state="running"`` write right after a claim raise, leaving
+    the claim ``pending``."""
+    real = _jobs.store.update
+
+    def update(job_id, **fields):
+        if fields.get("state") == "running":
+            raise RuntimeError("simulated failure of the running write")
+        return real(job_id, **fields)
+
+    monkeypatch.setattr(_jobs.store, "update", update)
+    try:
+        yield
+    finally:
+        monkeypatch.setattr(_jobs.store, "update", real)
+        _release_all_slots()
+        # Each test using this fixture ends in a simulated unhandled 500.
+        _drop_unhandled_error_logs()
+
+
+def test_export_releases_the_slot_when_the_running_write_fails(
+    admin_headers, slide, attach_wsi, running_write_fails,
+):
+    from fastapi.testclient import TestClient
+    from wsi_app.main import app
+
+    attach_wsi(slide)
+    with TestClient(app, raise_server_exceptions=False) as c:
+        r = c.post("/api/admin/slides/export", json={"slide_ids": [slide.id]}, headers=admin_headers)
+    assert r.status_code == 500
+    # A "pending" claim left by this live worker would 409 every later job.
+    assert not _jobs.store.has_running()
+
+
+def test_apply_releases_the_slot_when_the_running_write_fails(admin_headers, running_write_fails):
+    from fastapi.testclient import TestClient
+    from wsi_app.main import app
+
+    with TestClient(app, raise_server_exceptions=False) as c:
+        r = c.post("/api/admin/slides/import/apply",
+                   json={"stage_id": "import-000000000000"}, headers=admin_headers)
+    assert r.status_code == 500
+    assert not _jobs.store.has_running()
+
+
+def test_stage_import_releases_the_slot_when_the_request_is_cancelled(admin_user, monkeypatch):
+    """The client goes away (or the server shuts down) while the bundle is
+    being received: the request's cancellation is delivered again at every
+    await of the handler, so its cleanup must not await anything."""
+    import anyio
+    from anyio import from_thread
+    from wsi_app.routers import admin_slide_transfer as ast
+
+    scope_box = {}
+
+    class _Held:
+        size = 1
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    held = _Held()
+
+    def hold_upload(file, max_bytes):
+        # Cancel the request while the upload is being taken over; the
+        # cancellation lands at the handler's next await.
+        from_thread.run_sync(scope_box["scope"].cancel)
+        return held
+
+    monkeypatch.setattr(ast, "hold_upload", hold_upload)
+    upload = type("U", (), {"filename": "b.tar.zst"})()
+
+    async def main():
+        with anyio.CancelScope() as scope:
+            scope_box["scope"] = scope
+            await ast.stage_slide_import(request=None, file=upload, admin=admin_user)
+        assert scope.cancelled_caught
+
+    try:
+        anyio.run(main)
+        assert held.closed
+        assert not _jobs.store.has_running(), "the cancelled request left the job slot claimed"
+    finally:
+        _release_all_slots()

@@ -31,6 +31,7 @@ import time
 from contextlib import contextmanager
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from typing import Optional
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response
 from starlette.background import BackgroundTask
@@ -80,17 +81,39 @@ _BOT_FILTER = PageView.ua_class == "bot"
 # (e.g. `start=1970-01-01`) that locks the table.
 _MAX_WINDOW_DAYS = 365
 
+# The dates a request may name. Python's own limits (0001-01-01 … 9999-12-31)
+# are not enough: the window math steps past the given day (end_date + 1 day,
+# start = end - 364 days) and the analytics-TZ midnight is converted to UTC for
+# the SQL bounds, so a date at either edge raised OverflowError deep in a
+# handler and came back as an unhelpful 422 "Numeric value out of range" (or
+# worked or failed depending on the zone's offset). No analytics row predates
+# 1900 or postdates 9998, so these bounds cost nothing real and leave a year of
+# headroom on each side for every step above.
+_MIN_REQUEST_DATE = date(1900, 1, 1)
+_MAX_REQUEST_DATE = date(9998, 12, 31)
+
+
 def _parse_iso_date(s: str) -> datetime:
     """Parse a YYYY-MM-DD string as midnight in the analytics TZ.
 
     Raises HTTPException(400) on malformed input so the caller sees
     "the date is wrong" rather than silently falling back to `days`,
-    which would hide typos in the picker.
+    which would hide typos in the picker — and on a date outside
+    [_MIN_REQUEST_DATE, _MAX_REQUEST_DATE].
     """
     try:
-        return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=analytics_tz())
+        parsed = datetime.strptime(s, "%Y-%m-%d")
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"invalid date: {s!r} (expected YYYY-MM-DD)") from exc
+    if not _MIN_REQUEST_DATE <= parsed.date() <= _MAX_REQUEST_DATE:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"date out of range: {s!r} (expected {_MIN_REQUEST_DATE.isoformat()}"
+                f" to {_MAX_REQUEST_DATE.isoformat()})"
+            ),
+        )
+    return parsed.replace(tzinfo=analytics_tz())
 
 
 def _resolve_window(
@@ -209,12 +232,28 @@ def _query_budget(db: Session):
     passed, turning the interruption into a 503 the dashboard can explain."""
     raw = db.connection().connection.driver_connection
     deadline = time.monotonic() + _QUERY_TIME_BUDGET_S
-    raw.set_progress_handler(lambda: time.monotonic() > deadline, _QUERY_BUDGET_CHECK_STEPS)
+    # Whether the handler has asked SQLite to stop. The error that follows is
+    # not always "interrupted": when the interrupt lands while SQLite is
+    # re-preparing a cached statement (another connection changed the schema
+    # since it was compiled, e.g. a migration or an index build), it reports
+    # "database schema has changed" instead. So the timeout is recognised by
+    # the handler having fired, not by the error's wording.
+    fired = False
+
+    def past_deadline() -> bool:
+        nonlocal fired
+        if time.monotonic() > deadline:
+            fired = True
+        return fired
+
+    raw.set_progress_handler(past_deadline, _QUERY_BUDGET_CHECK_STEPS)
     timed_out = None
     try:
         yield
     except OperationalError as exc:
-        if "interrupted" not in str(exc.orig):
+        # Any other OperationalError (locked database, disk I/O, a genuine
+        # schema error) is not a timeout and propagates as before.
+        if not fired:
             raise
         timed_out = exc
     finally:
@@ -753,6 +792,21 @@ def _resolve_beacon_staff_user(db, auth_header: str) -> Optional[User]:
     return resolve_staff_user(token, db)
 
 
+def _host_header_name(host: str) -> str:
+    """The host name of a ``Host`` header value, port and IPv6 brackets
+    removed ("[::1]:8000" -> "::1"), lower-cased; "" when it does not parse.
+
+    Splitting on the first ':' would cut a bracketed IPv6 literal down to "["
+    and every same-site referrer on an IPv6 URL would then count as an
+    external one. The result is compared with ``urlparse(referrer).hostname``
+    (analytics.extract_referrer_host), so it is produced the same way.
+    """
+    try:
+        return urlsplit("//" + host).hostname or ""
+    except ValueError:
+        return ""
+
+
 def _staff_actor_role(staff_user: Optional[User], auth_header: str = "") -> Optional[str]:
     """Classify a resolved beacon user into a staff ``actor_role``, or None.
 
@@ -863,7 +917,7 @@ def _persist_pageview(
     referer = payload.get("referrer")
     if not isinstance(referer, str):
         referer = ""
-    host_header = (headers.get("host") or "").split(":", 1)[0]
+    host_header = _host_header_name(headers.get("host") or "")
     referrer_host = _an.extract_referrer_host(referer, host_header)
 
     session_cookie = cookies.get(_app_auth.SESSION_COOKIE)
@@ -880,7 +934,14 @@ def _persist_pageview(
     # analytics aggregations filter on actor_role IS NULL so QA traversals
     # by staff don't pollute the educational metrics.
     actor_role = _staff_actor_role(staff_user, auth_header)
-    if not published and actor_role is None:
+    # Draft content is recorded only for a LIVE staff user (staff_user, which
+    # resolve_staff_user checked for expiry, revocation and is_active), not
+    # for any non-NULL actor_role: that also comes from signed_staff_role,
+    # which deliberately accepts an expired or revoked token so a stale staff
+    # browser is still tagged as staff. A tag is not an authorisation — a
+    # disabled account's leftover JWT must not keep writing analytics rows
+    # for unpublished slides / tours. Same gate in all three beacons.
+    if not published and staff_user is None:
         return Response(status_code=204)
     user_id, user_identifier, mode = _an.resolve_identity(
         session_cookie, headers, client_host, db,
@@ -1169,7 +1230,9 @@ def _persist_slide_dwell(
     # _persist_pageview.
     staff_user = _resolve_beacon_staff_user(db, auth_header)
     actor_role = _staff_actor_role(staff_user, auth_header)
-    if not published and actor_role is None:
+    # Live staff only for draft content (staff_user, not actor_role) — see
+    # _persist_pageview.
+    if not published and staff_user is None:
         return Response(status_code=204)
     _uid, user_identifier, mode = _an.resolve_identity(
         session_cookie, headers, client_host, db,
@@ -1408,7 +1471,9 @@ def _persist_tour_event(
     # _persist_pageview.
     staff_user = _resolve_beacon_staff_user(db, auth_header)
     actor_role = _staff_actor_role(staff_user, auth_header)
-    if actor_role is None and not (
+    # Live staff only for draft content (staff_user, not actor_role) — see
+    # _persist_pageview.
+    if staff_user is None and not (
         tour.is_published and _slide_published(db, tour.slide_id)
     ):
         return Response(status_code=204)
@@ -2688,12 +2753,19 @@ def admin_clear_analytics_user(
     ``"complete": false`` when rows may remain, for the caller to repeat.
     """
     ident, digest, _match = _identifier_matcher(identifier)
-    # What the audit row names: the digest in hashed mode (so a raw email typed
-    # into the purge box never lands in the trail), else the identifier. Decided
-    # up front - before any row is deleted - so the failure path can use it too.
+    # What the audit row names: the digest unless the mode is "plain" (so a raw
+    # email typed into the purge box never lands in the trail), else the
+    # identifier. "off" counts with "hashed": an operator who recorded in hashed
+    # mode and then stopped recording still erases hashed rows, and naming the
+    # plaintext there would put the erased person's email into the audit trail
+    # (and the journal it is mirrored to) only because recording was switched
+    # off. Only "plain", whose rows hold the identifier as typed anyway, keeps
+    # it readable. Without a usable salt there is no digest and the identifier
+    # is all there is. Decided up front - before any row is deleted - so the
+    # failure path can use it too.
     audit_target = (
         digest
-        if digest and _an.current_analytics_mode(db) == _an.ANALYTICS_HASHED
+        if digest and _an.current_analytics_mode(db) != _an.ANALYTICS_PLAIN
         else ident
     )
 
@@ -2719,9 +2791,9 @@ def admin_clear_analytics_user(
         pv_deleted, sde_deleted, ts_deleted, complete,
     )
     # GDPR erasure: "who erased whose data and when" is exactly what the audit
-    # trail must retain. ``target`` is the (already-pseudonymous in hashed mode)
-    # identifier the admin supplied — or, in hashed mode, its digest, so a raw
-    # email typed into the purge box doesn't land in the audit trail.
+    # trail must retain. ``target`` is the identifier's digest outside plain
+    # mode, so a raw email typed into the purge box doesn't land in the audit
+    # trail; in plain mode, the identifier as supplied (see audit_target above).
     audit(
         admin, "analytics.purge_user", target=audit_target,
         deleted_page_views=int(pv_deleted),

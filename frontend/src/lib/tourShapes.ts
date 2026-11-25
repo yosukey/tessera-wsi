@@ -30,7 +30,10 @@ export function normalizeShapeKind(raw: string | undefined | null): ShapeKind {
 // (border, background) downstream, so anything outside this whitelist is
 // rejected to prevent attribute / markup injection from a malicious stored
 // value. The named-palette branch returns a constant and is safe.
-const SAFE_HEX_COLOR = /^#[0-9a-fA-F]{3,8}$/
+// Exactly 3, 4, 6 or 8 digits: `{3,8}` also let 5- and 7-digit values
+// through, which are not valid CSS colors (the browser drops the fill and the
+// pin/shape renders with no color instead of the palette fallback).
+const SAFE_HEX_COLOR = /^#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/
 
 // Resolve a stored stroke_color (preset name OR hex string) into a CSS color.
 // Unknown / non-hex values fall back to the default palette color rather

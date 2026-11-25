@@ -524,6 +524,35 @@ def test_app_logout_rejects_cross_site_post(client):
     assert ok.status_code == 200, ok.text
 
 
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "null",  # sandboxed iframe / data: page: another site can create one
+        "NULL",
+        "http://[::1",  # urlsplit raises ValueError: must be a 403, not a 500
+        "garbage",  # no hostname to compare
+    ],
+)
+def test_app_logout_origin_fallback_fails_closed(client, origin):
+    """Without fetch metadata the Origin fallback refuses an opaque or
+    unparsable Origin instead of letting it through."""
+    r = client.post("/api/auth/logout", headers={"Origin": origin})
+    assert r.status_code == 403, r.text
+
+
+def test_app_logout_origin_fallback_admits_its_own_host(client):
+    """The fallback still admits the app's own origin, port and trailing dot
+    notwithstanding (nginx forwards Host without either)."""
+    for origin in ("http://testserver", "https://testserver:8443", "http://testserver."):
+        r = client.post("/api/auth/logout", headers={"Origin": origin})
+        assert r.status_code == 200, (origin, r.text)
+    # An Origin with no Host to compare it with is refused.
+    r = client.post(
+        "/api/auth/logout", headers={"Origin": "http://testserver", "Host": ""}
+    )
+    assert r.status_code == 403, r.text
+
+
 def test_app_login_rejects_cross_site_post(client, db_session):
     """Login CSRF: a cross-site POST must not be able to seat a session."""
     from wsi_app import app_auth as _app_auth

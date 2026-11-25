@@ -113,8 +113,12 @@ done
 # drops SUDO_UID) the account the login session belongs to.
 _guard_op="${SUDO_UID:-}"
 if [[ -z "$_guard_op" ]]; then _guard_op="$(id -u -- "$(logname 2>/dev/null)" 2>/dev/null || true)"; fi
+# Everything root runs from the tree: lib/wsi-common.sh, lib/replica_db.py,
+# and lib/envfile_set.py, which replica_db.py's set-env imports (as root) from
+# the directory it sits in.
 for _guard_p in "$REPO_DIR" "$REPO_DIR/infra" "$REPO_DIR/infra/lib" "$REPO_DIR/infra/lib/wsi-common.sh" \
-                "$REPO_DIR/infra/lib/replica_db.py" "$(realpath -- "${BASH_SOURCE[0]}")"; do
+                "$REPO_DIR/infra/lib/replica_db.py" "$REPO_DIR/infra/lib/envfile_set.py" \
+                "$(realpath -- "${BASH_SOURCE[0]}")"; do
     read -r _guard_uid _guard_user _guard_mode < <(stat -L -c '%u %U %a' -- "$_guard_p" 2>/dev/null) \
         || _guard_refuse "$_guard_p is missing"
     if [[ "$_guard_uid" != 0 && "$_guard_uid" != "$EUID" && "$_guard_uid" != "$_guard_op" ]]; then
@@ -589,9 +593,20 @@ if [[ "$MODE" == "rollback" ]]; then
     ok "Moved every slide to a fresh tile generation."
     sign_out
     if [[ -n "$PRE_SYNC_ENV" && "$LAST_MODE" == "all" ]]; then
-        install -m "$(stat -c '%a' "$WSI_ENV_FILE")" -o "$(stat -c '%u' "$WSI_ENV_FILE")" \
-            -g "$(stat -c '%g' "$WSI_ENV_FILE")" "$PRE_SYNC_ENV" "$WSI_ENV_FILE.sync-tmp"
-        mv -f -- "$WSI_ENV_FILE.sync-tmp" "$WSI_ENV_FILE"
+        # wsi.env may be a symlink (kept in a config-managed directory, which
+        # envfile_set.py supports): put the content back into the file it
+        # points to, with THAT file's mode and owner, and leave the link a link.
+        # Taken from the link itself, the mode would be lstat's 0777 -- the
+        # secrets world-readable and writable -- and the rename would replace
+        # the link by a regular file. The temp file sits beside the target, so
+        # the rename stays on one filesystem and is atomic.
+        env_target="$(realpath -e -- "$WSI_ENV_FILE")" \
+            || die "$WSI_ENV_FILE (or the file it links to) is missing; the previous one is kept in $PRE_SYNC_ENV."
+        read -r env_mode env_uid env_gid < <(stat -L -c '%a %u %g' -- "$env_target") \
+            || die "Could not read the mode of $env_target; the previous wsi.env is kept in $PRE_SYNC_ENV."
+        install -m "$env_mode" -o "$env_uid" -g "$env_gid" -- "$PRE_SYNC_ENV" "$env_target.sync-tmp"
+        mv -f -- "$env_target.sync-tmp" "$env_target"
+        unset env_target env_mode env_uid env_gid
         rm -f -- "$PRE_SYNC_ENV"
         ok "Restored $WSI_ENV_FILE."
     elif [[ -n "$PRE_SYNC_ENV" ]]; then

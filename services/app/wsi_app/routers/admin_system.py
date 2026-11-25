@@ -16,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import admin_helpers as _admin_helpers
+from .. import admin_reports as _admin_reports
 from .. import disk_space as _disk_space
 from ..auth import MANAGER_OR_ABOVE, ROLE_ADMIN, get_current_user, require_server_access
 from ..config import settings
@@ -1011,86 +1012,15 @@ def _cgroup_info() -> dict:
     return out
 
 
-def _iana_name_or_none(name: str) -> str | None:
-    """``name`` if it is an IANA zone this host knows, else None.
-
-    ``TZ`` may legally hold a POSIX rule ("JST-9") or a file path
-    (":/etc/localtime"), and zoneinfo symlinks can point into the
-    ``posix/`` / ``right/`` trees; none of those is a zone name the page (or
-    a browser's Intl API) can use.
-    """
-    from zoneinfo import ZoneInfo
-
-    name = name.strip()
-    for prefix in ('posix/', 'right/'):
-        if name.startswith(prefix):
-            name = name[len(prefix):]
-    if not name or name.startswith(('/', '.')):
-        return None
-    try:
-        ZoneInfo(name)
-    except Exception:
-        return None
-    return name
-
-
-_ZONEINFO_DIRS = ('/usr/share/zoneinfo/', '/usr/lib/zoneinfo/', '/usr/share/lib/zoneinfo/')
-
-
-def _zone_from_zoneinfo_path(path: str) -> str | None:
-    """The IANA name of a zoneinfo file ``path`` is, or links to, if any."""
-    candidates = [path]
-    try:
-        candidates.insert(0, os.readlink(path))
-    except OSError:
-        pass
-    for target in candidates:
-        for prefix in _ZONEINFO_DIRS:
-            if prefix in target:
-                name = _iana_name_or_none(target.split(prefix, 1)[1])
-                if name:
-                    return name
-    return None
-
-
-def _get_iana_timezone() -> str | None:
-    """Return the IANA timezone name (e.g. 'Europe/Berlin') for the server.
-
-    Priority: TZ env var > /etc/localtime symlink > /etc/timezone, each used
-    only when it names a real IANA zone.
-    /etc/timezone is checked last because container images often ship it
-    as 'Etc/UTC' even when the actual runtime timezone differs.
-    """
-    # 1. TZ environment variable — set explicitly in most container runtimes.
-    # When set, it — not /etc/localtime — is the zone the process runs in, so
-    # a value that names no IANA zone is "unknown", never a fall-through to
-    # /etc/localtime: TZ=JST-9 on a host whose localtime is UTC runs at +09:00.
-    # A file path (":/usr/share/zoneinfo/Asia/Tokyo", "/etc/localtime") is
-    # resolved like /etc/localtime below.
-    tz_env = os.environ.get('TZ', '').strip().lstrip(':')
-    if tz_env:
-        name = _iana_name_or_none(tz_env)
-        if name:
-            return name
-        if not tz_env.startswith('/'):
-            return None
-        name = _zone_from_zoneinfo_path(tz_env)
-        if name or tz_env != '/etc/localtime':
-            return name
-        # TZ names /etc/localtime itself: the sources below describe it too.
-    # 2. /etc/localtime symlink — reliable on systemd-managed hosts.
-    name = _zone_from_zoneinfo_path('/etc/localtime')
-    if name:
-        return name
-    # 3. /etc/timezone — may be stale in minimal container images.
-    try:
-        with open('/etc/timezone') as f:
-            name = _iana_name_or_none(f.read())
-            if name:
-                return name
-    except Exception:
-        pass
-    return None
+# The host-zone resolver lives in admin_reports so the System page's
+# ``tz_name`` and the analytics zone fallback share one implementation; the
+# two used to differ on a POSIX-rule TZ ("JST-9"), where the analytics side
+# fell through to /etc/localtime and reported a zone the process does not run
+# in. These aliases keep this module's names (perf_bench imports
+# _get_iana_timezone).
+_iana_name_or_none = _admin_reports.iana_name_or_none
+_zone_from_zoneinfo_path = _admin_reports.zone_from_zoneinfo_path
+_get_iana_timezone = _admin_reports.host_iana_timezone
 
 
 def _os_extended() -> dict:

@@ -559,12 +559,46 @@ export function applyStepTransition(
     unionRect(viewer.viewport.getBounds(true).getBoundingBox(), bounds.getBoundingBox()),
     OVERVIEW_PADDING,
   )
-  setSpringAnimationTime(viewer, animationTime * PULL_OUT_FRACTION)
+  const pullOutSeconds = animationTime * PULL_OUT_FRACTION
+  const pushInSeconds = animationTime * (1 - PULL_OUT_FRACTION)
+
+  // Phase 2. Reached either from phase 1's 'animation-finish' or from the
+  // phase-1 timeout below, whichever comes first; `pushedIn` makes the second
+  // arrival a no-op so the push-in is never issued twice.
+  let pushedIn = false
+  let pullOutTimer: ReturnType<typeof setTimeout> | undefined
+  const pushIn = () => {
+    if (pushedIn) return
+    pushedIn = true
+    disposePullOutFinish()
+    if (pullOutTimer !== undefined) clearTimeout(pullOutTimer)
+    setSpringAnimationTime(viewer, pushInSeconds)
+    // Register before fitBounds so even a synchronously raised finish is
+    // seen. Phase 2 needs the same no-op safety net as 'smooth': if the
+    // target equals where phase 1 left the view, OSD animates nothing and
+    // the springs would otherwise stay slow forever.
+    const disposePushInFinish = onceAnimationFinish(viewer, token, () => restoreSpringAnimationTime(viewer))
+    restoreSpringAnimationTimeAfter(viewer, token, pushInSeconds * 1000 + 50, disposePushInFinish)
+    viewer.viewport.fitBounds(bounds, false)
+  }
+
+  setSpringAnimationTime(viewer, pullOutSeconds)
+  const disposePullOutFinish = onceAnimationFinish(viewer, token, pushIn)
+  // Phase-1 safety net. When the view already shows the overview (typically
+  // the viewer sits at its home / minimum zoom, so fitBounds(overview) is
+  // clamped to the current view), OSD starts no animation and never raises
+  // 'animation-finish' — without this, phase 2 would never run and the tour
+  // would be stuck at the overview with slow springs. A slightly early
+  // expiry during a real pull-back is harmless: phase 2's fitBounds simply
+  // retargets the in-flight springs.
+  pullOutTimer = setTimeout(() => {
+    try {
+      if ((viewer as TransitionViewer)._tourTransitionToken !== token) return
+      if (viewer.viewport) pushIn()
+    } catch { /* viewer destroyed */ }
+  }, pullOutSeconds * 1000 + 50)
+  const timer = pullOutTimer
+  trackTransitionDisposer(viewer, () => clearTimeout(timer))
   viewer.viewport.setRotation(rotationDeg, false)
   viewer.viewport.fitBounds(overview, false)
-  onceAnimationFinish(viewer, token, () => {
-    setSpringAnimationTime(viewer, animationTime * (1 - PULL_OUT_FRACTION))
-    viewer.viewport.fitBounds(bounds, false)
-    onceAnimationFinish(viewer, token, () => restoreSpringAnimationTime(viewer))
-  })
 }

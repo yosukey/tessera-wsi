@@ -12,6 +12,7 @@ import os
 
 import pytest
 
+from wsi_app import admin_reports
 from wsi_app.routers import admin_system
 
 
@@ -26,6 +27,9 @@ def fake_fs(monkeypatch):
         raise PermissionError(13, "Permission denied", path)
 
     monkeypatch.setattr(admin_system, "open", fake_open, raising=False)
+    # The host-zone resolver behind admin_system._get_iana_timezone lives in
+    # admin_reports (shared with the analytics zone fallback).
+    monkeypatch.setattr(admin_reports, "open", fake_open, raising=False)
     monkeypatch.setattr(os.path, "exists", lambda p: p in files)
     monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
     return files
@@ -350,3 +354,24 @@ def test_server_info_endpoint_shape(client, admin_headers):
     assert "workers" in body["app_process"]
     assert "cgroup_path" in body["cgroup"]
     assert {"stat_age_seconds", "stat_stale", "source", "partial"} <= set(body["nginx_cache"])
+
+
+@pytest.mark.parametrize("tz_env", ["JST-9", "posix/Asia/Tokyo", ":/usr/share/zoneinfo/Asia/Tokyo"])
+def test_analytics_host_zone_agrees_with_the_system_page(fake_fs, monkeypatch, tz_env):
+    """The analytics zone fallback and the System page resolve the host zone
+    with one implementation: on a POSIX-rule TZ the analytics side used to
+    fall through to /etc/localtime (here UTC) — a zone the process does not
+    run in — while the System page correctly reported it unknown."""
+    def readlink(path):
+        if path == "/etc/localtime":
+            return "../usr/share/zoneinfo/Etc/UTC"
+        raise OSError(22, "Invalid argument", path)
+
+    monkeypatch.setenv("TZ", tz_env)
+    monkeypatch.setattr(admin_system.os, "readlink", readlink)
+    admin_reports._host_tz_name.cache_clear()
+    try:
+        assert admin_reports._host_tz_name() == admin_system._get_iana_timezone()
+    finally:
+        admin_reports._host_tz_name.cache_clear()
+    assert admin_system._get_iana_timezone() == (None if tz_env == "JST-9" else "Asia/Tokyo")

@@ -213,3 +213,93 @@ def test_a_root_owned_link_to_the_service_users_database_is_refused(tmp_path, mo
     _service_user(monkeypatch, tool)
     message = tool._refuse_root_on_service_db(str(link))
     assert message and "is a link to a database that belongs to wsi" in message
+
+
+def test_snapshot_copy_is_private_while_it_is_being_written(tmp_path, monkeypatch):
+    """The copy holds password hashes: it must not exist world-readable (the
+    usual 0022 umask) at any point before it gets the source's mode."""
+    import os
+    import sqlite3
+
+    tool = _load_tool()
+    src = tmp_path / "wsi.db"
+    c = sqlite3.connect(src)
+    c.execute("CREATE TABLE t(a)")
+    c.commit()
+    c.close()
+    os.chmod(src, 0o640)
+    seen = {}
+
+    def record(src_path, dest_path):
+        seen["mode"] = os.stat(dest_path).st_mode & 0o777
+
+    monkeypatch.setattr(tool, "_mirror_ownership", record)
+    old = os.umask(0o022)
+    try:
+        tool._snapshot(str(src), str(tmp_path / "copy.db"))
+        assert os.umask(0o022) == 0o022, "the caller's umask was not restored"
+    finally:
+        os.umask(old)
+    assert seen["mode"] & 0o077 == 0
+
+
+def test_report_only_snapshot_leaves_the_live_wal_alone(tmp_path):
+    """A report-only run promises to write nothing: no WAL checkpoint, and no
+    checkpoint-on-close either (a writable connection would do one)."""
+    import hashlib
+    import os
+    import sqlite3
+
+    tool = _load_tool()
+    src = tmp_path / "wsi.db"
+    live = sqlite3.connect(src)
+    live.execute("PRAGMA journal_mode=WAL")
+    live.execute("CREATE TABLE t(a)")
+    live.execute("INSERT INTO t VALUES (1)")
+    live.commit()
+
+    def digest(p):
+        return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+    before = (digest(src), digest(f"{src}-wal"))
+    assert os.path.getsize(f"{src}-wal") > 0
+    copy = tmp_path / "copy.db"
+    tool._snapshot(str(src), str(copy), read_only=True)
+    assert (digest(src), digest(f"{src}-wal")) == before
+    # ... and the copy still has the rows that live only in the WAL.
+    assert sqlite3.connect(copy).execute("SELECT a FROM t").fetchall() == [(1,)]
+    live.close()
+
+
+def _wal_db_without_sidecars(path):
+    """A WAL-mode database, closed cleanly: no -wal / -shm on disk."""
+    import sqlite3
+
+    live = sqlite3.connect(path)
+    live.execute("PRAGMA journal_mode=WAL")
+    live.execute("CREATE TABLE t(a)")
+    live.execute("INSERT INTO t VALUES (1)")
+    live.commit()
+    live.close()
+
+
+def test_report_only_snapshot_never_deletes_a_live_writers_sidecars(tmp_path):
+    """A writer (the service, started while the report runs) that has opened
+    the database but not written yet holds an EMPTY -wal, exactly like the
+    ones a read-only open creates. The report-only run must not remove
+    sidecars at all: unlinking that writer's -wal / -shm makes its next
+    commit fail ("disk I/O error") or lose its writes."""
+    import os
+    import sqlite3
+
+    tool = _load_tool()
+    src = tmp_path / "wsi.db"
+    _wal_db_without_sidecars(src)
+    writer = sqlite3.connect(src)
+    writer.execute("SELECT count(*) FROM t").fetchone()  # opened, nothing written
+    tool._snapshot(str(src), str(tmp_path / "copy.db"), read_only=True)
+    assert os.path.exists(f"{src}-wal") and os.path.exists(f"{src}-shm")
+    writer.execute("INSERT INTO t VALUES (2)")
+    writer.commit()
+    assert writer.execute("SELECT count(*) FROM t").fetchone() == (2,)
+    writer.close()

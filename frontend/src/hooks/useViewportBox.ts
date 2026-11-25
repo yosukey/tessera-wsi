@@ -15,7 +15,7 @@ let stopListening: (() => void) | null = null
 function measure(): void {
   const next = measureViewportBox()
   applyViewportBox(next)
-  if (current && current.width === next.width && current.height === next.height && current.stale === next.stale) return
+  if (current && current.width === next.width && current.height === next.height && current.stale === next.stale && current.clipX === next.clipX) return
   current = next
   subscribers.forEach((notify) => notify())
 }

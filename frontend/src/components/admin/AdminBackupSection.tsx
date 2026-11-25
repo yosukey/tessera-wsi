@@ -1,4 +1,5 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useRef, useState, type MutableRefObject } from 'react'
+import { createPortal } from 'react-dom'
 import {
   BackupEstimate,
   BackupItem,
@@ -48,6 +49,7 @@ import {
 } from '../../lib/api'
 import { Badge, Button, Card, Input, LockFieldset, Textarea } from '../ui'
 import { useDialogFocus } from '../../hooks/useDialogFocus'
+import { useUnsavedNavigationGuard } from '../../hooks/useUnsavedNavigationGuard'
 import { useInFlight } from '../../hooks/useInFlight'
 import { useI18n } from '../../lib/i18n'
 import { apiErrorMessage } from '../../lib/admin/apiError'
@@ -56,6 +58,7 @@ import { STORAGE_KEYS } from '../../lib/storageKeys'
 import { formatBytes } from '../../lib/admin/validation'
 import type { TFn } from '../../lib/admin/validation'
 import { safeSessionGetItem, safeSessionSetItem, safeSessionRemoveItem } from '../../lib/safeStorage'
+import { FULL_VIEWPORT_FIXED } from '../../lib/viewportBox'
 
 function formatDateTime(iso: string): string {
   if (!iso) return '—'
@@ -295,7 +298,41 @@ const TD_STYLE: React.CSSProperties = {
   verticalAlign: 'top',
 }
 
-export default function AdminBackupSection() {
+// The three confirm dialogs' backdrop and panel. Portaled to <body> and
+// anchored to the measured viewport (lib/viewportBox), so no ancestor's
+// transform / overflow and no stale layout viewport can misplace them; the
+// panel scrolls within the backdrop on a short screen (a phone in landscape,
+// an on-screen keyboard), so its buttons can always be reached.
+const MODAL_BACKDROP_STYLE: React.CSSProperties = {
+  ...FULL_VIEWPORT_FIXED,
+  background: 'rgba(0,0,0,0.5)',
+  display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
+  padding: 16,
+}
+const MODAL_PANEL_STYLE: React.CSSProperties = {
+  background: 'var(--color-surface)',
+  padding: 'var(--space-4)',
+  borderRadius: 8,
+  maxWidth: 480,
+  width: '90%',
+  maxHeight: '100%',
+  overflowY: 'auto',
+  boxShadow: '0 4px 24px rgba(0,0,0,0.2)',
+}
+
+type Props = {
+  // Reports whether leaving this section now would cost something: a restore
+  // archive whose body is still being sent (unmounting aborts it), or a
+  // restore / reset being applied (unmounting stops following it, so its
+  // outcome is not shown here). The dashboard confirms before its own exits
+  // (a tab switch, a link, Logout) while it is reported.
+  onBusyChange?: (busy: boolean) => void
+  // Holds the navigation guard's in-app exit while this section is mounted
+  // (null otherwise); see AdminUploadSection.
+  leaveRef?: MutableRefObject<((go: () => void) => void) | null>
+}
+
+export default function AdminBackupSection({ onBusyChange, leaveRef }: Props = {}) {
   const { t } = useI18n()
   const currentVersion = APP_INFO.version
 
@@ -355,6 +392,12 @@ export default function AdminBackupSection() {
   // False once this section unmounts (sidebar tab switch): an upload that
   // finishes after that only records its job id for the next mount.
   const mountedRef = useRef(true)
+  // Aborted on unmount: ends the waits that follow a restore / reset apply
+  // (waitForJob / waitForRestoreApplied). Left running, they would go on
+  // polling and, once the apply finished, reload — or alert and send to the
+  // login page — whatever page the operator had moved on to. The outcome is
+  // not lost: the next mount reads the server's result file.
+  const lifetimeRef = useRef<AbortController | null>(null)
 
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [confirmBackupOpen, setConfirmBackupOpen] = useState(false)
@@ -825,8 +868,11 @@ export default function AdminBackupSection() {
 
   useEffect(() => {
     mountedRef.current = true
+    const lifetime = new AbortController()
+    lifetimeRef.current = lifetime
     return () => {
       mountedRef.current = false
+      lifetime.abort()
       // An upload still sending its body is abandoned (nothing was staged).
       // A staged archive is kept: its job id is remembered, so the next
       // mount shows it again.
@@ -997,6 +1043,9 @@ export default function AdminBackupSection() {
   // would write that state back. Reload the whole page rather than refreshing
   // each piece; the carried key reopens this tab with the outcome banner.
   function reloadAfterRestore(result: unknown) {
+    // Unmounted meanwhile (the operator confirmed leaving): not this page's
+    // to reload any more.
+    if (!mountedRef.current) return
     safeSessionSetItem(STORAGE_KEYS.adminPostRestore, JSON.stringify(result ?? null))
     window.location.reload()
   }
@@ -1008,6 +1057,7 @@ export default function AdminBackupSection() {
   // fetch shows the server's result banner — flagged when it is not this
   // apply's (stage_id mismatch).
   function reloginAfterRestore(stageId: string, messageKey: string) {
+    if (!mountedRef.current) return
     window.alert(t(messageKey))
     safeSessionSetItem(STORAGE_KEYS.adminPostRestore, JSON.stringify({ awaitingStageId: stageId }))
     clearToken()
@@ -1048,6 +1098,7 @@ export default function AdminBackupSection() {
         // token and leave for the login screen with nothing to show for it.
         job = await waitForJob(started.job_id, {
           keepLogin: true,
+          signal: lifetimeRef.current?.signal,
           onPoll: (j) => { if (j.state === 'running') seenRunning = true },
         })
       } catch (err) {
@@ -1059,6 +1110,8 @@ export default function AdminBackupSection() {
       } finally {
         setResetPreparing(false)
       }
+      // Unmounted (and the wait aborted): nothing here to show the outcome on.
+      if (!mountedRef.current) return
       if (signedOut) {
         // Signed out after the job was seen at work: the reset was applied.
         // The result is read after signing in again, matched by stage id.
@@ -1087,8 +1140,9 @@ export default function AdminBackupSection() {
       setResetWaitingHealth(true)
       let result: Awaited<ReturnType<typeof waitForRestoreApplied>>
       try {
-        result = await waitForRestoreApplied(started.stage_id, 90_000)
+        result = await waitForRestoreApplied(started.stage_id, 90_000, undefined, lifetimeRef.current?.signal)
       } catch (err) {
+        if (isAbortError(err)) return
         if (isUnauthorizedError(err)) { reloginAfterRestore(started.stage_id, restartReloginKey(err)); return }
         // resetError is rendered ONLY inside the confirm modal, so this must
         // not fall through to the modal-closing below — otherwise the
@@ -1145,8 +1199,9 @@ export default function AdminBackupSection() {
         setWaitingHealth(true)
         let result: Awaited<ReturnType<typeof waitForRestoreApplied>>
         try {
-          result = await waitForRestoreApplied(stageId, 90_000)
+          result = await waitForRestoreApplied(stageId, 90_000, undefined, lifetimeRef.current?.signal)
         } catch (err) {
+          if (isAbortError(err)) return
           if (isUnauthorizedError(err)) { reloginAfterRestore(stageId, restartReloginKey(err)); return }
           // The wait timed out (the restart is taking longer than 90s, or
           // failed). Keep the modal open and the staged restore intact so the
@@ -1286,6 +1341,35 @@ export default function AdminBackupSection() {
   useDialogFocus(backupDialogRef, confirmBackupOpen)
   useDialogFocus(restoreDialogRef, confirmOpen && !!stagedRestore)
   useDialogFocus(resetDialogRef, resetConfirmOpen)
+
+  // Leaving this section while a restore archive's body is still being sent
+  // aborts the upload (see the unmount effect); leaving while a restore /
+  // reset is being applied stops following it. The dashboard asks before its
+  // own exits while this is reported, the guard before browser Back. A
+  // reload or a closed tab loses the upload too, so beforeunload asks while
+  // the body is being sent. (Not while applying: the apply's own reload onto
+  // the outcome banner would be held up by the prompt, and the apply carries
+  // on server side whatever this tab does.)
+  const uploadSending = uploadProgress !== null && !uploadStaging
+  const busy = uploadSending || applying || resetApplying
+  useEffect(() => {
+    onBusyChange?.(busy)
+  }, [busy, onBusyChange])
+  useEffect(() => () => onBusyChange?.(false), [onBusyChange])
+  const leave = useUnsavedNavigationGuard(busy, t('adminBackup.busyLeaveConfirm'))
+  useEffect(() => {
+    if (!leaveRef) return
+    leaveRef.current = leave
+    return () => {
+      if (leaveRef.current === leave) leaveRef.current = null
+    }
+  }, [leaveRef, leave])
+  useEffect(() => {
+    if (!uploadSending) return
+    const handler = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = '' }
+    window.addEventListener('beforeunload', handler)
+    return () => window.removeEventListener('beforeunload', handler)
+  }, [uploadSending])
 
   // ---- render ----
   const inProgress = backupJob && (backupJob.state === 'pending' || backupJob.state === 'running')
@@ -2077,7 +2161,7 @@ export default function AdminBackupSection() {
       </Card>
 
       {/* BACKUP CONFIRMATION MODAL */}
-      {confirmBackupOpen && (
+      {confirmBackupOpen && createPortal(
         <div
           role="dialog"
           aria-modal="true"
@@ -2085,19 +2169,9 @@ export default function AdminBackupSection() {
           onMouseDown={(e) => {
             if (e.target === e.currentTarget) setConfirmBackupOpen(false)
           }}
-          style={{
-            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
-            display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
-          }}
+          style={MODAL_BACKDROP_STYLE}
         >
-          <div ref={backupDialogRef} tabIndex={-1} style={{
-            background: 'var(--color-surface)',
-            padding: 'var(--space-4)',
-            borderRadius: 8,
-            maxWidth: 480,
-            width: '90%',
-            boxShadow: '0 4px 24px rgba(0,0,0,0.2)',
-          }}>
+          <div ref={backupDialogRef} tabIndex={-1} className="overscroll-panel" style={MODAL_PANEL_STYLE}>
             <h4 id="backup-create-title" style={{ marginTop: 0 }}>{t('adminBackup.confirmCreate.title')}</h4>
             <p style={{ fontSize: 14 }}>{t('adminBackup.confirmCreate.body')}</p>
             <div style={{ ...ROW, marginTop: 'var(--space-3)', justifyContent: 'flex-end' }}>
@@ -2109,11 +2183,12 @@ export default function AdminBackupSection() {
               </Button>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
 
       {/* CONFIRMATION MODAL */}
-      {confirmOpen && stagedRestore && (
+      {confirmOpen && stagedRestore && createPortal(
         <div
           role="dialog"
           aria-modal="true"
@@ -2128,19 +2203,9 @@ export default function AdminBackupSection() {
               setPassword('')
             }
           }}
-          style={{
-            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
-            display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
-          }}
+          style={MODAL_BACKDROP_STYLE}
         >
-          <div ref={restoreDialogRef} tabIndex={-1} style={{
-            background: 'var(--color-surface)',
-            padding: 'var(--space-4)',
-            borderRadius: 8,
-            maxWidth: 480,
-            width: '90%',
-            boxShadow: '0 4px 24px rgba(0,0,0,0.2)',
-          }}>
+          <div ref={restoreDialogRef} tabIndex={-1} className="overscroll-panel" style={MODAL_PANEL_STYLE}>
             <h4 id="backup-restore-title" style={{ marginTop: 0 }}>{t('adminBackup.restore.confirm.title')}</h4>
             <p style={{ fontSize: 14 }}>{t('adminBackup.restore.confirm.body')}</p>
             <p style={{ fontSize: 14 }}>{t('adminBackup.restore.confirm.password')}</p>
@@ -2177,11 +2242,12 @@ export default function AdminBackupSection() {
               </Button>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
 
       {/* RESET CONFIRMATION MODAL */}
-      {resetConfirmOpen && (
+      {resetConfirmOpen && createPortal(
         <div
           role="dialog"
           aria-modal="true"
@@ -2189,19 +2255,9 @@ export default function AdminBackupSection() {
           onMouseDown={(e) => {
             if (e.target === e.currentTarget && !resetApplying) onCancelResetConfirm()
           }}
-          style={{
-            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
-            display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
-          }}
+          style={MODAL_BACKDROP_STYLE}
         >
-          <div ref={resetDialogRef} tabIndex={-1} style={{
-            background: 'var(--color-surface)',
-            padding: 'var(--space-4)',
-            borderRadius: 8,
-            maxWidth: 480,
-            width: '90%',
-            boxShadow: '0 4px 24px rgba(0,0,0,0.2)',
-          }}>
+          <div ref={resetDialogRef} tabIndex={-1} className="overscroll-panel" style={MODAL_PANEL_STYLE}>
             <h4 id="backup-reset-title" style={{ marginTop: 0 }}>{t('adminBackup.reset.confirm.title')}</h4>
             <p style={{ fontSize: 14 }}>{t('adminBackup.reset.confirm.body')}</p>
             <div style={{ marginTop: 'var(--space-2)' }}>
@@ -2257,7 +2313,8 @@ export default function AdminBackupSection() {
               </Button>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   )

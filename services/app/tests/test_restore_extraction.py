@@ -210,6 +210,10 @@ def test_stage_restore_refuses_an_oversized_extended_header_as_a_bad_archive(tmp
 # Damaged archives
 # ---------------------------------------------------------------------------
 
+def _skippable_frame(payload: bytes, magic: int = 0x184D2A50) -> bytes:
+    return magic.to_bytes(4, "little") + len(payload).to_bytes(4, "little") + payload
+
+
 def _compressed_archive(fmt: str) -> bytes:
     # Mostly incompressible, then text: the deflate stream holds stored blocks
     # (whose length fields a flipped byte breaks, a zlib.error) as well as
@@ -226,6 +230,14 @@ def _compressed_archive(fmt: str) -> bytes:
     cctx = _backup._zstd.ZstdCompressor(level=3, write_checksum=True)
     if fmt == "zst":
         return cctx.compress(raw)  # one-shot: single segment, content size recorded
+    if fmt == "zst-multi":
+        # As pzstd writes it: each data frame behind a skippable frame (the
+        # last cut lands in the second frame, past the first one's end).
+        cut = len(raw) // 3
+        return b"".join(
+            _skippable_frame(b"\x10\x00\x00\x00") + cctx.compress(part)
+            for part in (raw[:cut], raw[cut:])
+        )
     # As _open_archive_writer streams it: no content size, a window descriptor.
     out = io.BytesIO()
     with cctx.stream_writer(out, closefd=False) as w:
@@ -251,7 +263,7 @@ def _assert_refused_as_corrupt(path) -> None:
     assert _staging_entries() == before
 
 
-@pytest.mark.parametrize("fmt", ["gz", "zst", "zst-stream"])
+@pytest.mark.parametrize("fmt", ["gz", "zst", "zst-stream", "zst-multi"])
 def test_a_truncated_archive_is_refused_as_corrupt(tmp_path, fmt):
     """python-zstandard ends a truncated frame's output silently and tarfile
     ends an archive quietly at a member boundary, so a .tar.zst cut short —
@@ -312,14 +324,62 @@ def test_a_deflate_block_that_does_not_decode_is_refused_as_corrupt(tmp_path):
     _assert_refused_as_corrupt(path)
 
 
-def test_an_intact_streamed_zstd_archive_still_reads_to_the_end(tmp_path):
+@pytest.mark.parametrize("fmt", ["zst-stream", "zst-multi"])
+def test_an_intact_streamed_zstd_archive_still_reads_to_the_end(tmp_path, fmt):
     """The truncation check follows the frame's blocks; a whole archive, as
-    the backup writer streams it, still reads to the end."""
+    the backup writer streams it (or as pzstd writes one: several frames,
+    each behind a skippable frame), still reads to the end."""
     path = tmp_path / "ok.tar.zst"
-    path.write_bytes(_compressed_archive("zst-stream"))
+    path.write_bytes(_compressed_archive(fmt))
     with _backup._open_archive_reader(str(path)) as tar:
         _backup._safe_extract(tar, str(tmp_path / "out"))
     assert _written(tmp_path) == ["manifest.json", "wsi.db"]
+
+
+def test_a_zstd_archive_cut_after_a_frame_boundary_is_refused(tmp_path):
+    """A cut that lands exactly where a frame ends, or inside the frame after
+    it, or a leading skippable frame, must not switch the truncation check
+    off: each would otherwise read as a clean but shorter archive."""
+    blob = _compressed_archive("zst-multi")
+    first_end = blob.index(_skippable_frame(b"\x10\x00\x00\x00"), 1)
+    for keep in (first_end, first_end + 3, first_end + 12, first_end + 40):
+        path = tmp_path / f"cut{keep}.tar.zst"
+        path.write_bytes(blob[:keep])
+        _assert_refused_as_corrupt(path)
+
+
+def test_zstd_frame_tracker_follows_every_frame():
+    """The tracker's verdict itself, cut at every byte: complete only on a
+    frame boundary — never inside a skippable frame or a later data frame,
+    which tarfile alone would not notice when the cut fell between members."""
+    blob = _compressed_archive("zst-multi")
+    boundaries = set()
+    at = 0
+    while at < len(blob):
+        # One frame at a time: the skippable header names its size, a data
+        # frame is measured by zstandard itself.
+        if blob[at:at + 4] == (0x184D2A50).to_bytes(4, "little"):
+            at += 8 + int.from_bytes(blob[at + 4:at + 8], "little")
+        else:
+            at += _frame_len(blob[at:])
+        boundaries.add(at)
+    assert len(boundaries) == 4
+    # Every byte around each boundary (and the start), read in odd-sized
+    # chunks so headers straddle reads.
+    keeps = sorted({k for b in boundaries | {0} for k in range(b - 20, b + 21)
+                    if 0 <= k <= len(blob)})
+    for keep in keeps:
+        tracker = _backup._ZstdFrameTracker(io.BytesIO(blob[:keep]))
+        while tracker.read(7):
+            pass
+        assert tracker.complete is (keep in boundaries), keep
+
+
+def _frame_len(data: bytes) -> int:
+    """The length of the zstd data frame ``data`` starts with."""
+    dobj = _backup._zstd.ZstdDecompressor().decompressobj()
+    dobj.decompress(data)
+    return len(data) - len(dobj.unused_data)
 
 
 # ---------------------------------------------------------------------------

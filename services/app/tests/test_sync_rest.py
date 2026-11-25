@@ -581,3 +581,133 @@ def test_create_session_supersedes_caller_previous_session(
     assert second_sid in sr.manager._rooms
     owned = [r for r in sr.manager._rooms.values() if r.owner_user_id == admin_user.id]
     assert len(owned) == 1
+
+
+def test_rest_db_reads_use_a_session_of_their_own_thread(client, admin_headers, slide, monkeypatch):
+    """The async endpoints' DB reads run in a worker thread, in a session that
+    thread opens and closes itself — never the request's ``get_db`` session,
+    which a client disconnect would close from another thread while the
+    worker is still querying it."""
+    import threading
+
+    import wsi_app.routers.sync as sync_mod
+
+    real = sync_mod.SessionLocal
+    events = []
+
+    class _Tracked:
+        def __init__(self):
+            self._db = real()
+            events.append(("open", threading.get_ident()))
+
+        def __getattr__(self, name):
+            return getattr(self._db, name)
+
+        def close(self):
+            events.append(("close", threading.get_ident()))
+            self._db.close()
+
+    monkeypatch.setattr(sync_mod, "SessionLocal", _Tracked)
+    sid = _create_session(client, admin_headers, slide.id)
+    assert client.get(f"/api/sync/sessions/{sid}").status_code == 200
+    assert client.get("/api/admin/sync/sessions", headers=admin_headers).status_code == 200
+    assert client.get("/api/admin/sync/sessions/all", headers=admin_headers).status_code == 200
+    # create, owned list, full list: one session for the staff gate
+    # (require_staff_off_loop) and one for the reads; the unauthenticated
+    # peek: one for its read. Each opened and closed on the same thread.
+    assert len(events) == 14, events
+    for opened, closed in zip(events[::2], events[1::2]):
+        assert opened[0] == "open" and closed[0] == "close"
+        assert opened[1] == closed[1]
+
+
+def test_staff_endpoints_never_open_a_request_scoped_get_db_session(
+    client, admin_headers, slide,
+):
+    """The staff-gated async endpoints must not depend on ``get_db``: its
+    session is torn down only after the response, so its pooled connection
+    would stay checked out across the RoomManager awaits and the audit hop.
+    Overriding ``get_db`` with one that fails proves none of them reaches it
+    (``require_staff`` would, through ``get_current_user``)."""
+    from wsi_app.db import get_db
+    from wsi_app.main import app
+
+    def _forbidden_get_db():
+        raise AssertionError("sync endpoint opened a request-scoped get_db session")
+        yield  # pragma: no cover - makes this a generator dependency
+
+    app.dependency_overrides[get_db] = _forbidden_get_db
+    try:
+        sid = _create_session(client, admin_headers, slide.id)
+        assert client.get("/api/admin/sync/sessions", headers=admin_headers).status_code == 200
+        assert client.get("/api/admin/sync/sessions/all", headers=admin_headers).status_code == 200
+        r = client.delete(f"/api/admin/sync/sessions/{sid}", headers=admin_headers)
+        assert r.status_code == 200, r.text
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_staff_gate_off_loop_keeps_the_require_staff_answers(
+    client, slide, admin_user, db_session,
+):
+    """The off-loop gate runs get_current_user + require_staff themselves, so
+    a missing token, a bad token, a revoked token and a non-staff role get
+    exactly the answers every other staff endpoint gives. (Every valid role
+    is a staff role, so require_staff's 403 has no reachable case here.)"""
+    from wsi_app.auth import create_token
+
+    url = "/api/admin/sync/sessions/all"
+    r = client.get(url)
+    assert (r.status_code, r.json()["detail"]) == (401, "Missing token")
+    r = client.get(url, headers={"Authorization": "Bearer not-a-jwt"})
+    assert (r.status_code, r.json()["detail"]) == (401, "Invalid token")
+
+    token = create_token(admin_user)
+    hdrs = {"Authorization": f"Bearer {token}"}
+    assert client.get(url, headers=hdrs).status_code == 200
+    # A token_version bump (password change / forced logout) revokes it.
+    admin_user.token_version = int(admin_user.token_version or 0) + 1
+    db_session.commit()
+    r = client.get(url, headers=hdrs)
+    assert (r.status_code, r.json()["detail"]) == (401, "Invalid token")
+
+    # A disabled account is refused even with a fresh token.
+    admin_user.is_active = False
+    db_session.commit()
+    r = client.get(url, headers={"Authorization": f"Bearer {create_token(admin_user)}"})
+    assert (r.status_code, r.json()["detail"]) == (401, "Invalid token")
+
+
+def test_sync_timer_env_values_fall_back_when_not_positive(monkeypatch):
+    """A zero / negative / NaN / infinite timer would spin or kill the
+    keepalive and reauth loops: the default is used instead. A value that is
+    not a number at all still fails, naming the variable."""
+    from wsi_app.routers.sync import _env_positive_float
+
+    for bad in ("0", "-5", "nan", "inf", "-inf"):
+        monkeypatch.setenv("WSI_SYNC_TEST_SEC", bad)
+        assert _env_positive_float("WSI_SYNC_TEST_SEC", 15) == 15.0
+    monkeypatch.setenv("WSI_SYNC_TEST_SEC", "2.5")
+    assert _env_positive_float("WSI_SYNC_TEST_SEC", 15) == 2.5
+    monkeypatch.setenv("WSI_SYNC_TEST_SEC", "fast")
+    with pytest.raises(ValueError, match="WSI_SYNC_TEST_SEC"):
+        _env_positive_float("WSI_SYNC_TEST_SEC", 15)
+
+
+def test_zero_reverse_dns_workers_does_not_break_the_import():
+    """WSI_SYNC_REVERSE_DNS_WORKERS=0 used to raise from ThreadPoolExecutor at
+    import time, crash-looping wsi-app and wsi-sync alike."""
+    import os
+    import subprocess
+    import sys
+
+    env = {**os.environ, "WSI_SYNC_REVERSE_DNS_WORKERS": "0", "WSI_SYNC_PING_INTERVAL_SEC": "0"}
+    r = subprocess.run(
+        [sys.executable, "-c",
+         "import wsi_app.routers.sync as s; "
+         "print(s._RDNS_EXECUTOR._max_workers, s.PING_INTERVAL_SECONDS)"],
+        env=env, capture_output=True, text=True, timeout=60,
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split() == ["1", "15.0"]

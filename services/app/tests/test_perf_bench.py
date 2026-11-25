@@ -1917,3 +1917,30 @@ def test_a_job_claim_takes_its_benchmark_check_connection_before_the_lock(_priva
     locked = events.index("lock")
     # The connection is in hand before the lock; none is checked out under it.
     assert "checkout" in events[:locked] and "checkout" not in events[locked:]
+
+
+def test_server_run_overlap_caps_a_run_at_the_orphan_age(db_session):
+    """No run works past created_at + _ORPHAN_AGE_SECONDS, so that bounds its
+    end: an orphan still marked running (its worker died, nothing reaped it
+    yet), or one whose finished_at is the late reap time rather than its
+    death, must not flag every browser test since as overlapping."""
+    began = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    t0 = began.timestamp()
+    cap = perf_bench._ORPHAN_AGE_SECONDS
+    reaped = PerfRun(kind="server", state="failed", error=perf_bench.RUN_ERROR_INTERRUPTED,
+                     created_at=began, finished_at=began + timedelta(days=1))
+    db_session.add(reaped)
+    db_session.commit()
+    try:
+        assert perf_bench.server_run_overlap(db_session, t0 + 30, t0 + 60) is True
+        assert perf_bench.server_run_overlap(db_session, t0 + cap - 1, t0 + cap + 60) is True
+        assert perf_bench.server_run_overlap(db_session, t0 + 3600, t0 + 3660) is False
+        # Still 'running' under a pid that is gone: the same cap, not "now".
+        reaped.state, reaped.finished_at, reaped.pid = "running", None, 2**22 + 12345
+        db_session.commit()
+        now = time.time()
+        assert perf_bench.server_run_overlap(db_session, now - 60, now) is False
+        assert perf_bench.server_run_overlap(db_session, t0 + 30, t0 + 60) is True
+    finally:
+        db_session.delete(reaped)
+        db_session.commit()

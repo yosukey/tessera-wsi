@@ -66,11 +66,41 @@ def _oauth_redirect_uri(request: Request) -> str:
     # derived value exactly as it does the WSI_PUBLIC_BASE_URL-unset default,
     # so this does not widen the attack surface: an operator serving more than
     # one hostname simply registers each callback there.
-    if settings.public_base_url:
-        pinned_host = urlsplit(settings.public_base_url).netloc.lower()
-        if pinned_host and host.lower() == pinned_host:
-            return f"{settings.public_base_url}/api/auth/oauth/callback"
+    if settings.public_base_url and _on_pinned_host(host, settings.public_base_url):
+        return f"{settings.public_base_url}/api/auth/oauth/callback"
     return derived
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _on_pinned_host(host: str, public_base_url: str) -> bool:
+    """Whether the request ``Host`` names the ``WSI_PUBLIC_BASE_URL`` host.
+
+    Compared by hostname, plus the port only when the ``Host`` header carries
+    one. nginx forwards ``Host: $host``, which never has a port, so on an
+    install published at a non-standard port (``https://wsi.example:8443``) a
+    full-authority comparison would never match: the pin would silently fall
+    back to the derived, port-less callback and Google would answer
+    ``redirect_uri_mismatch``. A ``Host`` that does carry a port (a direct
+    hit, another proxy) must still agree with the pinned one — the scheme's
+    default when the base URL names none — so a different listener on the
+    same name keeps deriving its own callback.
+    """
+    try:
+        pinned = urlsplit(public_base_url)
+        pinned_name = (pinned.hostname or "").lower()
+        pinned_port = pinned.port or _DEFAULT_PORTS.get(pinned.scheme.lower())
+        req = urlsplit(f"//{host or ''}")
+        req_name = (req.hostname or "").lower()
+        req_port = req.port
+    except ValueError:  # an unbalanced "[" or a non-numeric port
+        return False
+    pinned_name = pinned_name[:-1] if pinned_name.endswith(".") else pinned_name
+    req_name = req_name[:-1] if req_name.endswith(".") else req_name
+    if not pinned_name or req_name != pinned_name:
+        return False
+    return req_port is None or req_port == pinned_port
 
 
 def _is_secure_request(request: Request) -> bool:
@@ -118,6 +148,19 @@ def _reject_cross_site_post(request: Request) -> None:
     A request carrying neither header is allowed through: that is a non-browser
     client (curl, a scripted integration), which is not a CSRF vector because
     there is no ambient cookie jar to abuse.
+
+    Once an ``Origin`` is present the fallback fails closed, as the live-sync
+    WebSocket check does (routers/sync._ws_origin_allowed):
+
+    * an opaque ``Origin: null`` is refused. A browser sends it from a
+      sandboxed iframe, a ``data:`` / ``file:`` page or after a cross-origin
+      redirect — all contexts another site can create, and none the app's
+      own sign-in form ever runs in;
+    * an ``Origin`` with no hostname, or one ``urlsplit`` cannot parse (an
+      unbalanced ``[`` raises ``ValueError``, which would otherwise surface
+      as a 500), is refused;
+    * a missing ``Host`` leaves nothing to compare against, so it is refused
+      too rather than waved through.
     """
     site = (request.headers.get("sec-fetch-site") or "").strip().lower()
     if site:
@@ -125,19 +168,28 @@ def _reject_cross_site_post(request: Request) -> None:
             return
         raise HTTPException(status_code=403, detail="cross-site request rejected")
     origin = (request.headers.get("origin") or "").strip()
-    if not origin or origin.lower() == "null":
+    if not origin:
         return
     # Parse the Host header through urlsplit too, so an IPv6 literal
     # ("[::1]:8000") and a port suffix are stripped the same way on both sides.
     # One trailing dot is dropped as well: nginx strips it from $host while the
     # browser's Origin keeps it, so "wsi.example." would otherwise refuse every
     # login from a browser without fetch metadata (as in the sync WS check).
-    host_name = (urlsplit(f"//{request.headers.get('host') or ''}").hostname or "").lower()
-    origin_name = (urlsplit(origin).hostname or "").lower()
-    host_name = host_name[:-1] if host_name.endswith(".") else host_name
-    origin_name = origin_name[:-1] if origin_name.endswith(".") else origin_name
-    if host_name and origin_name and origin_name != host_name:
+    # "null" parses to no hostname and is refused with the rest below.
+    host_name = _url_hostname(f"//{request.headers.get('host') or ''}")
+    origin_name = _url_hostname(origin)
+    if not host_name or not origin_name or origin_name != host_name:
         raise HTTPException(status_code=403, detail="cross-site request rejected")
+
+
+def _url_hostname(url: str) -> str:
+    """Lower-cased hostname of ``url`` ("" when it has none or won't parse),
+    with one trailing dot dropped (``wsi.example.`` is ``wsi.example``)."""
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:  # e.g. an unbalanced "[" in an IPv6 literal
+        return ""
+    return host[:-1] if host.endswith(".") else host
 
 
 @router.get("/api/auth/state")

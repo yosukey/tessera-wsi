@@ -131,6 +131,38 @@ def test_beacon_self_referrer_recorded_as_direct(client, db_session):
     assert row.referrer_host == ""
 
 
+@pytest.mark.parametrize("host, referrer", [
+    ("[::1]:8000", "http://[::1]:8000/slides/3"),
+    ("[fd00::5]", "http://[FD00::5]/"),
+    ("WSI.Example:8443", "https://wsi.example:8443/x"),
+])
+def test_beacon_self_referrer_on_ipv6_or_ported_host(client, db_session, host, referrer):
+    """The Host header's port is removed without cutting a bracketed IPv6
+    literal down to "[": a same-site IPv6 referrer is direct traffic too."""
+    db_session.execute(delete(PageView))
+    db_session.commit()
+    r = client.post(
+        "/api/analytics/pageview",
+        json={"kind": "top", "referrer": referrer},
+        headers={"Host": host},
+    )
+    assert r.status_code == 204
+    db_session.expire_all()
+    row = db_session.execute(select(PageView)).scalar_one()
+    assert row.referrer_host == ""
+
+
+def test_host_header_name_parsing():
+    from wsi_app.routers.analytics import _host_header_name
+
+    assert _host_header_name("[::1]:8000") == "::1"
+    assert _host_header_name("[::1]") == "::1"
+    assert _host_header_name("example.com:80") == "example.com"
+    assert _host_header_name("Example.COM") == "example.com"
+    assert _host_header_name("") == ""
+    assert _host_header_name("[::1") == ""  # malformed: no self-match, no crash
+
+
 def test_beacon_ignores_referer_header(client, db_session):
     """The request's own `Referer` header is not consulted; only the
     payload referrer counts."""
@@ -457,6 +489,28 @@ def test_admin_export_csv_recent(client, admin_headers, slide):
     assert "occurred_at,kind,slide_id" in body
     # The single seeded viewer hit appears in the body.
     assert "viewer," in body
+
+
+@pytest.mark.parametrize("qs", [
+    "start_date=9999-12-31&end_date=9999-12-31",
+    "end_date=9999-12-31",
+    "end_date=0001-01-01",
+    "start_date=0001-01-01&end_date=0001-01-01",
+    "start_date=1899-12-31",
+])
+def test_out_of_range_dates_are_a_clear_400(client, admin_headers, qs):
+    """A date at Python's own limits used to overflow in the window math (or
+    the UTC conversion) and come back as a 422 "Numeric value out of range"."""
+    r = client.get(f"/api/admin/analytics/summary?{qs}", headers=admin_headers)
+    assert r.status_code == 400, r.text
+    assert "out of range" in r.json()["detail"]
+
+
+def test_out_of_range_dates_on_clear_are_a_clear_400(client, admin_headers):
+    r = client.delete("/api/admin/analytics/data?from_date=2020-01-01&to_date=9999-12-31",
+                      headers=admin_headers)
+    assert r.status_code == 400, r.text
+    assert "out of range" in r.json()["detail"]
 
 
 def test_admin_export_csv_unknown_dataset_400(client, admin_headers):
@@ -1959,6 +2013,48 @@ def test_purge_analytics_user_emits_audit(client, admin_headers, caplog):
         "GDPR erasure must be recorded in the audit trail"
 
 
+@pytest.mark.parametrize("mode, names_digest", [
+    ("hashed", True), ("off", True), ("plain", False),
+])
+def test_purge_analytics_user_audit_names_the_digest_unless_plain(
+    client, admin_headers, caplog, mode, names_digest
+):
+    """The purge's audit target is the identifier's digest in every mode but
+    "plain": switching recording off after a hashed period must not put the
+    erased person's raw email into the audit trail (and the journal)."""
+    import json
+    import logging
+
+    from wsi_app import analytics_hash as _an_hash
+
+    if not _an_hash.salt_available():
+        pytest.skip("no analytics salt in this environment")
+    email = "erase-me@example.com"
+    digest = _an_hash.compute_user_hash(email)
+    db = _SessionLocal()
+    try:
+        ns = db.get(_NetworkSettings, 1)
+        saved = ns.analytics_mode if ns is not None else None
+    finally:
+        db.close()
+    _set_analytics_mode(mode)
+    try:
+        with caplog.at_level(logging.INFO, logger="wsi_app.audit"):
+            r = client.request("DELETE", "/api/admin/analytics/user",
+                               data={"identifier": email}, headers=admin_headers)
+    finally:
+        _set_analytics_mode(saved or "hashed")
+    assert r.status_code == 200, r.text
+    records = [
+        json.loads(rec.getMessage()) for rec in caplog.records
+        if "analytics.purge_user" in rec.getMessage()
+    ]
+    assert records
+    assert records[-1]["target"] == (digest if names_digest else email)
+    if names_digest:
+        assert all(email not in rec.getMessage() for rec in caplog.records)
+
+
 def test_csv_export_rejects_actor_role_on_aggregate(client, admin_headers):
     # An actor_role filter on an aggregate dataset would silently return
     # staff-excluded numbers, so it is refused rather than honoured.
@@ -2867,6 +2963,57 @@ def test_query_budget_never_touches_the_connection_after_releasing_it(monkeypatc
     assert log.count("set_progress_handler") == 2  # installed, then cleared
 
 
+def test_query_budget_timeout_while_a_statement_is_re_prepared_is_a_503(monkeypatch):
+    """When another connection has changed the schema since a statement was
+    compiled, SQLite re-prepares it on the next run; an interrupt landing
+    during that re-prepare is reported as "database schema has changed",
+    not "interrupted". It is still the budget running out and must answer
+    503, not escape as a 500."""
+    import sqlite3
+
+    from fastapi import HTTPException
+    from sqlalchemy import text
+
+    from wsi_app.db import engine
+
+    stmt = text("SELECT count(*) FROM page_views WHERE id != :x")
+    db = _SessionLocal()
+    other = sqlite3.connect(engine.url.database)
+    try:
+        # Compiles the statement into this connection's statement cache.
+        db.execute(stmt, {"x": 0}).scalar()
+        # A schema change made through another connection.
+        other.execute("CREATE TABLE _schema_bump (x INTEGER)")
+        other.commit()
+        monkeypatch.setattr(_ar, "_QUERY_TIME_BUDGET_S", -1.0)
+        monkeypatch.setattr(_ar, "_QUERY_BUDGET_CHECK_STEPS", 1)
+        with pytest.raises(HTTPException) as caught:
+            with _ar._query_budget(db):
+                db.execute(stmt, {"x": 0}).scalar()
+        assert caught.value.status_code == 503
+        assert caught.value.detail["code"] == "adminDash.apiErr.analyticsQueryTimeout"
+    finally:
+        db.close()
+        other.execute("DROP TABLE IF EXISTS _schema_bump")
+        other.commit()
+        other.close()
+
+
+def test_query_budget_lets_other_operational_errors_through():
+    """Only a query the budget stopped becomes the 503; any other
+    OperationalError (here a missing table) propagates unchanged."""
+    from sqlalchemy import text
+    from sqlalchemy.exc import OperationalError
+
+    db = _SessionLocal()
+    try:
+        with pytest.raises(OperationalError, match="no such table"):
+            with _ar._query_budget(db):
+                db.execute(text("SELECT * FROM _no_such_table")).all()
+    finally:
+        db.close()
+
+
 def test_beacons_skip_identity_work_when_analytics_is_off(client, admin_headers, slide, monkeypatch):
     calls = []
     monkeypatch.setattr(_analytics, "probe_identity", lambda *a, **k: calls.append("probe") or (None, ""))
@@ -3192,6 +3339,43 @@ def test_views_of_unpublished_content_are_recorded_for_staff_only(
     assert dwell.actor_role == "admin"
     ts = db_session.query(_TourSession).filter(_TourSession.tour_id == draft_tour.id).one()
     assert ts.actor_role == "admin"
+
+
+@pytest.mark.parametrize("stale", ["expired", "revoked"])
+def test_stale_staff_token_does_not_record_unpublished_content(
+    client, db_session, admin_user, stale,
+):
+    """An expired or revoked staff JWT still TAGS a row as staff
+    (signed_staff_role), but tagging authorises nothing: only a live staff
+    user may have beacons for draft slides / tours recorded."""
+    draft = Slide(title="Draft", catalog_id=f"DRAFT-STALE-{stale}", is_published=False)
+    db_session.add(draft)
+    db_session.commit()
+    draft_tour = _Tour(slide_id=draft.id, title="Draft tour", is_published=True)
+    db_session.add(draft_tour)
+    db_session.commit()
+    if stale == "expired":
+        headers = _staff_bearer(admin_user, exp_offset=-60)
+    else:
+        headers = _staff_bearer(
+            admin_user, exp_offset=3600, tv=int(admin_user.token_version or 0) + 1,
+        )
+    now = _dt.datetime.now(_dt.timezone.utc)
+    sid = "33333333-bbbb-4ccc-8ddd-eeeeeeeeeeee" if stale == "expired" else "44444444-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    client.post("/api/analytics/pageview",
+                json={"kind": "viewer", "slide_public_id": draft.public_id}, headers=headers)
+    client.post("/api/analytics/slide-dwell", json={
+        "slide_public_id": draft.public_id, "started_at": (now - _dt.timedelta(seconds=5)).isoformat(),
+        "ended_at": now.isoformat(), "dwell_ms": 1_000,
+    }, headers=headers)
+    client.post("/api/analytics/tour-event", json={
+        "event": "start", "session_id": sid,
+        "tour_public_id": draft_tour.public_id, "started_at": now.isoformat(),
+    }, headers=headers)
+    db_session.expire_all()
+    assert db_session.query(_PageView).filter(_PageView.slide_id == draft.id).count() == 0
+    assert db_session.query(_SlideDwellEvent).filter(_SlideDwellEvent.slide_id == draft.id).count() == 0
+    assert db_session.query(_TourSession).filter(_TourSession.tour_id == draft_tour.id).count() == 0
 
 
 def test_report_title_lookups_never_read_the_slide_image_blobs(client, admin_headers, db_session):
